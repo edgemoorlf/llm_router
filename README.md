@@ -54,7 +54,7 @@ The application is configured via environment variables. Here are the key settin
 
 The proxy supports multiple Azure OpenAI instances with load balancing and automatic failover:
 
-- `AZURE_INSTANCES`: Comma-separated list of instance names (e.g., `instance1,instance2,instance3`)
+- `AZURE_INSTANCES`: Comma-separated list of instance names (e.g., `1,2,3`)
 - `AZURE_ROUTING_STRATEGY`: Strategy for routing requests across instances. Options:
   - `failover`: Try instances in priority order (default)
   - `priority`: Always use highest priority instance unless unavailable
@@ -164,7 +164,7 @@ print(response)
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
+    "model": "gpt-4o",
     "messages": [
       {
         "role": "system",
@@ -193,7 +193,7 @@ Example with Gunicorn:
 
 ```bash
 pip install gunicorn
-gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:3010
 ```
 
 ## API Endpoints
