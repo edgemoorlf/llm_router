@@ -23,7 +23,7 @@ def main():
     load_dotenv(args.env_file)
     
     # Get port from arguments or environment variables
-    port = args.port or int(os.getenv("PORT", 8000))
+    port = args.port or int(os.getenv("PORT", 3010))
     
     # Print startup message
     print(f"Starting Azure OpenAI Proxy server on {args.host}:{port}")

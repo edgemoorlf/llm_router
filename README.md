@@ -114,7 +114,7 @@ You can add additional mappings using the format `MODEL_MAP_<UPPERCASE_MODEL_NAM
 ### Server Settings
 
 - `LOG_LEVEL`: Logging level (default: INFO)
-- `PORT`: Port to run the server on (default: 8000)
+- `PORT`: Port to run the server on (default: 3010)
 
 ## Running the Service
 
@@ -128,7 +128,7 @@ python -m app.main
 Or use Uvicorn directly:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 3010 --reload
 ```
 
 ## Usage Examples
@@ -142,12 +142,12 @@ import openai
 
 # Instead of: openai.api_key = "your-openai-key"
 # Use your proxy:
-openai.api_base = "http://localhost:8000/v1"
+openai.api_base = "http://localhost:3010/v1"
 openai.api_key = "dummy-value"  # Can be any value, as the proxy doesn't check it
 
 # Standard OpenAI API calls will be redirected to Azure
 response = openai.ChatCompletion.create(
-    model="gpt-4",  # Will be mapped to your Azure deployment
+    model="gpt-4o",  # Will be mapped to your Azure deployment
     messages=[
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Tell me a joke."}
@@ -161,7 +161,7 @@ print(response)
 ### cURL Example
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost:3010/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o",

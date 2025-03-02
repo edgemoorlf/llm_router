@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def test_chat_completions(base_url, model="gpt-4"):
+def test_chat_completions(base_url, model="gpt-4o"):
     """Test chat completions endpoint with the OpenAI client library."""
     try:
         import openai
@@ -96,7 +96,7 @@ def test_embeddings(base_url, model="text-embedding-ada-002"):
         logger.error(f"Error testing embeddings: {str(e)}")
         return False
 
-def test_streaming(base_url, model="gpt-4"):
+def test_streaming(base_url, model="gpt-4o"):
     """Test streaming responses with the OpenAI client library."""
     try:
         import openai
@@ -131,7 +131,7 @@ def test_streaming(base_url, model="gpt-4"):
         logger.error(f"Error testing streaming: {str(e)}")
         return False
 
-def test_rate_limiting(base_url, model="gpt-4"):
+def test_rate_limiting(base_url, model="gpt-4o"):
     """Test rate limiting by making multiple large requests quickly."""
     try:
         import openai
@@ -211,7 +211,7 @@ def test_instances_status(base_url):
         logger.error(f"Error testing instances status endpoint: {str(e)}")
         return False
 
-def test_failover(base_url, model="gpt-4"):
+def test_failover(base_url, model="gpt-4o"):
     """Test failover functionality between instances."""
     try:
         import openai
@@ -301,8 +301,8 @@ def test_health_endpoint(base_url):
 def main():
     """Run the test script."""
     parser = argparse.ArgumentParser(description="Test the Azure OpenAI Proxy")
-    parser.add_argument("--url", default="http://localhost:8000/v1", help="Base URL of the proxy server")
-    parser.add_argument("--chat-model", default="gpt-4", help="Model to use for chat completions test")
+    parser.add_argument("--url", default="http://localhost:3010/v1", help="Base URL of the proxy server")
+    parser.add_argument("--chat-model", default="gpt-4o", help="Model to use for chat completions test")
     parser.add_argument("--completion-model", default="text-davinci-003", help="Model to use for completions test")
     parser.add_argument("--embedding-model", default="text-embedding-ada-002", help="Model to use for embeddings test")
     parser.add_argument("--test", 
