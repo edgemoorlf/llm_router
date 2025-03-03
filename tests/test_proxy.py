@@ -201,6 +201,7 @@ def test_instances_status(base_url):
         # Log details for each instance
         for instance in status_data.get('instances', []):
             logger.info(f"Instance: {instance['name']}")
+            logger.info(f"  Provider type: {instance['provider_type']}")
             logger.info(f"  Status: {instance['status']}")
             logger.info(f"  TPM usage: {instance['current_tpm']}/{instance['max_tpm']} ({instance['tpm_usage_percent']}%)")
             logger.info(f"  Priority: {instance['priority']}")
@@ -261,6 +262,7 @@ def test_failover(base_url, model="gpt-4o"):
         # Log details for each instance
         for instance in status_data.get('instances', []):
             logger.info(f"Instance: {instance['name']}")
+            logger.info(f"  Provider type: {instance['provider_type']}")
             logger.info(f"  Status: {instance['status']}")
             logger.info(f"  TPM usage: {instance['current_tpm']}/{instance['max_tpm']} ({instance['tpm_usage_percent']}%)")
             

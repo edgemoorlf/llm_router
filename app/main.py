@@ -96,7 +96,7 @@ async def health_check():
             "instance_summary": {
                 "total": total_instances,
                 "healthy": healthy_instances,
-                "routing_strategy": os.getenv("AZURE_ROUTING_STRATEGY", "failover")
+                "routing_strategy": os.getenv("API_ROUTING_STRATEGY", "failover")
             },
             "version": app.version
         }

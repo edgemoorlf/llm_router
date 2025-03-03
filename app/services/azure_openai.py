@@ -1,23 +1,21 @@
-"""Azure OpenAI service for forwarding and transforming requests to multiple instances."""
-import os
-import json
+"""Azure OpenAI service for forwarding and transforming requests to Azure OpenAI instances."""
 import logging
-from typing import Any, Dict, List, Optional, Union, Tuple
-import httpx
+from typing import Any, Dict, List
 from fastapi import HTTPException, status
 
 from app.utils.model_mappings import model_mapper
-from app.utils.rate_limiter import rate_limiter, TokenUsage
-from app.utils.instance_manager import instance_manager, AzureOpenAIInstance
+from app.utils.rate_limiter import rate_limiter
+from app.utils.instance_manager import instance_manager
+from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 
 logger = logging.getLogger(__name__)
 
 class AzureOpenAIService:
-    """Service for transforming and forwarding requests to Azure OpenAI instances."""
+    """Service for transforming and forwarding requests specifically to Azure OpenAI instances."""
     
     def __init__(self):
         """Initialize the Azure OpenAI service."""
-        logger.info("Initialized Azure OpenAI service with multi-instance support")
+        logger.info("Initialized Azure OpenAI service for Azure-specific instances")
     
     async def transform_request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -38,15 +36,51 @@ class AzureOpenAIService:
                 detail="Model name is required",
             )
         
-        # Look up the Azure deployment name
-        deployment_name = model_mapper.get_deployment_name(model_name)
+        # Normalize the model name
+        normalized_model = model_name.lower().split(':')[0]
+        
+        # Find Azure instances that support this model
+        azure_instances = [
+            instance for instance in instance_manager.instances.values()
+            if (
+                # Must be Azure provider type
+                instance.provider_type == "azure" and
+                (
+                    # Instance has this model in its supported_models list
+                    normalized_model in [m.lower() for m in instance.supported_models] or
+                    # Instance has a deployment mapping for this model
+                    normalized_model in instance.model_deployments or
+                    # Instance has no model restrictions (empty supported_models means it supports all models)
+                    not instance.supported_models
+                )
+            )
+        ]
+        
+        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{normalized_model}'")
+        
+        if not azure_instances:
+            logger.warning(f"No Azure instances found supporting model '{model_name}'")
+        
+        # Get the deployment name from the first instance that has a mapping for this model
+        deployment_name = None
+        for instance in azure_instances:
+            if normalized_model in instance.model_deployments:
+                deployment_name = instance.model_deployments[normalized_model]
+                logger.debug(f"Found deployment mapping for model '{model_name}' in Azure instance '{instance.name}': {deployment_name}")
+                break
+        
+        # If no instance has a mapping, fall back to the global model mapper
+        if not deployment_name:
+            deployment_name = model_mapper.get_deployment_name(model_name)
+            logger.debug(f"Using global model mapper for model '{model_name}': {deployment_name}")
+        
         if not deployment_name:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No Azure deployment mapped for model '{model_name}'",
+                detail=f"No deployment mapped for model '{model_name}' in any Azure instance",
             )
         
-        # Clone the payload and remove the model field
+        # Clone the payload and remove the model field since Azure uses deployment names
         azure_payload = payload.copy()
         azure_payload.pop("model", None)
         
@@ -56,12 +90,17 @@ class AzureOpenAIService:
         # For handling specific endpoints
         if endpoint == "/v1/chat/completions":
             # Estimate tokens for chat completions
-            required_tokens = self._estimate_chat_tokens(azure_payload)
+            required_tokens = estimate_chat_tokens(
+                azure_payload.get("messages", []),
+                azure_payload.get("functions", None),
+                model_name,
+                "azure"
+            )
         
         # For completions endpoint
         elif endpoint == "/v1/completions":
             # Estimate tokens for standard completions
-            required_tokens = self._estimate_completion_tokens(azure_payload)
+            required_tokens = estimate_completion_tokens(azure_payload)
         
         # For embeddings endpoint (rough estimate)
         elif endpoint == "/v1/embeddings":
@@ -97,68 +136,7 @@ class AzureOpenAIService:
             "payload": azure_payload,
             "required_tokens": required_tokens
         }
-    
-    def _estimate_chat_tokens(self, payload: Dict[str, Any]) -> int:
-        """
-        Estimate the number of tokens in a chat completion request.
         
-        Args:
-            payload: The chat completion request payload
-            
-        Returns:
-            Estimated token count
-        """
-        messages = payload.get("messages", [])
-        model = payload.get("model", "gpt-3.5-turbo")
-        max_tokens = payload.get("max_tokens", 256)  # Default if not specified
-        
-        # Estimate tokens for each message
-        message_tokens = 0
-        for message in messages:
-            # Count tokens in the content
-            content = message.get("content", "")
-            if isinstance(content, str):
-                message_tokens += rate_limiter.estimate_tokens(content, model)
-            elif isinstance(content, list):  # Handle multi-modal content (list of objects)
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        message_tokens += rate_limiter.estimate_tokens(item.get("text", ""), model)
-            
-            # Add tokens for role and metadata (rough estimate)
-            message_tokens += 4  # ~4 tokens per message overhead
-        
-        # Add tokens for completion (max_tokens)
-        total_tokens = message_tokens + max_tokens
-        
-        return total_tokens
-    
-    def _estimate_completion_tokens(self, payload: Dict[str, Any]) -> int:
-        """
-        Estimate the number of tokens in a completion request.
-        
-        Args:
-            payload: The completion request payload
-            
-        Returns:
-            Estimated token count
-        """
-        prompt = payload.get("prompt", "")
-        model = payload.get("model", "text-davinci-003")
-        max_tokens = payload.get("max_tokens", 256)  # Default if not specified
-        
-        # Estimate tokens for the prompt
-        if isinstance(prompt, str):
-            prompt_tokens = rate_limiter.estimate_tokens(prompt, model)
-        elif isinstance(prompt, list):
-            prompt_tokens = sum(rate_limiter.estimate_tokens(p, model) for p in prompt if isinstance(p, str))
-        else:
-            prompt_tokens = 0
-        
-        # Add tokens for completion (max_tokens)
-        total_tokens = prompt_tokens + max_tokens
-        
-        return total_tokens
-    
     async def forward_request(
         self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], method: str = "POST"
     ) -> Dict[str, Any]:
@@ -177,22 +155,59 @@ class AzureOpenAIService:
         # Get the estimated token requirement from the payload
         required_tokens = payload.pop("required_tokens", 1000)  # Default if not available
         
-        # Try to send the request to an available instance with failover
+        # Filter instances to only include Azure provider types
+        azure_instances = [
+            instance for instance in instance_manager.instances.values()
+            if instance.provider_type == "azure"
+        ]
+        
+        if not azure_instances:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No Azure OpenAI instances available",
+            )
+        
+        # Select an Azure instance based on the routing strategy
+        primary_instance = instance_manager.select_instance(required_tokens, azure_deployment)
+        
+        # Ensure we only selected an Azure instance
+        if primary_instance and primary_instance.provider_type != "azure":
+            logger.warning(f"Non-Azure instance {primary_instance.name} selected, filtering to Azure only")
+            primary_instance = None
+            
+            # Try to find a suitable Azure instance
+            for instance in azure_instances:
+                if azure_deployment in instance.model_deployments.values():
+                    primary_instance = instance
+                    break
+            
+            # If still no instance found, use the first Azure instance
+            if not primary_instance and azure_instances:
+                primary_instance = azure_instances[0]
+        
+        # Try to send the request to an available Azure instance with failover
+        # We'll only try Azure instances
         result, instance = await instance_manager.try_instances(
             endpoint, 
             azure_deployment, 
             payload, 
             required_tokens,
-            method
+            method,
+            provider_type="azure"  # Only try Azure instances
         )
         
-        logger.debug(f"Request completed using instance {instance.name}")
+        logger.debug(f"Request completed using Azure instance {instance.name}")
         
         return result
         
     async def get_instances_status(self) -> List[Dict[str, Any]]:
-        """Get the status of all instances."""
-        return instance_manager.get_instance_stats()
+        """Get the status of all Azure instances."""
+        all_stats = instance_manager.get_instance_stats()
+        # Filter to only include Azure instances
+        return [
+            stats for stats in all_stats
+            if stats["provider_type"] == "azure"
+        ]
 
 # Create a singleton instance
 azure_openai_service = AzureOpenAIService()

@@ -41,6 +41,10 @@ class ModelMapper:
         Returns:
             The Azure deployment name or None if no mapping exists.
         """
+        # Special case for DeepSeek R1 model
+        if model_name.lower() == "deepseek-r1":
+            return "DeepSeek-R1"  # This is a special case handled differently in the routing
+        
         # Normalize the model name by removing the version suffix if present
         normalized_name = model_name.split(':')[0]
         
