@@ -2,6 +2,9 @@ import os
 import uuid
 import time
 import logging
+import requests
+import json
+from threading import Thread
 from fastapi import FastAPI, Depends, Request
 from dotenv import load_dotenv
 import uvicorn
@@ -11,11 +14,83 @@ load_dotenv()
 
 # Configure logging
 log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO"))
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Create logs directory if it doesn't exist
+log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "logs"))
+os.makedirs(log_dir, exist_ok=True)
+
+# Configure logging FIRST
 logging.basicConfig(
     level=log_level,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format=log_format,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            os.path.join(log_dir, "app.log"),
+            maxBytes=1024*1024*5,
+            backupCount=3
+        )
+    ]
 )
+
+# THEN get logger instance
 logger = logging.getLogger(__name__)
+
+# Get root logger and configure propagation
+root_logger = logging.getLogger()
+root_logger.setLevel(log_level)
+
+# Add Feishu webhook handler if configured
+class FeishuHandler(logging.Handler):
+    def __init__(self, webhook_url: str):
+        super().__init__()
+        self.setFormatter(logging.Formatter(
+            fmt='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        self.webhook_url = webhook_url
+        self.setLevel(logging.ERROR)
+
+    def emit(self, record):
+        try:
+            if not self.webhook_url:
+                return
+                
+            # # Format thez log message according to Feishu's requirements
+            log_data = {
+                "msg_type": "text",
+                "content": {"text": self.format(record)}
+            }
+
+            # Send in background thread to avoid blocking
+            Thread(target=self._send_alert, args=(log_data,)).start()
+            
+        except Exception as e:
+            print(f"Failed to send Feishu alert: {str(e)}")
+
+    def _send_alert(self, data: dict):
+        try:
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(
+                self.webhook_url,
+                data=json.dumps(data),
+                headers=headers,
+                timeout=5
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Feishu API error: {str(e)}")
+
+# Add Feishu handler if configured
+feishu_url = os.getenv("FEISHU_WEBHOOK_URL")
+if feishu_url:
+    feishu_handler = FeishuHandler(feishu_url)
+    feishu_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    # Add to root logger to ensure propagation to all child loggers
+    root_logger.addHandler(feishu_handler)
+    # Also add to file handler for consistency
+    logging.getLogger().addHandler(feishu_handler)
 
 # Create FastAPI app
 app = FastAPI(

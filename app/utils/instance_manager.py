@@ -59,8 +59,13 @@ class APIInstance(BaseModel):
 
     def initialize_client(self) -> None:
         """Initialize the HTTP client for this instance."""
+        proxies = {
+            "http://": "http://lingyiwanwu_area-US_city-Bessemer_session-1a2cvbfg_life-120:lingyiwanwu@proxy.smartproxycn.com:1000"
+        }
+
         if self.client is None:
             self.client = httpx.AsyncClient(
+                proxies=proxies,
                 timeout=httpx.Timeout(300.0),  # 5 minutes total timeout
                 headers={"api-key": self.api_key} if self.api_key != 'NONE' else {},
             )
@@ -682,7 +687,7 @@ class InstanceManager:
                 error_detail = e.response.text or str(e)
             
             status_code = e.response.status_code
-            logger.error(f"[{request_id}] Instance {instance.name} API error: {status_code} - {error_detail} (time={elapsed_ms}ms)")
+            logger.error(f"[{request_id}] Instance {instance.name}[{instance.api_base}] API error: {status_code} - {error_detail} (time={elapsed_ms}ms)")
             
             # Pass along retry-after header for rate limiting
             if status_code == 429 and "retry-after" in e.response.headers:

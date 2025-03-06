@@ -35,7 +35,7 @@ class AzureOpenAIService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Model name is required",
             )
-        
+            
         # Normalize the model name
         normalized_model = model_name.lower().split(':')[0]
         
@@ -137,6 +137,24 @@ class AzureOpenAIService:
             "required_tokens": required_tokens
         }
         
+    def _clean_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove Azure-specific fields from the response to match OpenAI format."""
+        # Remove top-level Azure-specific fields
+        response.pop("prompt_filter_results", None)
+        response.pop("content_filter_results", None)
+        
+        if "choices" in response:
+            for choice in response["choices"]:
+                # Remove choice-level Azure fields
+                choice.pop("content_filter_results", None)
+                choice.pop("logprobs", None)
+                
+                # Remove refusal field from message
+                if "message" in choice:
+                    choice["message"].pop("refusal", None)
+        
+        return response
+
     async def forward_request(
         self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], method: str = "POST"
     ) -> Dict[str, Any]:
@@ -198,7 +216,9 @@ class AzureOpenAIService:
         
         logger.debug(f"Request completed using Azure instance {instance.name}")
         
-        return result
+        # Clean Azure-specific fields from the response
+        cleaned_result = self._clean_response(result)
+        return cleaned_result
         
     async def get_instances_status(self) -> List[Dict[str, Any]]:
         """Get the status of all Azure instances."""

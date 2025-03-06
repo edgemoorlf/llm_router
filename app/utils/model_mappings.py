@@ -45,8 +45,24 @@ class ModelMapper:
         if model_name.lower() == "deepseek-r1":
             return "DeepSeek-R1"  # This is a special case handled differently in the routing
         
-        # Normalize the model name by removing the version suffix if present
-        normalized_name = model_name.split(':')[0]
+        # Normalize the model name by removing version suffixes (both : and - formats)
+        base_name = model_name.split(':')[0].split('-')[0]
+        # Handle special GPT version formats (e.g. gpt-4o-2024-11-20 -> gpt-4o)
+        if 'gpt' in base_name:
+            parts = model_name.split('-')
+            # Remove hyphens and version numbers for key matching
+            # Handle versioned model names by keeping just the base model identifier
+            # Extract base model name (first two hyphen-separated parts)
+            # Extract base model name and format for env var matching
+            # Handle versioned model names by keeping just the base model identifier
+            # Handle versioned model names by stripping any numeric suffixes
+            # Handle versioned model names by keeping base model identifier
+            # Remove all hyphens and version components
+            # Handle versioned model names by keeping base model identifier
+            base_model = parts[0] + parts[1]  # "gpt-4o-2024-11-20" -> "gpt4o"
+            normalized_name = base_model.lower().replace("-", "")  # Ensure no hyphens remain
+        else:
+            normalized_name = base_name
         
         # Check if we have a direct mapping
         if normalized_name in self.model_map:
