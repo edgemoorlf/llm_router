@@ -6,237 +6,12 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 import httpx
 from fastapi import HTTPException, status
-from enum import Enum
 from pydantic import BaseModel, Field
-
-from app.utils.endpoint_mappings import EndpointMapper
 
 logger = logging.getLogger(__name__)
 
-class RoutingStrategy(str, Enum):
-    """Strategy used to select an API instance."""
-    
-    PRIORITY = "priority"  # Use instance with highest priority (lowest number)
-    ROUND_ROBIN = "round_robin"  # Simple round-robin distribution
-    WEIGHTED = "weighted"  # Weight-based distribution
-    LEAST_LOADED = "least_loaded"  # Use instance with lowest TPM consumption
-    FAILOVER = "failover"  # Try instances in priority order until one succeeds
-    MODEL_SPECIFIC = "model_specific"  # Route based on model support
-
-
-class InstanceStatus(str, Enum):
-    """Status of an API instance."""
-    
-    HEALTHY = "healthy"  # Instance is operational
-    RATE_LIMITED = "rate_limited"  # Instance is rate limited
-    ERROR = "error"  # Instance has encountered an error
-
-
-class APIInstance(BaseModel):
-    """Configuration and state for an OpenAI-compatible service instance."""
-    
-    name: str = Field(..., description="Unique identifier for this instance")
-    provider_type: str = Field(default="azure", description="Provider type (azure or generic)")
-    api_key: str = Field(..., description="API key for the service")
-    api_base: str = Field(..., description="API base URL")
-    api_version: str = Field(..., description="API version")
-    priority: int = Field(default=100, description="Priority (lower is higher priority)")
-    weight: int = Field(default=100, description="Weight for weighted distribution (higher gets more traffic)")
-    max_tpm: int = Field(default=240000, description="Maximum TPM (tokens per minute) for this instance")
-    max_input_tokens: int = Field(default=0, description="Maximum input tokens allowed (0=unlimited)")
-    supported_models: List[str] = Field(default_factory=list, description="List of models supported by this instance")
-    model_deployments: Dict[str, str] = Field(default_factory=dict, description="Mapping of model names to deployment names (for Azure)")
-    
-    # Runtime state
-    status: InstanceStatus = Field(default=InstanceStatus.HEALTHY, description="Current instance status")
-    current_tpm: int = Field(default=0, description="Current TPM usage (resets each minute)")
-    error_count: int = Field(default=0, description="Consecutive error count")
-    last_error: Optional[str] = Field(default=None, description="Last error message")
-    rate_limited_until: Optional[float] = Field(default=None, description="Timestamp when rate limit expires")
-    usage_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of token usage (timestamp -> tokens)")
-    client: Optional[Any] = Field(default=None, exclude=True, description="HTTP client for this instance")
-    last_used: float = Field(default=0.0, description="Timestamp when this instance was last used")
-
-    def initialize_client(self) -> None:
-        """Initialize the HTTP client for this instance."""
-        proxies = {
-            "http://": "http://lingyiwanwu_area-US_city-Bessemer_session-1a2cvbfg_life-120:lingyiwanwu@proxy.smartproxycn.com:1000"
-        }
-
-        if self.client is None:
-            self.client = httpx.AsyncClient(
-                proxies=proxies,
-                timeout=httpx.Timeout(300.0),  # 5 minutes total timeout
-                headers={"api-key": self.api_key} if self.api_key != 'NONE' else {},
-            )
-    
-    def update_tpm_usage(self, tokens: int) -> None:
-        """
-        Update the TPM usage for this instance.
-        
-        Args:
-            tokens: Number of tokens used
-        """
-        current_time = int(time.time())
-        window_start = current_time - 60  # 1 minute window
-        
-        # Clean up old entries
-        self.usage_window = {ts: usage for ts, usage in self.usage_window.items() if ts >= window_start}
-        
-        # Add new usage
-        self.usage_window[current_time] = self.usage_window.get(current_time, 0) + tokens
-        
-        # Update current TPM
-        self.current_tpm = sum(self.usage_window.values())
-    
-    def is_rate_limited(self) -> bool:
-        """Check if this instance is currently rate limited."""
-        # Check if we're in a rate-limited state
-        if self.status == InstanceStatus.RATE_LIMITED:
-            current_time = time.time()
-            
-            # Check if rate limit has expired
-            if self.rate_limited_until and current_time >= self.rate_limited_until:
-                logger.info(f"Instance {self.name} rate limit has expired, marking as healthy")
-                self.status = InstanceStatus.HEALTHY
-                self.rate_limited_until = None
-                return False
-            
-            return True
-        
-        # Check if we're approaching the TPM limit
-        if self.current_tpm >= self.max_tpm * 0.95:  # 95% of max TPM
-            logger.warning(f"Instance {self.name} is approaching TPM limit: {self.current_tpm}/{self.max_tpm}")
-            return True
-        
-        return False
-    
-    def mark_rate_limited(self, retry_after: Optional[int] = None) -> None:
-        """
-        Mark this instance as rate limited.
-        
-        Args:
-            retry_after: Seconds until the rate limit expires
-        """
-        self.status = InstanceStatus.RATE_LIMITED
-        
-        if retry_after is None:
-            retry_after = 60  # Default to 1 minute
-        
-        self.rate_limited_until = time.time() + retry_after
-        logger.warning(f"Instance {self.name} marked as rate limited for {retry_after} seconds")
-    
-    def mark_error(self, error_message: str) -> None:
-        """
-        Mark this instance as having an error.
-        
-        Args:
-            error_message: Error message
-        """
-        self.error_count += 1
-        self.last_error = error_message
-        
-        if self.error_count >= 3:  # Three strikes and you're out
-            self.status = InstanceStatus.ERROR
-            logger.error(f"Instance {self.name} marked as error after {self.error_count} consecutive errors")
-    
-    def mark_healthy(self) -> None:
-        """Mark this instance as healthy."""
-        self.status = InstanceStatus.HEALTHY
-        self.error_count = 0
-        self.last_error = None
-        self.rate_limited_until = None
-    
-    def build_url(self, endpoint: str, deployment_name: str) -> str:
-        """
-        Build the API URL for this instance.
-        
-        Args:
-            endpoint: The API endpoint
-            deployment_name: The deployment name
-            
-        Returns:
-            The full API URL
-        """
-        logger.debug(f"Building URL for instance {self.name}, provider_type={self.provider_type}, endpoint={endpoint}, deployment={deployment_name}")
-        
-        # For generic provider type, keep the original endpoint without any transformation
-        if self.provider_type == "generic":
-            # For generic OpenAI-compatible services, use the original endpoint
-            # This preserves the original endpoint structure without transformation
-            url = f"{self.api_base}{endpoint}"
-            logger.debug(f"Generic provider URL: {url}")
-            return url
-        
-        # Special case for DeepSeek R1 model (only for Azure provider type)
-        if deployment_name == "DeepSeek-R1":
-            # DeepSeek R1 uses a different endpoint structure
-            if endpoint == "/v1/chat/completions":
-                url = f"{self.api_base}/deepseek/chat/completions?api-version={self.api_version}"
-                logger.debug(f"DeepSeek R1 chat URL: {url}")
-                return url
-            elif endpoint == "/v1/completions":
-                url = f"{self.api_base}/deepseek/completions?api-version={self.api_version}"
-                logger.debug(f"DeepSeek R1 completions URL: {url}")
-                return url
-            elif endpoint == "/v1/embeddings":
-                url = f"{self.api_base}/deepseek/embeddings?api-version={self.api_version}"
-                logger.debug(f"DeepSeek R1 embeddings URL: {url}")
-                return url
-            else:
-                # For other endpoints, use a generic format
-                endpoint_part = endpoint.split("/")[-1]  # Get the last part of the path
-                url = f"{self.api_base}/deepseek/{endpoint_part}?api-version={self.api_version}"
-                logger.debug(f"DeepSeek R1 other endpoint URL: {url}")
-                return url
-        
-        # Use the EndpointMapper to get the appropriate endpoint for the provider
-        mapper = EndpointMapper()
-        
-        # Determine endpoint type from the endpoint path
-        endpoint_type = None
-        if "/chat/completions" in endpoint:
-            endpoint_type = "chat"
-            logger.debug(f"Detected endpoint type: chat")
-        elif "/completions" in endpoint and "/chat/completions" not in endpoint:
-            endpoint_type = "completions"
-            logger.debug(f"Detected endpoint type: completions")
-        elif "/embeddings" in endpoint:
-            endpoint_type = "embeddings"
-            logger.debug(f"Detected endpoint type: embeddings")
-        else:
-            # For unsupported endpoints, try to extract the operation name
-            parts = endpoint.split("/")
-            if len(parts) >= 3 and parts[-2] == "deployments":
-                # Already in Azure format
-                url = f"{self.api_base}{endpoint}"
-                logger.debug(f"Already in Azure format URL: {url}")
-                return url
-            else:
-                # Unknown endpoint format
-                logger.error(f"Unsupported endpoint: {endpoint}")
-                raise ValueError(f"Unsupported endpoint: {endpoint}")
-        
-        try:
-            # For Azure, use the endpoint mapper to get the Azure-specific endpoint format
-            provider_endpoint = mapper.get_endpoint(
-                provider=self.provider_type,
-                endpoint_type=endpoint_type,
-                deployment=deployment_name
-            )
-            
-            logger.debug(f"Mapped provider endpoint: {provider_endpoint}")
-            
-            # For Azure, we need to append the API version
-            url = f"{self.api_base}{provider_endpoint}?api-version={self.api_version}"
-            logger.debug(f"Final URL: {url}")
-            return url
-            
-        except ValueError as e:
-            error_msg = f"Error building URL: {str(e)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
+from .routing_strategy import RoutingStrategy
+from .api_instance import APIInstance, InstanceStatus
 
 class InstanceManager:
     """Manager for multiple API service instances with load balancing and failover."""
@@ -259,6 +34,47 @@ class InstanceManager:
         
         logger.info(f"Initialized {len(self.instances)} API instances with {routing_strategy} routing strategy")
     
+    def load_from_csv(self, csv_path: str) -> None:
+        """Load instances from a CSV file, replacing existing configuration."""
+        self.instances.clear()
+        self._load_instances_from_csv(csv_path)
+        if not self.instances:
+            logger.warning("No instances loaded from CSV. Falling back to environment variables.")
+            self._load_instances_from_env()
+        logger.info(f"Loaded {len(self.instances)} instances from CSV")
+
+    def _load_instances_from_csv(self, csv_path: str) -> None:
+        """Load instances from a CSV file."""
+        try:
+            with open(csv_path, newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row_idx, row in enumerate(reader, start=1):
+                    try:
+                        name = row.get('name', f'instance-{row_idx}')
+                        instance = APIInstance(
+                            name=name,
+                            provider_type=row.get('provider_type', 'azure').lower(),
+                            api_key=row['API_KEY'],
+                            api_base=row['API_BASE'],
+                            api_version=row.get('api_version', '2023-07-01-preview'),
+                            proxy_url=row.get('proxy_url'),
+                            priority=int(row.get('priority', 100)),
+                            weight=int(row.get('weight', 100)),
+                            max_tpm=int(row.get('max_tpm', 240000)),
+                            max_input_tokens=int(row.get('max_input_tokens', 0)),
+                            supported_models=[m.strip() for m in row.get('model_name', '').split(',') if m.strip()],
+                        )
+                        instance.initialize_client()
+                        self.instances[name] = instance
+                        logger.info(f"Loaded API instance {name} from CSV")
+                    except KeyError as e:
+                        logger.error(f"Missing required column {e} in CSV row {row_idx}")
+                    except Exception as e:
+                        logger.error(f"Error loading instance from CSV row {row_idx}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Failed to load instances from CSV: {str(e)}")
+            raise
+
     def _load_instances_from_env(self) -> None:
         """Load instances from environment variables."""
         instance_names = os.getenv("API_INSTANCES", "").split(",")
@@ -341,13 +157,19 @@ class InstanceManager:
         Returns:
             Selected instance or None if no suitable instance is available
         """
-        # Filter healthy instances with enough TPM capacity
+        # Filter healthy instances with enough capacity
         available_instances = [
             instance for instance in self.instances.values()
             if (instance.status == InstanceStatus.HEALTHY or 
                 (instance.status == InstanceStatus.RATE_LIMITED and time.time() >= (instance.rate_limited_until or 0)))
             and (instance.current_tpm + required_tokens) <= instance.max_tpm
             and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
+        ]
+        
+        # Enforce max input tokens strictly
+        available_instances = [
+            instance for instance in available_instances
+            if instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens
         ]
         
         # If a model name is provided, filter instances that support this model
@@ -377,10 +199,12 @@ class InstanceManager:
         
         if not available_instances:
             logger.warning(f"No healthy instances available with enough TPM capacity for {required_tokens} tokens")
-            # Try to find any instance that's not in error state as a fallback
+            # Try to find any instance that's not in error state but still respects token limits
             available_instances = [
                 instance for instance in self.instances.values()
                 if instance.status != InstanceStatus.ERROR
+                and (instance.current_tpm + required_tokens) <= instance.max_tpm
+                and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
             ]
             
             if not available_instances:
@@ -490,8 +314,8 @@ class InstanceManager:
         
         # Try strategy-based instance first, prioritizing instances that support this model
         primary_instance = self.select_instance(required_tokens, model_name)
-        logger.debug(f"Selected primary instance: {primary_instance.name if primary_instance else 'None'} for model: {model_name}")
         if primary_instance:
+            logger.debug(f"Selected primary instance: {primary_instance.name if primary_instance else 'None'} for model: {model_name} with max input tokens: {primary_instance.max_input_tokens} vs required tokens: {required_tokens}")
             try:
                 response = await self._forward_request(primary_instance, endpoint, deployment, payload, method)
                 # Mark instance as healthy and update TPM
@@ -524,7 +348,15 @@ class InstanceManager:
                 primary_instance.mark_error(str(e))
                 logger.error(f"Unexpected error from instance {primary_instance.name}: {str(e)}")
                 # Fall through to try other instances
-        
+        else: 
+            error_message = "No instance found"
+            logger.error(error_message)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=error_message,
+        )
+
+
         # If primary instance failed or not found, try all other instances in priority order
         # Sort by priority and filter by model support if possible
         available_instances.sort(key=lambda x: x.priority)

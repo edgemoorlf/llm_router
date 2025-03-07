@@ -1,6 +1,6 @@
-"""Azure OpenAI service for forwarding and transforming requests to Azure OpenAI instances."""
+"""Azure OpenAI service for forwarding and transforming requests to Azure OpenAI instances using DRY request handling."""
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 
 from app.utils.model_mappings import model_mapper
@@ -11,7 +11,7 @@ from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_
 logger = logging.getLogger(__name__)
 
 class AzureOpenAIService:
-    """Service for transforming and forwarding requests specifically to Azure OpenAI instances."""
+    """Service for Azure OpenAI requests with streamlined endpoint methods."""
     
     def __init__(self):
         """Initialize the Azure OpenAI service."""
@@ -96,7 +96,7 @@ class AzureOpenAIService:
                 model_name,
                 "azure"
             )
-        
+
         # For completions endpoint
         elif endpoint == "/v1/completions":
             # Estimate tokens for standard completions
@@ -131,10 +131,12 @@ class AzureOpenAIService:
         # Log the transformation
         logger.debug(f"Transformed request for model '{model_name}' to Azure deployment '{deployment_name}' (est. {required_tokens} tokens)")
         
+        azure_payload["required_tokens"] = required_tokens
+        logger.debug(f"azure_payload required_tokens {azure_payload.get('required_tokens')}")
         return {
             "azure_deployment": deployment_name,
-            "payload": azure_payload,
-            "required_tokens": required_tokens
+            "payload": azure_payload
+            # "required_tokens": required_tokens
         }
         
     def _clean_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -158,67 +160,42 @@ class AzureOpenAIService:
     async def forward_request(
         self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], method: str = "POST"
     ) -> Dict[str, Any]:
-        """
-        Forward a request to an available Azure OpenAI instance with automatic failover.
-        
-        Args:
-            endpoint: The API endpoint
-            azure_deployment: The Azure deployment name
-            payload: The request payload
-            method: The HTTP method
-            
-        Returns:
-            The API response
-        """
-        # Get the estimated token requirement from the payload
-        required_tokens = payload.pop("required_tokens", 1000)  # Default if not available
-        
-        # Filter instances to only include Azure provider types
-        azure_instances = [
-            instance for instance in instance_manager.instances.values()
-            if instance.provider_type == "azure"
-        ]
+        """Forward request to Azure instances with failover handling."""
+        required_tokens = payload.pop("required_tokens", 1000)
+        azure_instances = self._get_azure_instances()
         
         if not azure_instances:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No Azure OpenAI instances available",
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "No Azure instances available")
+            
+        primary_instance = self._select_primary_instance(azure_instances, required_tokens, azure_deployment)
+        return await self._execute_request(endpoint, azure_deployment, payload, required_tokens, method, primary_instance)
+
+    def _get_azure_instances(self) -> list:
+        """Get all available Azure instances."""
+        return [i for i in instance_manager.instances.values() if i.provider_type == "azure"]
+
+    def _select_primary_instance(self, instances: list, tokens: int, deployment: str) -> Optional[object]:
+        """Select primary instance based on routing strategy."""
+        instance = instance_manager.select_instance(tokens, deployment)
+        if instance and instance.provider_type == "azure":
+            return instance
+        return next((i for i in instances if deployment in i.model_deployments.values()), instances[0] if instances else None)
+
+    async def _execute_request(
+        self, endpoint: str, deployment: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[object]
+    ) -> Dict[str, Any]:
+        """Execute the request with failover handling."""
+        try:
+            logger.debug(f"payload output 4 required tokens: {payload.get('required_tokens', required_tokens)}")
+            result, used_instance = await instance_manager.try_instances(
+                endpoint, deployment, payload, required_tokens, method, "azure"
             )
-        
-        # Select an Azure instance based on the routing strategy
-        primary_instance = instance_manager.select_instance(required_tokens, azure_deployment)
-        
-        # Ensure we only selected an Azure instance
-        if primary_instance and primary_instance.provider_type != "azure":
-            logger.warning(f"Non-Azure instance {primary_instance.name} selected, filtering to Azure only")
-            primary_instance = None
-            
-            # Try to find a suitable Azure instance
-            for instance in azure_instances:
-                if azure_deployment in instance.model_deployments.values():
-                    primary_instance = instance
-                    break
-            
-            # If still no instance found, use the first Azure instance
-            if not primary_instance and azure_instances:
-                primary_instance = azure_instances[0]
-        
-        # Try to send the request to an available Azure instance with failover
-        # We'll only try Azure instances
-        result, instance = await instance_manager.try_instances(
-            endpoint, 
-            azure_deployment, 
-            payload, 
-            required_tokens,
-            method,
-            provider_type="azure"  # Only try Azure instances
-        )
-        
-        logger.debug(f"Request completed using Azure instance {instance.name}")
-        
-        # Clean Azure-specific fields from the response
-        cleaned_result = self._clean_response(result)
-        return cleaned_result
+            logger.debug(f"Request completed using Azure instance {used_instance.name}")
+            return self._clean_response(result)
+        except HTTPException as e:
+            if "content management policy" in e.detail.lower():
+                logger.debug(f"Content policy violation - prompt: {payload.get('messages', '')}")
+            raise
         
     async def get_instances_status(self) -> List[Dict[str, Any]]:
         """Get the status of all Azure instances."""

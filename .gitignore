@@ -50,3 +50,7 @@ dump.rdb
 
 # Misc
 .DS_Store
+
+# Data
+data/
+*.csv

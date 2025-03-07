@@ -480,12 +480,30 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     # Estimate tokens for rate limiting and instance selection
     required_tokens = 0
     if endpoint == "/v1/chat/completions":
+        # Calculate precise token count using improved estimator
         required_tokens = estimate_chat_tokens(
-            payload.get("messages", []),
-            payload.get("functions", None),
-            payload.get("model", ""),
-            provider_type
+            messages=payload.get("messages", []),
+            functions=payload.get("functions"),
+            model=payload.get("model", ""),
+            provider=provider_type
         )
+        
+        # Validate against max input tokens before proceeding
+        max_input_tokens = next((inst.max_input_tokens for inst in instance_manager.instances.values() 
+                               if inst.max_input_tokens > 0), None)
+        logger.debug(f"required tokens {required_tokens} vs max input tokens {max_input_tokens}")        
+        if max_input_tokens and required_tokens > max_input_tokens:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Request exceeds maximum input tokens ({required_tokens} > {max_input_tokens})"
+            )
+        
+        # Enforce strict token limits before instance selection
+        if required_tokens <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid token count estimation"
+            )
     elif endpoint == "/v1/completions":
         required_tokens = estimate_completion_tokens(
             payload.get("prompt", ""),
@@ -500,7 +518,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     
     # Select an instance based on the routing strategy and model support
     primary_instance = instance_manager.select_instance(required_tokens, model_name)
-    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name}")
+    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens}")
     
     # For Azure provider types, remove the model field since it uses deployment names
     # For generic provider types, keep the model field since it's required
