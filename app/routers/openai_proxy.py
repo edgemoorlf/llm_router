@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from app.instance.manager import instance_manager
 from app.services.azure_openai import azure_openai_service
 from app.services.generic_openai import generic_openai_service
-from app.utils.instance_manager import instance_manager
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 
 logger = logging.getLogger(__name__)

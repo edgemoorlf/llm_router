@@ -3,9 +3,9 @@ import logging
 from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 
+from app.instance.manager import instance_manager
 from app.utils.model_mappings import model_mapper
 from app.utils.rate_limiter import rate_limiter
-from app.utils.instance_manager import instance_manager
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 
 logger = logging.getLogger(__name__)

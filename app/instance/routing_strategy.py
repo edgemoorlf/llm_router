@@ -7,4 +7,4 @@ class RoutingStrategy(str, Enum):
     WEIGHTED = "weighted"
     LEAST_LOADED = "least_loaded"
     FAILOVER = "failover"
-    MODEL_SPECIFIC = "model_specific"
+    MODEL_SPECIFIC = "model_specific" 

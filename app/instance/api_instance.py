@@ -4,9 +4,8 @@ from typing import Optional, Dict, List, Any
 import time
 import httpx
 import logging
-from .endpoint_mappings import EndpointMapper
 
-from .endpoint_mappings import EndpointMapper
+from app.utils.endpoint_mappings import EndpointMapper
 
 logger = logging.getLogger(__name__)
 
@@ -137,4 +136,4 @@ class APIInstance(BaseModel):
             return f"{self.api_base}{provider_endpoint}?api-version={self.api_version}"
         except ValueError as e:
             logger.error(f"Error building URL: {str(e)}")
-            raise
+            raise 

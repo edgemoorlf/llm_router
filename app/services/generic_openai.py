@@ -1,11 +1,11 @@
 """Generic OpenAI service for forwarding and transforming requests to generic OpenAI-compatible instances."""
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from fastapi import HTTPException, status
 
+from app.instance.manager import instance_manager
 from app.utils.rate_limiter import rate_limiter
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
-from app.utils.instance_manager import instance_manager
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,8 @@ class GenericOpenAIService:
         # Estimate tokens for rate limiting and instance selection
         required_tokens = 0
         
-        # For handling specific endpoints
-        if endpoint == "/v1/chat/completions":
+        # For handling specific endpoints; somehow new API is sending /v1/chat/completions/v1/chat/completions
+        if endpoint == "/v1/chat/completions" or endpoint == "/v1/chat/completions/v1/chat/completions":
             # Estimate tokens for chat completions
             required_tokens = estimate_chat_tokens(
                 generic_payload.get("messages", []),
@@ -90,7 +90,7 @@ class GenericOpenAIService:
         
         # For other endpoints, use a minimum token count for rate limiting
         else:
-            required_tokens = 100  # Minimum token count for unknown endpoints
+            required_tokens = 42  # Minimum token count for unknown endpoints
         
         # Check against global rate limiter (if enabled)
         if not generic_payload.get("stream", False) and required_tokens > 0:
