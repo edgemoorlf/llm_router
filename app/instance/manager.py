@@ -120,6 +120,46 @@ class InstanceManager:
             Summary of instance health status
         """
         return self.monitor.get_health_status(self.instances)
+    
+    def get_service_metrics(self, window_minutes: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Get overall service performance metrics for a specific time window.
+        
+        Args:
+            window_minutes: Time window in minutes for calculations, default uses the average 
+                           of all instances' rpm_window_minutes
+            
+        Returns:
+            Overall service metrics for the specified time window
+        """
+        return self.monitor.get_service_metrics(self.instances, window_minutes)
+    
+    def get_metrics_for_multiple_windows(self, windows: List[int] = [5, 15, 30, 60]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get service metrics for multiple time windows.
+        
+        Args:
+            windows: List of time windows in minutes to calculate metrics for
+            
+        Returns:
+            Dictionary of service metrics for each time window
+        """
+        return self.monitor.get_multiple_window_metrics(self.instances, windows)
+    
+    def set_rpm_window_for_all(self, minutes: int) -> None:
+        """
+        Set the RPM calculation window for all instances.
+        
+        Args:
+            minutes: The number of minutes to use for the RPM calculation window
+        """
+        if minutes <= 0:
+            raise ValueError("RPM window must be positive")
+            
+        for instance in self.instances.values():
+            instance.set_rpm_window(minutes)
+            
+        logger.info(f"Set RPM window for all instances to {minutes} minutes")
 
 
 # Create a singleton instance with the default routing strategy

@@ -19,41 +19,40 @@ router = APIRouter(prefix="/v1", tags=["openai"])
 
 def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     """
-    Determine which service to use based on the model name and available instances.
+    Determine which service to use based on the model name.
     
     Args:
-        model_name: The model name from the request
+        model_name: Name of the model
         
     Returns:
-        Tuple of (service, provider_type)
+        A tuple of (service, provider_type)
     """
+    if not model_name:
+        logger.debug("No model name provided, using Azure service by default")
+        return azure_openai_service, "azure"
+    
     # Normalize the model name
-    normalized_model = model_name.lower().split(':')[0]
+    model_name = model_name.lower()
     
-    # Check if we have any generic instances that support this model
-    generic_instances = [
-        instance for instance in instance_manager.instances.values()
-        if (
-            instance.provider_type == "generic" and
-            (
-                normalized_model in [m.lower() for m in instance.supported_models] or
-                not instance.supported_models  # Empty list means it supports all models
-            )
-        )
-    ]
+    # Get available instances for each provider type
+    azure_instances = instance_manager.router.get_available_instances_for_model(
+        instance_manager.instances, 
+        model_name,
+        provider_type="azure"
+    )
     
-    # Check if we have any Azure instances that support this model
-    azure_instances = [
-        instance for instance in instance_manager.instances.values()
-        if (
-            instance.provider_type == "azure" and
-            (
-                normalized_model in [m.lower() for m in instance.supported_models] or
-                normalized_model in instance.model_deployments or
-                not instance.supported_models  # Empty list means it supports all models
-            )
-        )
-    ]
+    generic_instances = instance_manager.router.get_available_instances_for_model(
+        instance_manager.instances, 
+        model_name,
+        provider_type="generic"
+    )
+    
+    # Log what we found for debugging
+    if azure_instances:
+        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{model_name}'")
+    
+    if generic_instances:
+        logger.debug(f"Found {len(generic_instances)} Generic instances supporting model '{model_name}'")
     
     # Decide which service to use based on available instances
     if generic_instances and not azure_instances:
@@ -73,40 +72,6 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
         # No instances explicitly support this model, default to Azure
         logger.warning(f"No instances explicitly support model '{model_name}', defaulting to Azure service")
         return azure_openai_service, "azure"
-
-@router.get("/instances/status")
-async def get_instances_status() -> JSONResponse:
-    """
-    Get the status of all API instances.
-    
-    Returns detailed information about each instance, including:
-    - Health status (healthy, rate limited, error)
-    - Current TPM usage
-    - TPM limits
-    - Priority and weight settings
-    - Error information if applicable
-    """
-    try:
-        # Get status from both services and combine them
-        azure_instances = await azure_openai_service.get_instances_status()
-        generic_instances = await generic_openai_service.get_instances_status()
-        instances = azure_instances + generic_instances
-        return JSONResponse(
-            content={
-                "status": "success",
-                "timestamp": int(time.time()),
-                "instances": instances,
-                "total_instances": len(instances),
-                "healthy_instances": len([i for i in instances if i["status"] == "healthy"]),
-                "routing_strategy": os.getenv("API_ROUTING_STRATEGY", "failover")
-            }
-        )
-    except Exception as e:
-        logger.exception("Error getting instances status")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error getting instances status: {str(e)}",
-        )
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request) -> Any:

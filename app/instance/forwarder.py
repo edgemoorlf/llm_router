@@ -6,6 +6,7 @@ import httpx
 from fastapi import HTTPException, status
 
 from .api_instance import APIInstance
+from .service_stats import service_stats
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,13 @@ class RequestForwarder:
         """
         url = instance.build_url(endpoint, deployment)
         instance.last_used = time.time()
+        current_time = int(time.time())
+        
+        # Update request per minute counter for instance
+        instance.update_rpm_usage()
+        
+        # Record request in global service stats
+        service_stats.record_request(current_time)
         
         # Log request details at debug level
         request_id = f"req-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
@@ -72,11 +80,19 @@ class RequestForwarder:
                 result = response.json()
                 
                 # Log token usage if available
+                tokens_used = 0
                 if "usage" in result and "total_tokens" in result["usage"]:
-                    logger.debug(f"[{request_id}] Token usage: {result['usage']['total_tokens']} total tokens")
+                    tokens_used = result["usage"]["total_tokens"]
+                    logger.debug(f"[{request_id}] Token usage: {tokens_used} total tokens")
+                
+                # Record successful request in global service stats
+                service_stats.record_successful_request(current_time, tokens_used)
             else:
                 result = {"text": response.text}
                 logger.debug(f"[{request_id}] Non-JSON response received: {len(response.text)} bytes")
+                
+                # Record successful request in global service stats (without token count)
+                service_stats.record_successful_request(current_time)
             
             return result
         
@@ -93,6 +109,13 @@ class RequestForwarder:
                 error_detail = e.response.text or str(e)
             
             status_code = e.response.status_code
+            
+            # Record upstream error from the endpoint in instance
+            instance.record_upstream_error(status_code)
+            
+            # Record upstream error in global service stats
+            service_stats.record_upstream_error(current_time)
+            
             logger.error(f"[{request_id}] Instance {instance.name}[{instance.api_base}] API error: {status_code} - {error_detail} (time={elapsed_ms}ms)")
             
             # Pass along retry-after header for rate limiting
@@ -112,7 +135,11 @@ class RequestForwarder:
             # Handle connection errors
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_type = type(e).__name__
-            logger.error(f"[{request_id}] Connection error to instance {instance.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
+            
+            # Record as a downstream error (typically results in a 503 response to client)
+            instance.record_error(503)
+            
+            logger.warning(f"[{request_id}] Connection error to instance {instance.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Connection error to API instance {instance.name}: {str(e)}",
@@ -121,6 +148,13 @@ class RequestForwarder:
             # Handle unexpected errors
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_type = type(e).__name__
+            
+            # Record as downnstream 500 error
+            instance.record_upstream_error(500)
+            
+            # Record upstream error in global service stats
+            service_stats.record_upstream_error(current_time)
+            
             logger.error(f"[{request_id}] Unexpected error with instance {instance.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -155,6 +189,8 @@ class RequestForwarder:
         Raises:
             HTTPException: If all instances fail
         """
+        current_time = int(time.time())
+        
         # Extract model name from payload if available
         model_name = None
         if "model" in payload:
@@ -190,18 +226,24 @@ class RequestForwarder:
                     logger.warning(f"Instance {primary_instance.name} rate limited: {detail}")
                 else:
                     primary_instance.mark_error(str(e))
-                    logger.error(f"Error from instance {primary_instance.name}: {detail}")
+                    logger.warning(f"Error from instance {primary_instance.name}: {detail}")
                 
                 # Fall through to try other instances
             except Exception as e:
+                # Instance errors already recorded in forward_request
                 primary_instance.mark_error(str(e))
-                logger.error(f"Unexpected error from instance {primary_instance.name}: {str(e)}")
+                logger.warning(f"Unexpected error from instance {primary_instance.name}: {str(e)}")
                 # Fall through to try other instances
         else: 
             error_message = "No instance found"
             logger.error(error_message)
+            
+            # 全局记录客户端错误，不再依赖单个实例
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            service_stats.record_client_error(status_code, current_time)
+                
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                status_code=status_code,
                 detail=error_message,
             )
 
@@ -244,18 +286,25 @@ class RequestForwarder:
                     logger.warning(f"Instance {instance.name} rate limited: {detail}")
                 else:
                     instance.mark_error(str(e))
-                    logger.error(f"Error from instance {instance.name}: {detail}")
+                    logger.warning(f"Error from instance {instance.name}: {detail}")
                 
                 errors.append(f"{instance.name}: {detail}")
             except Exception as e:
+                # Instance errors already recorded in forward_request
                 instance.mark_error(str(e))
                 logger.error(f"Unexpected error from instance {instance.name}: {str(e)}")
                 errors.append(f"{instance.name}: {str(e)}")
         
-        # If we get here, all instances failed
+        # 所有实例都失败了 - 这是将发送给客户端的错误
         error_message = f"All API instances failed: {'; '.join(errors)}"
         logger.error(error_message)
+        
+        # 全局记录客户端错误，不再依赖单个实例
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        service_stats.record_client_error(status_code, current_time)
+        
+        # No instance available, return 503 Service Unavailable
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=status_code,
             detail=error_message,
         ) 

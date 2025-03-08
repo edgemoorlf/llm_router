@@ -6,6 +6,7 @@ import httpx
 import logging
 
 from app.utils.endpoint_mappings import EndpointMapper
+from app.instance.instance_stats import InstanceStats
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +37,13 @@ class APIInstance(BaseModel):
     
     # Runtime state
     status: InstanceStatus = Field(default=InstanceStatus.HEALTHY, description="Current instance status")
-    current_tpm: int = Field(default=0, description="Current TPM usage (resets each minute)")
     error_count: int = Field(default=0, description="Consecutive error count")
     last_error: Optional[str] = Field(default=None, description="Last error message")
     rate_limited_until: Optional[float] = Field(default=None, description="Timestamp when rate limit expires")
-    usage_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of token usage (timestamp -> tokens)")
+    
+    # Statistics
+    instance_stats: InstanceStats = Field(default_factory=InstanceStats, description="Instance statistics")
+    
     client: Optional[Any] = Field(default=None, exclude=True, description="HTTP client for this instance")
     last_used: float = Field(default=0.0, description="Timestamp when this instance was last used")
 
@@ -56,11 +59,50 @@ class APIInstance(BaseModel):
             )
     
     def update_tpm_usage(self, tokens: int) -> None:
-        current_time = int(time.time())
-        window_start = current_time - 60
-        self.usage_window = {ts: usage for ts, usage in self.usage_window.items() if ts >= window_start}
-        self.usage_window[current_time] = self.usage_window.get(current_time, 0) + tokens
-        self.current_tpm = sum(self.usage_window.values())
+        """Update the tokens per minute usage with sliding window."""
+        self.instance_stats.update_tpm_usage(tokens)
+    
+    def update_rpm_usage(self) -> None:
+        """
+        Update the requests per minute counter with sliding window.
+        Uses the configured time window (rpm_window_minutes) for calculation.
+        """
+        self.instance_stats.update_rpm_usage(self.name)
+    
+    def record_error(self, status_code: int) -> None:
+        """
+        Record an instance-level error encountered by this instance.
+        These errors may not be sent to clients if the request is retried on another instance.
+        
+        Args:
+            status_code: HTTP status code of the error
+        """
+        self.instance_stats.record_error(status_code, self.name)
+    
+    def record_client_error(self, timestamp: int, error_type: str) -> None:
+        """
+        Record a client-level error that was actually returned to the client.
+        This happens when all instances have failed, and the error is returned to the client.
+        
+        Args:
+            timestamp: Time when the error occurred
+            error_type: Type of error ("500", "503", or "other")
+        """
+        status_code = 500 if error_type == "500" else (503 if error_type == "503" else 0)
+        self.instance_stats.record_client_error(status_code, self.name, timestamp)
+    
+    def record_upstream_error(self, status_code: int) -> None:
+        """
+        Record an error received from an upstream API endpoint.
+        
+        Args:
+            status_code: HTTP status code of the error
+        """
+        self.instance_stats.record_upstream_error(status_code, self.name)
+    
+    def set_rpm_window(self, minutes: int) -> None:
+        """Set the time window for RPM calculation."""
+        self.instance_stats.set_rpm_window(minutes, self.name)
     
     def is_rate_limited(self) -> bool:
         if self.status == InstanceStatus.RATE_LIMITED:
@@ -71,8 +113,8 @@ class APIInstance(BaseModel):
                 self.rate_limited_until = None
                 return False
             return True
-        if self.current_tpm >= self.max_tpm * 0.95:
-            logger.warning(f"Instance {self.name} is approaching TPM limit: {self.current_tpm}/{self.max_tpm}")
+        if self.instance_stats.current_tpm >= self.max_tpm * 0.95:
+            logger.warning(f"Instance {self.name} is approaching TPM limit: {self.instance_stats.current_tpm}/{self.max_tpm}")
             return True
         return False
     
@@ -88,7 +130,7 @@ class APIInstance(BaseModel):
         self.last_error = error_message
         if self.error_count >= 3:
             self.status = InstanceStatus.ERROR
-            logger.error(f"Instance {self.name} marked as error after {self.error_count} consecutive errors")
+            logger.warning(f"Instance {self.name} marked as error after {self.error_count} consecutive errors")
     
     def mark_healthy(self) -> None:
         self.status = InstanceStatus.HEALTHY

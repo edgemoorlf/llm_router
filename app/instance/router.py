@@ -41,7 +41,7 @@ class InstanceRouter:
             instance for instance in instances.values()
             if (instance.status == "healthy" or 
                 (instance.status == "rate_limited" and time.time() >= (instance.rate_limited_until or 0)))
-            and (instance.current_tpm + required_tokens) <= instance.max_tpm
+            and (instance.instance_stats.current_tpm + required_tokens) <= instance.max_tpm
             and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
         ]
         
@@ -76,7 +76,7 @@ class InstanceRouter:
             available_instances = [
                 instance for instance in instances.values()
                 if instance.status != "error"
-                and (instance.current_tpm + required_tokens) <= instance.max_tpm
+                and (instance.instance_stats.current_tpm + required_tokens) <= instance.max_tpm
                 and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
             ]
             
@@ -120,7 +120,7 @@ class InstanceRouter:
             
         elif self.routing_strategy == RoutingStrategy.LEAST_LOADED:
             # Sort by current TPM usage (lower is better)
-            available_instances.sort(key=lambda x: x.current_tpm)
+            available_instances.sort(key=lambda x: x.instance_stats.current_tpm)
             return available_instances[0]
             
         elif self.routing_strategy == RoutingStrategy.FAILOVER:

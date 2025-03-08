@@ -17,7 +17,7 @@ log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO"))
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # Create logs directory if it doesn't exist
-log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "logs"))
+log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../logs"))
 os.makedirs(log_dir, exist_ok=True)
 
 # Configure logging FIRST
@@ -96,7 +96,7 @@ if feishu_url:
 app = FastAPI(
     title="Azure OpenAI Proxy",
     description="A proxy service to convert OpenAI API calls to Azure OpenAI API calls with rate limiting",
-    version="0.1.0",
+    version="1.0.2a",
 )
 
 # Add middleware for request/response logging
@@ -125,9 +125,11 @@ async def log_requests(request: Request, call_next):
 
 # Import routers after app is created to avoid circular imports
 from app.routers import openai_proxy
+from app.routers import stats  # 添加 stats 路由导入
 
 # Include routers
 app.include_router(openai_proxy.router)
+app.include_router(stats.router)  # 添加 stats 路由
 
 @app.get("/")
 async def root():
@@ -141,8 +143,8 @@ async def health_check():
     """
     Health check endpoint that returns basic status information.
     Also checks the status of all Azure OpenAI instances.
-    """
-    from app.utils.instance_manager import instance_manager
+    """    
+    from app.instance.manager import instance_manager
     
     try:
         # Get instance stats
