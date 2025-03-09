@@ -1,0 +1,25 @@
+# Production environment configuration
+# Overrides base.yaml settings
+
+# Example of real instance configuration (uncomment and modify)
+instances:
+  # - name: "prod-instance-1"
+  #   provider_type: "azure"
+  #   api_key: "${AZURE_API_KEY_PROD_1}"
+  #   api_base: "https://prod-instance-1.openai.azure.com"
+  #   api_version: "2024-08-01-preview"
+  #   priority: 1  # Higher priority than other instances
+  #   weight: 100
+  #   max_tpm: 240000
+  #   supported_models:
+  #     - "gpt-4o-mini"
+  #     - "gpt-4o"
+  #     - "gpt-4"
+  #   model_deployments:
+  #     gpt-4o-mini: "gpt4omini"
+  #     gpt-4o: "gpt4o"
+  #     gpt-4: "gpt4"
+
+# Higher log level for production
+logging:
+  level: "WARNING" 

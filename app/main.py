@@ -12,12 +12,20 @@ import uvicorn
 # Load environment variables
 load_dotenv()
 
+# Import configuration system
+from app.config import config_loader
+
+# Load configuration
+config = config_loader.load_config()
+
 # Configure logging
-log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO"))
+log_level = getattr(logging, config.logging.level)
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # Create logs directory if it doesn't exist
-log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../logs"))
+log_dir = os.path.dirname(config.logging.file)
+if not os.path.isabs(log_dir):
+    log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), log_dir))
 os.makedirs(log_dir, exist_ok=True)
 
 # Configure logging FIRST
@@ -27,9 +35,9 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
-            os.path.join(log_dir, "app.log"),
-            maxBytes=1024*1024*5,
-            backupCount=3
+            config.logging.file if os.path.isabs(config.logging.file) else os.path.join(log_dir, os.path.basename(config.logging.file)),
+            maxBytes=config.logging.max_size,
+            backupCount=config.logging.backup_count
         )
     ]
 )
@@ -57,7 +65,7 @@ class FeishuHandler(logging.Handler):
             if not self.webhook_url:
                 return
                 
-            # # Format thez log message according to Feishu's requirements
+            # Format the log message according to Feishu's requirements
             log_data = {
                 "msg_type": "text",
                 "content": {"text": self.format(record)}
@@ -83,9 +91,8 @@ class FeishuHandler(logging.Handler):
             print(f"Feishu API error: {str(e)}")
 
 # Add Feishu handler if configured
-feishu_url = os.getenv("FEISHU_WEBHOOK_URL")
-if feishu_url:
-    feishu_handler = FeishuHandler(feishu_url)
+if config.logging.feishu_webhook:
+    feishu_handler = FeishuHandler(config.logging.feishu_webhook)
     feishu_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     # Add to root logger to ensure propagation to all child loggers
     root_logger.addHandler(feishu_handler)
@@ -94,9 +101,9 @@ if feishu_url:
 
 # Create FastAPI app
 app = FastAPI(
-    title="Azure OpenAI Proxy",
+    title=config.name,
     description="A proxy service to convert OpenAI API calls to Azure OpenAI API calls with rate limiting",
-    version="1.0.2a",
+    version=config.version,
 )
 
 # Add middleware for request/response logging
@@ -125,17 +132,20 @@ async def log_requests(request: Request, call_next):
 
 # Import routers after app is created to avoid circular imports
 from app.routers import openai_proxy
-from app.routers import stats  # 添加 stats 路由导入
+from app.routers import stats
+from app.routers import config
 
 # Include routers
 app.include_router(openai_proxy.router)
-app.include_router(stats.router)  # 添加 stats 路由
+app.include_router(stats.router)
+app.include_router(config.router)
 
 @app.get("/")
 async def root():
     return {
-        "message": "Azure OpenAI Proxy API is running",
+        "message": f"{config.name} API is running",
         "docs": "/docs",
+        "version": config.version
     }
 
 @app.get("/health")
@@ -173,9 +183,9 @@ async def health_check():
             "instance_summary": {
                 "total": total_instances,
                 "healthy": healthy_instances,
-                "routing_strategy": os.getenv("API_ROUTING_STRATEGY", "failover")
+                "routing_strategy": config.routing.strategy
             },
-            "version": app.version
+            "version": config.version
         }
     except Exception as e:
         logger.error(f"Health check error: {str(e)}")
@@ -183,9 +193,39 @@ async def health_check():
             "status": "error",
             "message": f"Error performing health check: {str(e)}",
             "timestamp": int(time.time()),
-            "version": app.version
+            "version": config.version
+        }
+
+# Add configuration endpoints
+@app.get("/config")
+async def get_config():
+    """Get the current configuration (excluding secrets)."""
+    return config_loader.to_dict()
+
+@app.post("/config/reload")
+async def reload_config():
+    """Reload configuration from disk."""
+    from app.instance.manager import instance_manager
+    
+    try:
+        # Reload configuration
+        config = config_loader.reload()
+        
+        # Reload instance manager
+        instance_manager.reload_config()
+        
+        return {
+            "status": "success",
+            "message": "Configuration reloaded successfully",
+            "instances": len(instance_manager.instances)
+        }
+    except Exception as e:
+        logger.error(f"Error reloading configuration: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error reloading configuration: {str(e)}"
         }
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 3010))
+    port = config.port
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
