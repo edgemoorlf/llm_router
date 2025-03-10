@@ -128,6 +128,7 @@ class APIInstance(BaseModel):
     def mark_error(self, error_message: str) -> None:
         self.error_count += 1
         self.last_error = error_message
+        # 401 is account permission error which needs not to be tested again
         if self.error_count >= 3 or '401' in error_message:
             self.status = InstanceStatus.ERROR
             logger.warning(f"Instance {self.name} marked as error after {self.error_count} consecutive errors")
