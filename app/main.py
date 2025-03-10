@@ -133,12 +133,12 @@ async def log_requests(request: Request, call_next):
 # Import routers after app is created to avoid circular imports
 from app.routers import openai_proxy
 from app.routers import stats
-from app.routers import config
+from app.routers import config as config_router
 
 # Include routers
 app.include_router(openai_proxy.router)
 app.include_router(stats.router)
-app.include_router(config.router)
+app.include_router(config_router.router)
 
 @app.get("/")
 async def root():
