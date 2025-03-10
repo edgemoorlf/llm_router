@@ -126,6 +126,9 @@ class APIInstance(BaseModel):
         logger.warning(f"Instance {self.name} marked as rate limited for {retry_after} seconds")
     
     def mark_error(self, error_message: str) -> None:
+        if '400' in error_message:
+            return
+        
         self.error_count += 1
         self.last_error = error_message
         # 401 is account permission error which needs not to be tested again

@@ -60,7 +60,7 @@ class MonitoringConfig(BaseModel):
 class AppConfig(BaseModel):
     """Main application configuration."""
     name: str = Field(default="Azure OpenAI Proxy", description="Application name")
-    version: str = Field(default="1.0.6", description="Application version")
+    version: str = Field(default="1.0.7", description="Application version")
     port: int = Field(default=3010, description="Server port")
     instances: List[InstanceConfig] = Field(default_factory=list, description="API instances")
     routing: RoutingConfig = Field(default_factory=RoutingConfig, description="Routing configuration")

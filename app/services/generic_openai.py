@@ -100,7 +100,7 @@ class GenericOpenAIService:
             if not allowed:
                 logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
                 raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"Global rate limit exceeded. Try again in {retry_after} seconds.",
                     headers={"Retry-After": str(retry_after)},
                 )

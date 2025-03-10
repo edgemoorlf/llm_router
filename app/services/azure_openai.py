@@ -123,7 +123,7 @@ class AzureOpenAIService:
             if not allowed:
                 logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
                 raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"Global rate limit exceeded. Try again in {retry_after} seconds.",
                     headers={"Retry-After": str(retry_after)},
                 )
@@ -193,8 +193,17 @@ class AzureOpenAIService:
             logger.debug(f"Request completed using Azure instance {used_instance.name}")
             return self._clean_response(result)
         except HTTPException as e:
+            # For content management policy errors, ensure we preserve the 400 status code
             if "content management policy" in e.detail.lower():
-                logger.debug(f"Content policy violation - prompt: {payload.get('messages', '')}")
+                logger.warning(f"Content policy violation (HTTP {e.status_code}) - prompt: {payload.get('messages', '')}")
+                # Ensure we're preserving the original error (which should be 400) for content policy violations
+                raise HTTPException(
+                    status_code=e.status_code,  # Preserve original status code (should be 400)
+                    detail=e.detail,
+                    headers=e.headers
+                )
+            # For all other errors, re-raise as is
+            logger.debug(f"Azure API error: {e.status_code} - {e.detail}")
             raise
         
     async def get_instances_status(self) -> List[Dict[str, Any]]:

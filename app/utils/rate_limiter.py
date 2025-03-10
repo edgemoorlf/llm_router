@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Default token rate limit (tokens per minute)
 DEFAULT_TOKEN_RATE_LIMIT = 30000
+DEFAULT_MAX_INPUT_TOKENS_LIMIT = 16384
 
 class TokenUsage(BaseModel):
     """Model for tracking token usage."""
@@ -60,7 +61,9 @@ class RateLimiter(ABC):
 class InMemoryRateLimiter(RateLimiter):
     """In-memory implementation of rate limiter based on a sliding window."""
     
-    def __init__(self, tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT):
+    def __init__(self, 
+                 tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT, 
+                 max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT):
         """
         Initialize the in-memory rate limiter.
         
@@ -68,6 +71,7 @@ class InMemoryRateLimiter(RateLimiter):
             tokens_per_minute: Token rate limit per minute
         """
         self.tokens_per_minute = tokens_per_minute
+        self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
         self.usage_window: Dict[int, int] = {}  # timestamp (s) -> tokens used
         self.lock = threading.Lock()
@@ -85,6 +89,11 @@ class InMemoryRateLimiter(RateLimiter):
         Returns:
             Tuple of (allowed, retry_after_seconds)
         """
+        # Validate against maximum allowed tokens per request
+        if tokens > self.max_input_tokens:
+            logger.warning(f"Request exceeds maximum allowed tokens: {tokens} > {self.max_input_tokens}")
+            return (False, 0)
+
         with self.lock:
             current_time = int(time.time())
             cutoff_time = current_time - self.window_seconds
@@ -148,7 +157,8 @@ class RedisRateLimiter(RateLimiter):
     def __init__(
         self, 
         tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
-        redis_url: str = "redis://localhost:6379"
+        redis_url: str = "redis://localhost:6379",
+        max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT
     ):
         """
         Initialize the Redis rate limiter.
@@ -156,8 +166,10 @@ class RedisRateLimiter(RateLimiter):
         Args:
             tokens_per_minute: Token rate limit per minute
             redis_url: URL for Redis connection
+            max_input_tokens: Maximum allowed tokens per request
         """
         self.tokens_per_minute = tokens_per_minute
+        self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
         self.redis_key_prefix = "azure_openai_proxy:rate_limit"
         self.redis = redis.from_url(redis_url)
@@ -175,6 +187,11 @@ class RedisRateLimiter(RateLimiter):
         Returns:
             Tuple of (allowed, retry_after_seconds)
         """
+        # Validate against configured maximum allowed tokens
+        if tokens > self.max_input_tokens:
+            logger.warning(f"Request exceeds maximum allowed tokens: {tokens} > {self.max_input_tokens}")
+            return (False, 0)
+
         current_time = int(time.time())
         cutoff_time = current_time - self.window_seconds
         window_key = f"{self.redis_key_prefix}:window"
@@ -242,16 +259,29 @@ class RedisRateLimiter(RateLimiter):
         self.redis.delete(window_key)
 
 
-def get_rate_limiter() -> RateLimiter:
-    """Factory function to get the configured rate limiter."""
-    tokens_per_minute = int(os.getenv("TOKEN_RATE_LIMIT", DEFAULT_TOKEN_RATE_LIMIT))
-    
-    use_redis = os.getenv("USE_REDIS_RATE_LIMITER", "false").lower() == "true"
+def get_rate_limiter(
+    tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
+    use_redis: bool = False,
+    redis_url: str = "redis://localhost:6379",
+    max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT
+) -> RateLimiter:
+    """Factory function to create a rate limiter with specified configuration."""
     if use_redis:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        return RedisRateLimiter(tokens_per_minute=tokens_per_minute, redis_url=redis_url)
-    else:
-        return InMemoryRateLimiter(tokens_per_minute=tokens_per_minute)
+        return RedisRateLimiter(
+            tokens_per_minute=tokens_per_minute,
+            redis_url=redis_url,
+            max_input_tokens=max_input_tokens
+        )
+    return InMemoryRateLimiter(
+        tokens_per_minute=tokens_per_minute,
+        max_input_tokens=max_input_tokens
+    )
 
-# Create a singleton instance
-rate_limiter = get_rate_limiter()
+# Create a default rate limiter instance
+# This is used by other modules that import it directly
+rate_limiter = get_rate_limiter(
+    tokens_per_minute=int(os.environ.get("TOKEN_RATE_LIMIT", DEFAULT_TOKEN_RATE_LIMIT)),
+    use_redis=os.environ.get("USE_REDIS", "").lower() in ("true", "1", "yes"),
+    redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    max_input_tokens=int(os.environ.get("MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS_LIMIT))
+)
