@@ -1,12 +1,12 @@
 name: Azure OpenAI Proxy
-version: 1.0.8
+version: 1.0.9
 port: 3010
 routing:
   strategy: round_robin
   retries: 3
   timeout: 60
 logging:
-  level: INFO
+  level: DEBUG
   file: ../logs/app.log
   max_size: 5242880
   backup_count: 3
@@ -25,6 +25,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://myoai022825.openai.azure.com
   proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
   supported_models:
@@ -40,6 +41,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://zmnzlmk001.openai.azure.com/
   proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
   supported_models:
@@ -55,38 +57,9 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://zmnz03101.openai.azure.com/
   proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
-  supported_models:
-  - gpt-4o
-  - gpt-4o-2024-11-20
-  model_deployments:
-    gpt-4o: gpt-4o
-    gpt-4o-2024-11-20: gpt-4o
-- name: azure30
-  provider_type: azure
-  api_key: GEhU0HeOUD7aq464IrwM9QsB58NwXj1WEqX40qlc4MqtYthzQqOOJQQJ99BCACYeBjFXJ3w3AAABACOG74lP
-  api_version: 2024-08-01-preview
-  priority: 100
-  weight: 100
-  max_tpm: 30000
-  api_base: https://zhimnz031002.openai.azure.com/
-  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
-  supported_models:
-  - gpt-4o
-  - gpt-4o-2024-11-20
-  model_deployments:
-    gpt-4o: gpt-4o
-    gpt-4o-2024-11-20: gpt-4o
-- name: azure31
-  provider_type: azure
-  api_key: 3hgVw41CUNIxb2kUyec8uFzZY9yzkg0X2fZVSSX9LVz3r4eGEcYFJQQJ99BCACBsN54XJ3w3AAABACOGAc8m
-  api_version: 2024-08-01-preview
-  priority: 100
-  weight: 100
-  max_tpm: 30000
-  api_base: https://zmzn1001.openai.azure.com/
-  proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
   supported_models:
   - gpt-4o
   - gpt-4o-2024-11-20
@@ -100,6 +73,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://zm30103.openai.azure.com/
   proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
   supported_models:
@@ -115,6 +89,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://nengzhi1003.openai.azure.com/
   proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
   supported_models:
@@ -130,6 +105,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://nzzm501013.openai.azure.com/
   proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
   supported_models:
@@ -145,6 +121,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://aacbcbcapfa.openai.azure.com/
   proxy_url: http://3e2486aa8c4cd7:062163a5@128.1.97.145:5001
   supported_models:
@@ -160,6 +137,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://nengzhi1007.openai.azure.com/
   proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
   supported_models:
@@ -175,6 +153,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://o3isminim.openai.azure.com/
   proxy_url: http://7287eecd4d707f:4705da58@128.1.97.145:5001
   supported_models:
@@ -190,6 +169,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://azure40.openai.azure.com/
   proxy_url: http://d27be8e66cfe01:05e6f898@128.1.97.145:5001
   supported_models:
@@ -205,23 +185,9 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://japan111.openai.azure.com/
   proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
-  supported_models:
-  - gpt-4o
-  - gpt-4o-2024-11-20
-  model_deployments:
-    gpt-4o: gpt-4o
-    gpt-4o-2024-11-20: gpt-4o
-- name: azure42
-  provider_type: azure
-  api_key: xy4cRzbuIUdJnfvPoLnV93KKunOtvQ6vmut3G0aufitW6JOMlaPGJQQJ99BCACi0881XJ3w3AAABACOGTQu4
-  api_version: 2024-08-01-preview
-  priority: 100
-  weight: 100
-  max_tpm: 30000
-  api_base: https://0311zmnza1.openai.azure.com/
-  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
   supported_models:
   - gpt-4o
   - gpt-4o-2024-11-20
@@ -235,6 +201,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://0311azure1.openai.azure.com/
   proxy_url: http://129293faf191cd:0bdb3529@128.1.97.145:5001
   supported_models:
@@ -250,6 +217,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://azure42.openai.azure.com/
   proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
   supported_models:
@@ -265,6 +233,7 @@ instances:
   priority: 100
   weight: 100
   max_tpm: 30000
+  max_input_tokens: 8000
   api_base: https://azure43.openai.azure.com/
   proxy_url: http://3e2486aa8c4cd7:062163a5@128.1.97.145:5001
   supported_models:
@@ -273,3 +242,371 @@ instances:
   model_deployments:
     gpt-4o: gpt-4o
     gpt-4o-2024-08-06: gpt-4o
+- name: azure51
+  provider_type: azure
+  api_key: 4AGDUm0fY7Hw8g6rW6vZ5wkEgMmwFHPEHM2NE35WtKbrXQGRSfOsJQQJ99BCAC5RqLJXJ3w3AAABACOG1a3W
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://westeurope0311zm.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure52
+  provider_type: azure
+  api_key: 24m5Uk6GJb1yDGNCjS8rBZ4oJL1ql6uHDNKLlUQIBkqUXLKKhKwwJQQJ99BCACE1PydXJ3w3AAABACOGAvib
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://polandcentral0311zm.openai.azure.com/
+  proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure54
+  provider_type: azure
+  api_key: 5G8YB5R0bh3NRfWUQAQq68OfcGm0Bk7tQwpKZel3e2KJG7Et82auJQQJ99BCACHrzpqXJ3w3AAABACOGh93t
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://zhimaio112233.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure57
+  provider_type: azure
+  api_key: 3syxMJjadxUyYzzZHsBrRyfR0nVBwzWxo8GSdBbrvOOFdXDhClFXJQQJ99BCACBsN54XJ3w3AAABACOGagT4
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://zfhaf52.openai.azure.com/
+  proxy_url: http://7287eecd4d707f:4705da58@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure58
+  provider_type: azure
+  api_key: AgjIuspFJgjK2ZLHwxSG4mmIZx6XHRhdXU3EUa1e6Mco7hfdwODMJQQJ99BCACBsN54XJ3w3AAABACOGsKiv
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://haohaohao111.openai.azure.com/
+  proxy_url: http://d27be8e66cfe01:05e6f898@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure59
+  provider_type: azure
+  api_key: 9q9FT6u6krqMrZgjUy5FFuJBvt0QAJtWpIDF1zHZsPgyqEEGK5JpJQQJ99BCACBsN54XJ3w3AAABACOGz6R9
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://zhifafajf63.openai.azure.com/
+  proxy_url: http://d27be8e66cfe01:05e6f898@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure60
+  provider_type: azure
+  api_key: 6pMJ2BjyKLEx9tLYeSySwPIJhSJpKbJaWIr1Cn7H8plWY2dHbfjoJQQJ99BCACBsN54XJ3w3AAABACOGfoUW
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://fafajfajk92.openai.azure.com/
+  proxy_url: http://d27be8e66cfe01:05e6f898@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure61
+  provider_type: azure
+  api_key: 91IEaxkLzQG4IsY3t6glIPKypdERcSXjZgDolfCkq8c0pSEvHXk6JQQJ99BCACHrzpqXJ3w3AAABACOGhbBU
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://hgdragsk63.openai.azure.com/
+  proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure62
+  provider_type: azure
+  api_key: 8H86dBpF3Vmhpy5LUMDJRKUaOvItTtTC6LSYm6GpUB4BVBUsJU6VJQQJ99BCAC5T7U2XJ3w3AAABACOGOfeF
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://ghjbjkags54.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure63
+  provider_type: azure
+  api_key: BBlxqfkwxz2nfb8haQz10SSSdfHYzaM0S2skvtgyHZBTcfabL634JQQJ99BCACZoyfiXJ3w3AAABACOGeQZO
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://ehashs65.openai.azure.com/
+  proxy_url: http://129293faf191cd:0bdb3529@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure64
+  provider_type: azure
+  api_key: 4EHCWDm8mKULlECcUoWVPOoskyeSShe6qTll8czpnqWS20O7CTxEJQQJ99BCACPV0roXJ3w3AAABACOGtpWQ
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://hduy363.openai.azure.com/
+  proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure65
+  provider_type: azure
+  api_key: 1uMx5ajODWdEN22BEMLnuB1E4dTBbhNg2p8y4QyiZYZVafhtNBPBJQQJ99BCAC5RqLJXJ3w3AAABACOGHwSx
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://gsrhjkjkk784.openai.azure.com/
+  proxy_url: http://3e2486aa8c4cd7:062163a5@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure66
+  provider_type: azure
+  api_key: GG8uUjf8axbpteOLg5jmvoShpBalbvsqdT9FiURIX0oH9gJh5CZTJQQJ99BCACE1PydXJ3w3AAABACOGAccR
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://hsrjjr67.openai.azure.com/
+  proxy_url: http://3e2486aa8c4cd7:062163a5@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: azure67
+  provider_type: azure
+  api_key: DFG7enCpk647pZFgLf4gAcY2N8eI28hP4Rj1jYhh9H4f8ylW4CVlJQQJ99BCACHrzpqXJ3w3AAABACOGVYsM
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://hjsrtsjj654.openai.azure.com/
+  proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: azure68
+  provider_type: azure
+  api_key: 6P2gAiveDOgP7z6EA6PClyFZAXV9KqPmoeJhnfzCi4y2uaVT5bZkJQQJ99BCACBsN54XJ3w3AAABACOGxH8n
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://mfgstdr46d.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: az69
+  provider_type: azure
+  api_key: 6oclrZv3Man6lHhmmbEC0njVB8Xg51u12c0i3NG6kxJA5QM2KnsLJQQJ99BCAC5T7U2XJ3w3AAABACOGIqXd
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://ryjdrt5ured.openai.azure.com/
+  proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: az70
+  provider_type: azure
+  api_key: 8710be57760c4be99c8ce1027a3fd949
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://eastus.api.cognitive.microsoft.com/
+  proxy_url: http://87d43078b8f1c2:72cb2e30@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: az71
+  provider_type: azure
+  api_key: AVwffw8SzL1f7IW2gtNpe8CJ0jWdMZNeG77EQNKru1ECeVgCBXhrJQQJ99BCACZoyfiXJ3w3AAABACOGMJKW
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://gjrstdrkmuy5.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: az72
+  provider_type: azure
+  api_key: 6tBhT87NHY7jvGy7fFNZXSMOGjkYdWXh0lN37RssFrKdb1zXxl4mJQQJ99BCACPV0roXJ3w3AAABACOGyXjV
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://xdhjhjd56.openai.azure.com/
+  proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: az73
+  provider_type: azure
+  api_key: 11jAjtB7nb2IpvhDn2TMyMinZMrvtvpRuXbJw7HY4d230cYGgO5GJQQJ99BCAChHRaEXJ3w3AAABACOGtKkW
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://0311zmnza03.openai.azure.com/
+  proxy_url: http://c5532156db8fd7:8b528703@15.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-08-06
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-08-06: gpt-4o
+- name: az74
+  provider_type: azure
+  api_key: 4SJ37siCIXbhl1PP9Mnd27sjySa1xnpf8N9vNQjSI75C5HqApsBSJQQJ99BCACLArgHXJ3w3AAABACOGQ23M
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://0311zmnza04.openai.azure.com/
+  proxy_url: http://67f85faf7b26ba:d2a5a33@115.204.52.62:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: az75
+  provider_type: azure
+  api_key: CjoUW3zcCJtadBEkHgMerdofsm1cpY7IdKZAPVt2CCKYPnYpwt5iJQQJ99BCACBsN54XJ3w3AAABACOGqCxI
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://0311zmnza05.openai.azure.com/
+  proxy_url: http://3e2486aa8c4cd7:062163a5@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o
+- name: az76
+  provider_type: azure
+  api_key: B5ku8jqJVL4q1WyiOKPgUl9uRhwK6KqqBCC2qGI1nt0KxjSgy69hJQQJ99BCACMsfrFXJ3w3AAABACOG5UvZ
+  api_version: 2024-08-01-preview
+  priority: 100
+  weight: 100
+  max_tpm: 30000
+  max_input_tokens: 8000
+  api_base: https://0311zmnza06.openai.azure.com/
+  proxy_url: http://37719ffa7e90ff:cbce3410@128.1.97.145:5001
+  supported_models:
+  - gpt-4o
+  - gpt-4o-2024-11-20
+  model_deployments:
+    gpt-4o: gpt-4o
+    gpt-4o-2024-11-20: gpt-4o

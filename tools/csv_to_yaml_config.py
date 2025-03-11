@@ -53,7 +53,7 @@ def convert_csv_to_yaml(csv_path, output_path=None, preserve_base=True, api_vers
             # Full configuration with base settings
             config = {
                 "name": "Azure OpenAI Proxy",
-                "version": "1.0.8",
+                "version": "1.0.9",
                 "port": 3010,
                 "routing": {
                     "strategy": "round_robin",
@@ -97,7 +97,8 @@ def convert_csv_to_yaml(csv_path, output_path=None, preserve_base=True, api_vers
                 "api_version": api_version,
                 "priority": 100,
                 "weight": 100,
-                "max_tpm": 30000
+                "max_tpm": 30000,
+                "max_input_tokens": 8000
             }
             
             # Add API base if available

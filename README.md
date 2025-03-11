@@ -28,7 +28,7 @@ Example configuration:
 ```yaml
 # Base configuration (app/config/base.yaml)
 name: "Azure OpenAI Proxy"
-version: "1.0.8"
+version: "1.0.9"
 port: 3010
 
 routing:
@@ -63,6 +63,37 @@ instances:
     model_deployments:
       gpt-4o-mini: "gpt4omini"
       gpt-4o: "gpt4o"
+
+### Version-Specific Model Mappings
+
+The proxy enforces strict model matching to ensure version-specific models are correctly routed:
+
+```yaml
+instances:
+  - name: "instance1"
+    # ... other configuration ...
+    supported_models:
+      - "gpt-4o-2024-11-20"  # Full versioned model name
+      - "gpt-4o-2024-08-06"  # Different version of gpt-4o
+    model_deployments:
+      # Map each specific version to a different deployment
+      gpt-4o-2024-11-20: "gpt4o-november"
+      gpt-4o-2024-08-06: "gpt4o-august"
+```
+
+**Important:** The system uses **exact model name matching only**:
+- Requests for `gpt-4o-2024-11-20` will be routed to the `gpt4o-november` deployment
+- Requests for `gpt-4o-2024-08-06` will be routed to the `gpt4o-august` deployment
+- Requests for generic `gpt-4o` will only work if `gpt-4o` is explicitly listed in supported_models and has its own mapping
+- No normalization or fallback occurs - each model version must be explicitly configured
+
+You must configure each specific model version you want to support. For example, if you want to support both the versioned model `gpt-4o-2024-11-20` and the base model `gpt-4o`, you need to include both in your configuration.
+
+You can also use environment variables for version-specific mappings:
+
+```
+API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O-2024-11-20=gpt4o-november
+API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O-2024-08-06=gpt4o-august
 ```
 
 ### Environment Variables (Legacy Support)

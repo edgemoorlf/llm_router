@@ -1,7 +1,7 @@
 # Development environment configuration
 # Overrides base.yaml settings
 name: Azure OpenAI Proxy
-version: 1.0.8
+version: 1.0.9
 port: 3010
 routing:
   strategy: round_robin

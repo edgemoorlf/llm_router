@@ -13,7 +13,7 @@ from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_
 
 logger = logging.getLogger(__name__)
 
-async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict[str, Any], provider_type: str = "azure") -> StreamingResponse:
+async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict[str, Any], provider_type: str = "azure", original_model: str = None) -> StreamingResponse:
     """
     Handle streaming requests by forwarding them to the API and streaming the response back.
     Supports multiple API instances with automatic failover.
@@ -23,6 +23,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
         deployment: The deployment name
         payload: The request payload
         provider_type: The provider type ("azure" or "generic")
+        original_model: The original model name from the client request
         
     Returns:
         A streaming response
@@ -32,7 +33,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     payload.pop("required_tokens", 1000)
     
     # Save the original model for adding to response chunks
-    original_model = payload.get("model", "unknown")
+    original_model = original_model or payload.get("model", "unknown")
     
     # Estimate tokens for rate limiting and instance selection
     required_tokens = 0
@@ -73,9 +74,22 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     # Extract model name from payload if available
     model_name = payload.get("model")
     
+    # Use the original model name for instance selection when available
+    model_for_selection = original_model if original_model else payload.get("model")
+    
     # Select an instance based on the routing strategy and model support
-    primary_instance = instance_manager.select_instance(required_tokens, model_name)
-    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
+    # Use the original model name to ensure proper matching against supported_models and model_deployments
+    primary_instance = instance_manager.select_instance(required_tokens, model_for_selection)
+    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_for_selection} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
+    
+    # If no instance was found that can handle this request with its token limits, return 503
+    if not primary_instance:
+        error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_for_selection}'"
+        logger.error(error_detail)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_detail
+        )
     
     # For Azure provider types, remove the model field since it uses deployment names
     # For generic provider types, keep the model field since it's required

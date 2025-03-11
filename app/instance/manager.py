@@ -2,6 +2,7 @@
 import os
 import logging
 from typing import Dict, List, Optional, Tuple, Any
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class InstanceManager:
             routing_strategy: Strategy for selecting instances
         """
         self.instances: Dict[str, APIInstance] = {}
+        self.instances_lock = threading.RLock()  # Lock for thread-safe access to instances
         self.router = None  # Will be initialized later
         self.forwarder = RequestForwarder()
         self.config_loader = InstanceConfigLoader()
@@ -166,16 +168,54 @@ class InstanceManager:
     
     def select_instance(self, required_tokens: int, model_name: Optional[str] = None) -> Optional[APIInstance]:
         """
-        Select an API instance based on the configured routing strategy and model support.
+        Select an instance based on the router strategy.
         
         Args:
-            required_tokens: Estimated number of tokens required for the request
-            model_name: The model name requested (optional)
+            required_tokens: Estimated number of tokens required
+            model_name: Optional model name to filter instances
             
         Returns:
             Selected instance or None if no suitable instance is available
         """
-        return self.router.select_instance(self.instances, required_tokens, model_name)
+        if not self.instances:
+            logger.error("No instances available for selection")
+            return None
+            
+        logger.debug(f"Selecting instance for model '{model_name}' requiring {required_tokens} tokens")
+        
+        # Lock access to the instances dictionary to prevent concurrent modification during selection
+        with self.instances_lock:
+            instance = self.router.select_instance(self.instances, required_tokens, model_name)
+            
+        if instance:
+            logger.info(f"Selected instance '{instance.name}' for model '{model_name}'")
+            if model_name:
+                # Log the exact model deployment that will be used
+                if model_name.lower() in instance.model_deployments:
+                    deployment = instance.model_deployments[model_name.lower()]
+                    logger.info(f"Using deployment '{deployment}' for model '{model_name}'")
+                else:
+                    # Check if model_name is in supported_models
+                    if model_name.lower() in [m.lower() for m in instance.supported_models]:
+                        logger.info(f"Model '{model_name}' is in supported_models but has no specific deployment mapping - instance will use default deployments")
+                    else:
+                        logger.warning(f"Model '{model_name}' is neither in supported_models nor has a mapping in model_deployments for instance '{instance.name}'")
+        else:
+            logger.warning(f"No suitable instance found for model '{model_name}' requiring {required_tokens} tokens")
+            # Add a stronger warning if we have instances but none match this model
+            if self.instances:
+                supported_models = set()
+                for inst in self.instances.values():
+                    if inst.supported_models:
+                        supported_models.update([m.lower() for m in inst.supported_models])
+                    if inst.model_deployments:
+                        supported_models.update([k.lower() for k in inst.model_deployments.keys()])
+                
+                if supported_models:
+                    logger.error(f"Available models: {sorted(list(supported_models))}")
+                    logger.error(f"The requested model '{model_name}' is not supported by any configured instance - request will fail")
+            
+        return instance
     
     async def try_instances(self, 
                            endpoint: str, 

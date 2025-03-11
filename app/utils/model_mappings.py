@@ -36,48 +36,23 @@ class ModelMapper:
         Get the Azure deployment name for the given OpenAI model name.
         
         Args:
-            model_name: The OpenAI model name, e.g., 'gpt-4o' or 'gpt-3.5-turbo'
+            model_name: The OpenAI model name, e.g., 'gpt-4o-2024-11-20'
             
         Returns:
-            The Azure deployment name or None if no mapping exists.
+            The Azure deployment name or None if no exact mapping exists.
         """
         # Special case for DeepSeek R1 model
         if model_name.lower() == "deepseek-r1":
             return "DeepSeek-R1"  # This is a special case handled differently in the routing
         
-        # Normalize the model name by removing version suffixes (both : and - formats)
-        base_name = model_name.split(':')[0].split('-')[0]
-        # Handle special GPT version formats (e.g. gpt-4o-2024-11-20 -> gpt-4o)
-        if 'gpt' in base_name:
-            parts = model_name.split('-')
-            # Remove hyphens and version numbers for key matching
-            # Handle versioned model names by keeping just the base model identifier
-            # Extract base model name (first two hyphen-separated parts)
-            # Extract base model name and format for env var matching
-            # Handle versioned model names by keeping just the base model identifier
-            # Handle versioned model names by stripping any numeric suffixes
-            # Handle versioned model names by keeping base model identifier
-            # Remove all hyphens and version components
-            # Handle versioned model names by keeping base model identifier
-            base_model = parts[0] + parts[1]  # "gpt-4o-2024-11-20" -> "gpt4o"
-            normalized_name = base_model.lower().replace("-", "")  # Ensure no hyphens remain
-        else:
-            normalized_name = base_name
+        # Check only for an exact model name match
+        exact_model_key = model_name.lower()
+        if exact_model_key in self.model_map:
+            logger.debug(f"Found exact model mapping for '{model_name}' → '{self.model_map[exact_model_key]}'")
+            return self.model_map[exact_model_key]
         
-        # Check if we have a direct mapping
-        if normalized_name in self.model_map:
-            return self.model_map[normalized_name]
-        
-        # Convert common model names to our mapped format
-        mapping_key = normalized_name.lower().replace(".", "").replace("-", "")
-        
-        # Check common model patterns
-        if mapping_key == "gpt4o":
-            return self.model_map.get("gpt4o")
-        elif mapping_key in ["gpt35turbo", "gpt3turbo"]:
-            return self.model_map.get("gpt35turbo")
-            
-        logger.warning(f"No Azure deployment mapped for model '{model_name}'")
+        # No fallbacks or normalization - if we don't have an exact match, return None
+        logger.warning(f"No Azure deployment mapped for exact model '{model_name}'")
         return None
 
 # Create a singleton instance

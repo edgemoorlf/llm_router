@@ -36,8 +36,8 @@ class AzureOpenAIService:
                 detail="Model name is required",
             )
             
-        # Normalize the model name
-        normalized_model = model_name.lower().split(':')[0]
+        # Use exact model name matching only
+        exact_model_name = model_name.lower()
         
         # Find Azure instances that support this model
         azure_instances = [
@@ -47,16 +47,16 @@ class AzureOpenAIService:
                 instance.provider_type == "azure" and
                 (
                     # Instance has this model in its supported_models list
-                    normalized_model in [m.lower() for m in instance.supported_models] or
+                    exact_model_name in [m.lower() for m in instance.supported_models] or
                     # Instance has a deployment mapping for this model
-                    normalized_model in instance.model_deployments or
+                    exact_model_name in instance.model_deployments or
                     # Instance has no model restrictions (empty supported_models means it supports all models)
                     not instance.supported_models
                 )
             )
         ]
         
-        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{normalized_model}'")
+        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{model_name}'")
         
         if not azure_instances:
             logger.warning(f"No Azure instances found supporting model '{model_name}'")
@@ -64,8 +64,9 @@ class AzureOpenAIService:
         # Get the deployment name from the first instance that has a mapping for this model
         deployment_name = None
         for instance in azure_instances:
-            if normalized_model in instance.model_deployments:
-                deployment_name = instance.model_deployments[normalized_model]
+            # Use only exact model name matching
+            if exact_model_name in instance.model_deployments:
+                deployment_name = instance.model_deployments[exact_model_name]
                 logger.debug(f"Found deployment mapping for model '{model_name}' in Azure instance '{instance.name}': {deployment_name}")
                 break
         
@@ -135,8 +136,8 @@ class AzureOpenAIService:
         logger.debug(f"azure_payload required_tokens {required_tokens}")
         return {
             "azure_deployment": deployment_name,
+            "original_model": model_name,  # Preserve the original model name for instance matching
             "payload": azure_payload
-            # "required_tokens": required_tokens
         }
         
     def _clean_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -158,42 +159,94 @@ class AzureOpenAIService:
         return response
 
     async def forward_request(
-        self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], method: str = "POST"
+        self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], original_model: str = None, method: str = "POST"
     ) -> Dict[str, Any]:
         """Forward request to Azure instances with failover handling."""
         required_tokens = payload.pop("required_tokens", 1000)
         azure_instances = self._get_azure_instances()
         
         if not azure_instances:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "No Azure instances available")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+                detail="No Azure instances available"
+            )
             
-        primary_instance = self._select_primary_instance(azure_instances, required_tokens, azure_deployment)
+        # Use the original model name for instance selection when available
+        model_for_selection = original_model if original_model else azure_deployment
+        
+        # Log which model name is being used for selection
+        if original_model:
+            logger.debug(f"Using original model '{original_model}' for instance selection")
+        else:
+            logger.warning(f"Original model name not available, using deployment '{azure_deployment}' for instance selection")
+            
+        primary_instance = self._select_primary_instance(azure_instances, required_tokens, model_for_selection)
+        
+        # If no instance is found that can handle this request with its token limits, return 503
+        if not primary_instance:
+            error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_for_selection}'"
+            logger.error(error_detail)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=error_detail
+            )
+            
         return await self._execute_request(endpoint, azure_deployment, payload, required_tokens, method, primary_instance)
 
     def _get_azure_instances(self) -> list:
         """Get all available Azure instances."""
         return [i for i in instance_manager.instances.values() if i.provider_type == "azure"]
 
-    def _select_primary_instance(self, instances: list, tokens: int, deployment: str) -> Optional[object]:
-        """Select primary instance based on routing strategy."""
-        instance = instance_manager.select_instance(tokens, deployment)
+    def _select_primary_instance(self, instances: list, tokens: int, model_or_deployment: str) -> Optional[object]:
+        """
+        Select primary instance based on routing strategy.
+        
+        Args:
+            instances: List of available Azure instances
+            tokens: Required tokens for the request
+            model_or_deployment: The original model name (preferred) or azure deployment name
+        """
+        # Try selecting an instance using the instance manager
+        # This will use the exact model matching logic we implemented earlier
+        # This also enforces token limits through the selection process
+        instance = instance_manager.select_instance(tokens, model_or_deployment)
         if instance and instance.provider_type == "azure":
+            logger.debug(f"Selected instance '{instance.name}' for model/deployment '{model_or_deployment}' via instance manager")
             return instance
-        return next((i for i in instances if deployment in i.model_deployments.values()), instances[0] if instances else None)
+            
+        # If instance manager failed (which already enforces token limits), 
+        # we should NOT try to select instances directly without enforcing the same limits
+        # Log the error and return None
+        logger.error(f"No instances available that support model '{model_or_deployment}' with enough capacity for {tokens} tokens")
+        return None
+        
+        # The rest of this method is removed because it bypassed token limit checks
 
     async def _execute_request(
         self, endpoint: str, deployment: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[object]
     ) -> Dict[str, Any]:
         """Execute the request with failover handling."""
+        # We already check for None in forward_request, but add an assertion for safety
+        assert instance is not None, "Instance should not be None at this point"
+            
         try:
-            logger.debug(f"payload output 4 required tokens: {payload.get('required_tokens', required_tokens)}")
-            result, used_instance = await instance_manager.try_instances(
-                endpoint, deployment, payload, required_tokens, method, "azure"
+            # Use the already selected instance directly instead of redoing selection
+            logger.debug(f"Executing request using Azure instance {instance.name} for deployment {deployment}")
+            
+            # Forward the request directly to the selected instance
+            result = await instance_manager.forwarder.forward_request(
+                instance, endpoint, deployment, payload, method
             )
-            logger.debug(f"Request completed using Azure instance {used_instance.name}")
+            
+            # Mark instance as healthy and update TPM
+            instance.mark_healthy()
+            if "usage" in result and "total_tokens" in result["usage"]:
+                instance.update_tpm_usage(result["usage"]["total_tokens"])
+                
+            logger.debug(f"Request completed using Azure instance {instance.name}")
             return self._clean_response(result)
         except HTTPException as e:
-            # For content management policy errors, ensure we preserve the 400 status code
+            # Check for content management policy errors
             if "content management policy" in e.detail.lower():
                 logger.warning(f"Content policy violation (HTTP {e.status_code}) - prompt: {payload.get('messages', '')}")
                 # Ensure we're preserving the original error (which should be 400) for content policy violations
@@ -202,10 +255,34 @@ class AzureOpenAIService:
                     detail=e.detail,
                     headers=e.headers
                 )
-            # For all other errors, re-raise as is
-            logger.debug(f"Azure API error: {e.status_code} - {e.detail}")
-            raise
-        
+                
+            # If there's an error with this instance, then try other instances as fallback
+            logger.warning(f"Primary instance {instance.name} failed with error {e.status_code}: {e.detail}, falling back to other instances")
+            
+            # Update instance status based on error
+            if e.status_code == 429:
+                retry_after = None
+                if hasattr(e, 'headers') and e.headers and 'retry-after' in e.headers:
+                    try:
+                        retry_after = int(e.headers['retry-after'])
+                    except (ValueError, TypeError):
+                        pass
+                instance.mark_rate_limited(retry_after)
+            else:
+                instance.mark_error(str(e))
+            
+            # Try other instances
+            try:
+                result, used_instance = await instance_manager.try_instances(
+                    endpoint, deployment, payload, required_tokens, method, "azure"
+                )
+                logger.debug(f"Request completed using fallback Azure instance {used_instance.name}")
+                return self._clean_response(result)
+            except HTTPException:
+                # Re-raise original error if fallback also fails
+                logger.debug(f"Azure API error: {e.status_code} - {e.detail}")
+                raise e
+
     async def get_instances_status(self) -> List[Dict[str, Any]]:
         """Get the status of all Azure instances."""
         all_stats = instance_manager.get_instance_stats()

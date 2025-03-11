@@ -46,17 +46,17 @@ class InstanceRouter:
         
         # If a model name is provided, filter instances that support this model
         if model_name:
-            # Normalize the model name
-            normalized_model = model_name.lower().split(':')[0]
+            # Use exact model name matching only
+            exact_model_name = model_name.lower()
             
             # Filter instances that explicitly support this model
             model_instances = [
                 instance for instance in available_instances
                 if (
                     # Instance has this model in its supported_models list
-                    normalized_model in [m.lower() for m in instance.supported_models] or
+                    exact_model_name in [m.lower() for m in instance.supported_models] or
                     # Instance has a deployment mapping for this model
-                    normalized_model in instance.model_deployments or
+                    exact_model_name in instance.model_deployments or
                     # Instance has no model restrictions (empty supported_models means it supports all models)
                     not instance.supported_models
                 )
@@ -118,17 +118,17 @@ class InstanceRouter:
         if not model_name:
             return available_instances
             
-        # Normalize the model name
-        normalized_model = model_name.lower().split(':')[0]
+        # Use exact model name matching only
+        exact_model_name = model_name.lower()
         
         # Filter instances that support this model
         model_instances = [
             instance for instance in available_instances
             if (
                 # Instance has this model in its supported_models list
-                normalized_model in [m.lower() for m in instance.supported_models] or
+                exact_model_name in [m.lower() for m in instance.supported_models] or
                 # Instance has a deployment mapping for this model
-                normalized_model in instance.model_deployments or
+                exact_model_name in instance.model_deployments or
                 # Instance has no model restrictions (empty supported_models means it supports all models)
                 not instance.supported_models
             )

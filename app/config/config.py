@@ -9,22 +9,25 @@ import json
 logger = logging.getLogger(__name__)
 
 class InstanceConfig(BaseModel):
-    """Configuration for an API instance."""
+    """Configuration for an OpenAI-compatible service instance."""
     name: str = Field(..., description="Unique identifier for this instance")
     provider_type: str = Field(default="azure", description="Provider type (azure or generic)")
     api_key: str = Field(..., description="API key for the service")
     api_base: str = Field(..., description="API base URL")
-    api_version: str = Field(default="2024-08-01-preview", description="API version")
+    api_version: str = Field(..., description="API version")
     proxy_url: Optional[str] = Field(
         default=None,
         description="Proxy URL for HTTP requests (e.g. http://user:pass@host:port)",
+        example="http://user:pass@proxyhost:1000"
     )
     priority: int = Field(default=100, description="Priority (lower is higher priority)")
     weight: int = Field(default=100, description="Weight for weighted distribution (higher gets more traffic)")
     max_tpm: int = Field(default=240000, description="Maximum TPM (tokens per minute) for this instance")
     max_input_tokens: int = Field(default=0, description="Maximum input tokens allowed (0=unlimited)")
-    supported_models: List[str] = Field(default_factory=list, description="List of models supported by this instance")
-    model_deployments: Dict[str, str] = Field(default_factory=dict, description="Mapping of model names to deployment names (for Azure)")
+    supported_models: List[str] = Field(default_factory=list, 
+        description="List of models supported by this instance. Can include version-specific models like 'gpt-4o-2024-11-20'")
+    model_deployments: Dict[str, str] = Field(default_factory=dict, 
+        description="Mapping of model names to deployment names. For version-specific models, use the full model name as the key, e.g., 'gpt-4o-2024-11-20': 'my-gpt4o-nov-deployment'")
     
     @validator('max_tpm')
     def validate_max_tpm(cls, v):
@@ -60,7 +63,7 @@ class MonitoringConfig(BaseModel):
 class AppConfig(BaseModel):
     """Main application configuration."""
     name: str = Field(default="Azure OpenAI Proxy", description="Application name")
-    version: str = Field(default="1.0.8", description="Application version")
+    version: str = Field(default="1.0.9", description="Application version")
     port: int = Field(default=3010, description="Server port")
     instances: List[InstanceConfig] = Field(default_factory=list, description="API instances")
     routing: RoutingConfig = Field(default_factory=RoutingConfig, description="Routing configuration")

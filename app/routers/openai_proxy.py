@@ -105,14 +105,16 @@ async def chat_completions(request: Request) -> Any:
                 "/v1/chat/completions",
                 transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
-                provider_type
+                provider_type,
+                original_model=transformed.get("original_model")
             )
         else:
             # For regular requests, we can forward and return directly
             response = await service.forward_request(
                 "/v1/chat/completions",
                 transformed["azure_deployment" if provider_type == "azure" else "deployment"],
-                transformed["payload"]
+                transformed["payload"],
+                original_model=transformed.get("original_model")
             )
             
             # Ensure the response matches OpenAI's expected format
@@ -190,14 +192,16 @@ async def completions(request: Request) -> Any:
                 "/v1/completions",
                 transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
-                provider_type
+                provider_type,
+                original_model=transformed.get("original_model")
             )
         else:
             # For regular requests, we can forward and return directly
             response = await service.forward_request(
                 "/v1/completions",
                 transformed["azure_deployment" if provider_type == "azure" else "deployment"],
-                transformed["payload"]
+                transformed["payload"],
+                original_model=transformed.get("original_model")
             )
             
             # Ensure the response matches OpenAI's expected format
@@ -267,7 +271,8 @@ async def embeddings(request: Request) -> Any:
         response = await service.forward_request(
             "/v1/embeddings",
             transformed["azure_deployment" if provider_type == "azure" else "deployment"],
-            transformed["payload"]
+            transformed["payload"],
+            original_model=transformed.get("original_model")
         )
         
         # Ensure the response matches OpenAI's expected format
@@ -365,6 +370,7 @@ async def catch_all(request: Request, path: str) -> Any:
                 transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
                 method=request.method,
+                original_model=transformed.get("original_model")
             )
             
             # Ensure the response includes the model information
