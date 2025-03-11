@@ -1,15 +1,15 @@
 # Base configuration for Azure OpenAI Proxy
 name: "Azure OpenAI Proxy"
-version: "1.0.7"
+version: "1.0.8"
 port: 3010
 
 routing:
-  strategy: "failover"  # failover, weighted, round_robin
+  strategy: "round_robin"  # failover, weighted, round_robin
   retries: 3
   timeout: 60
 
 logging:
-  level: "INFO"
+  level: "DEBUG"
   file: "../logs/app.log"
   max_size: 5242880  # 5MB
   backup_count: 3
@@ -19,10 +19,14 @@ monitoring:
   stats_window_minutes: 5
   additional_windows: [15, 30, 60]
 
+model_mapping:
+  gpt4o: gpt-4o
+
+
 # Sample instance configuration - will be overridden by environment-specific configs
 instances: []
   # Example instance configuration format:
-  # - name: "instance1"
+  # - id: "instance1"
   #   provider_type: "azure"
   #   api_key: "${AZURE_API_KEY_1}"  # Will be replaced with env var value
   #   api_base: "https://example.openai.azure.com"

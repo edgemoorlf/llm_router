@@ -29,6 +29,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     """
     # Ensure streaming is enabled
     payload["stream"] = True
+    payload.pop("required_tokens", 1000)
     
     # Save the original model for adding to response chunks
     original_model = payload.get("model", "unknown")
@@ -74,7 +75,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     
     # Select an instance based on the routing strategy and model support
     primary_instance = instance_manager.select_instance(required_tokens, model_name)
-    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens}")
+    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
     
     # For Azure provider types, remove the model field since it uses deployment names
     # For generic provider types, keep the model field since it's required
@@ -112,7 +113,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
             # Build the URL for this instance based on provider type
             if provider_type == "azure":
                 # Azure uses deployment names in the path
-                url = instance.build_url(deployment, endpoint)
+                url = instance.build_url(deployment_name=deployment, endpoint=endpoint)
             else:
                 # Generic providers use model parameter
                 url = instance.build_url(endpoint).replace("{model}", deployment)

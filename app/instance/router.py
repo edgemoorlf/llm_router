@@ -1,10 +1,9 @@
-import random
 import logging
 import time
 from typing import Dict, List, Optional
 
 from .api_instance import APIInstance
-from .routing_strategy import RoutingStrategy
+from .routing_strategy import RoutingStrategy, RoutingStrategyFactory
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +17,8 @@ class InstanceRouter:
         Args:
             routing_strategy: Strategy for selecting instances
         """
-        self.routing_strategy = routing_strategy
-        self.round_robin_index = 0
+        self.routing_strategy_type = routing_strategy
+        self.strategy = RoutingStrategyFactory.create_strategy(routing_strategy)
     
     def select_instance(self, 
                        instances: Dict[str, APIInstance], 
@@ -89,84 +88,10 @@ class InstanceRouter:
             return available_instances[0]
         
         # Apply routing strategy to select an instance
-        logger.debug(f"Selecting instance using {self.routing_strategy} strategy from {len(available_instances)} available instances")
+        logger.debug(f"Selecting instance using {self.routing_strategy_type} strategy from {len(available_instances)} available instances")
         
-        # Select instance based on routing strategy
-        if self.routing_strategy == RoutingStrategy.PRIORITY:
-            # Sort by priority (lower is higher priority)
-            sorted_instances = sorted(available_instances, key=lambda x: x.priority)
-            selected = sorted_instances[0]
-            logger.debug(f"PRIORITY strategy selected instance {selected.name} with priority {selected.priority}")
-            return selected
-            
-        elif self.routing_strategy == RoutingStrategy.ROUND_ROBIN:
-            # Ensure index is valid after instances may have been added/removed
-            if self.round_robin_index >= len(available_instances):
-                self.round_robin_index = 0
-                
-            # Simple round-robin
-            selected = available_instances[self.round_robin_index]
-            self.round_robin_index = (self.round_robin_index + 1) % len(available_instances)
-            logger.debug(f"ROUND_ROBIN strategy selected instance {selected.name}, next index: {self.round_robin_index}")
-            return selected
-            
-        elif self.routing_strategy == RoutingStrategy.WEIGHTED:
-            # Weighted random selection
-            total_weight = sum(instance.weight for instance in available_instances)
-            
-            if total_weight == 0:
-                # If all weights are 0, use simple round-robin
-                if self.round_robin_index >= len(available_instances):
-                    self.round_robin_index = 0
-                selected = available_instances[self.round_robin_index]
-                self.round_robin_index = (self.round_robin_index + 1) % len(available_instances)
-                logger.debug(f"WEIGHTED strategy using round-robin fallback (all weights 0) selected instance {selected.name}")
-                return selected
-            
-            # Weighted random selection
-            r = random.uniform(0, total_weight)
-            upto = 0
-            for instance in available_instances:
-                upto += instance.weight
-                if upto >= r:
-                    logger.debug(f"WEIGHTED strategy selected instance {instance.name} with weight {instance.weight}/{total_weight}")
-                    return instance
-            
-            # Should never reach here if weights are positive
-            logger.warning(f"WEIGHTED strategy selection error, falling back to first instance")
-            return available_instances[0]
-            
-        elif self.routing_strategy == RoutingStrategy.LEAST_LOADED:
-            # Sort by current TPM usage (lower is better)
-            sorted_instances = sorted(available_instances, key=lambda x: x.instance_stats.current_tpm)
-            selected = sorted_instances[0]
-            logger.debug(f"LEAST_LOADED strategy selected instance {selected.name} with {selected.instance_stats.current_tpm} TPM")
-            return selected
-            
-        elif self.routing_strategy == RoutingStrategy.FAILOVER:
-            # Sort by priority (lower is higher priority) for failover
-            sorted_instances = sorted(available_instances, key=lambda x: x.priority)
-            selected = sorted_instances[0]
-            logger.debug(f"FAILOVER strategy selected instance {selected.name} with priority {selected.priority}")
-            return selected
-            
-        elif self.routing_strategy == RoutingStrategy.MODEL_SPECIFIC:
-            # For model-specific routing, we've already filtered instances by model support above
-            # Now sort by priority within those instances
-            sorted_instances = sorted(available_instances, key=lambda x: x.priority)
-            selected = sorted_instances[0]
-            
-            # If we have a model name, log which instance we're using for it
-            if model_name:
-                logger.info(f"MODEL_SPECIFIC routing: selected instance {selected.name} for model {model_name}")
-            
-            return selected
-        
-        # If we reach here, the routing strategy wasn't recognized
-        logger.warning(f"Unrecognized routing strategy: {self.routing_strategy}, using FAILOVER as default")
-        # Default to failover strategy (sort by priority)
-        sorted_instances = sorted(available_instances, key=lambda x: x.priority)
-        return sorted_instances[0]
+        # Delegate selection to the appropriate strategy implementation
+        return self.strategy.select_instance(available_instances, required_tokens, model_name)
     
     def get_available_instances_for_model(self,
                                          instances: Dict[str, APIInstance],

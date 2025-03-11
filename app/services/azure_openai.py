@@ -132,7 +132,7 @@ class AzureOpenAIService:
         logger.debug(f"Transformed request for model '{model_name}' to Azure deployment '{deployment_name}' (est. {required_tokens} tokens)")
         
         azure_payload["required_tokens"] = required_tokens
-        logger.debug(f"azure_payload required_tokens {azure_payload.get('required_tokens')}")
+        logger.debug(f"azure_payload required_tokens {required_tokens}")
         return {
             "azure_deployment": deployment_name,
             "payload": azure_payload

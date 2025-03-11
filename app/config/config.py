@@ -46,10 +46,10 @@ class RoutingConfig(BaseModel):
 
 class LoggingConfig(BaseModel):
     """Configuration for logging."""
-    level: str = Field(default="INFO", description="Log level")
-    file: str = Field(default="../logs/app.log", description="Log file path")
-    max_size: int = Field(default=5242880, description="Max log file size (5MB)")
-    backup_count: int = Field(default=3, description="Number of backup log files")
+    level: str = Field(description="Log level")
+    file: str = Field(description="Log file path")
+    max_size: int = Field(description="Max log file size (5MB)")
+    backup_count: int = Field(description="Number of backup log files")
     feishu_webhook: Optional[str] = Field(default=None, description="Feishu webhook URL for alerts")
 
 class MonitoringConfig(BaseModel):
@@ -60,7 +60,7 @@ class MonitoringConfig(BaseModel):
 class AppConfig(BaseModel):
     """Main application configuration."""
     name: str = Field(default="Azure OpenAI Proxy", description="Application name")
-    version: str = Field(default="1.0.7", description="Application version")
+    version: str = Field(default="1.0.8", description="Application version")
     port: int = Field(default=3010, description="Server port")
     instances: List[InstanceConfig] = Field(default_factory=list, description="API instances")
     routing: RoutingConfig = Field(default_factory=RoutingConfig, description="Routing configuration")
@@ -73,7 +73,7 @@ class ConfigLoader:
     def __init__(self):
         self.config: Optional[AppConfig] = None
         self.config_path: Optional[str] = None
-        self.env: str = os.getenv("ENVIRONMENT", "production")
+        self.env: str = os.getenv("ENVIRONMENT", "development")
         
     def load_config(self, config_dir: Optional[str] = None) -> AppConfig:
         """
@@ -96,22 +96,55 @@ class ConfigLoader:
         
         # Try to load from YAML first
         config_dict = self._load_from_yaml(config_dir)
-        
         # Ensure config_dict is at least an empty dict if YAML loading failed
         if config_dict is None:
             config_dict = {}
             logger.warning("Failed to load YAML configuration, starting with empty configuration")
         
-        # If no instances in YAML config, fallback to env vars
-        if not config_dict.get("instances"):
-            logger.info("No instances found in YAML configuration, falling back to environment variables")
-            instances = self._load_instances_from_env()
+        # Initialize instances as a list if not present or not a list
+        if "instances" not in config_dict:
             config_dict["instances"] = []
-            if instances:
-                config_dict["instances"].extend(instances)
+        elif not isinstance(config_dict["instances"], list):
+            # Convert dict to list if it's a dict (YAML might load it as a dict)
+            if isinstance(config_dict["instances"], dict):
+                logger.warning("Instances in YAML was loaded as a dict, converting to list")
+                instances_dict = config_dict["instances"]
+                config_dict["instances"] = []
+                for name, instance in instances_dict.items():
+                    if isinstance(instance, dict) and "name" not in instance:
+                        instance["name"] = name
+                    config_dict["instances"].append(instance)
+            else:
+                logger.warning(f"Unexpected instances type in YAML: {type(config_dict['instances'])}, initializing as empty list")
+                config_dict["instances"] = []
+                
+        # Load instances from environment variables
+        # YAML config takes precedence over env vars for instances with the same name
+        logger.info("Checking for additional instances from environment variables")
+        env_instances = self._load_instances_from_env()
+        
+        # Create a map of existing instance names for quick lookup
+        existing_instance_names = ({instance['name']: True for instance in config_dict["instances"]}
+                                   if isinstance(config_dict["instances"], list) else {})
+        
+        # Add env instances that don't exist in YAML config
+        for instance in env_instances:
+            if instance["name"] not in existing_instance_names:
+                logger.info(f"Adding instance {instance['name']} from environment variables")
+                config_dict["instances"].append(instance)
+            else:
+                logger.info(f"Skipping instance {instance['name']} from environment variables as it already exists in YAML config")
         
         try:
-            self.config = AppConfig.parse_obj(config_dict)
+            # Use model_validate instead of parse_obj if available (Pydantic v2 compatibility)
+            if hasattr(AppConfig, 'model_validate'):
+                self.config = AppConfig.model_validate(config_dict)
+            else:
+                self.config = AppConfig(**config_dict)  # Use constructor instead of parse_obj
+            
+            # Debugging: Print final merged configuration
+            logger.debug(f"Merged configuration: {json.dumps(config_dict, indent=2)}")
+            
             logger.info(f"Loaded configuration with {len(self.config.instances)} instances")
             return self.config
         except Exception as e:
@@ -132,7 +165,7 @@ class ConfigLoader:
                     base_config = yaml.safe_load(f)
                     if base_config:
                         config_dict.update(base_config)
-                logger.info(f"Loaded base configuration from {base_path}")
+                logger.debug(f"Loaded base configuration from {base_path} with content: {base_config}")
             except Exception as e:
                 logger.error(f"Error loading base configuration: {str(e)}")
         else:
@@ -280,8 +313,11 @@ class ConfigLoader:
             return {}
             
         try:
-            # Convert to dict and redact sensitive fields
-            config_dict = self.config.dict()
+            # Convert to dict and redact sensitive fields (Pydantic v2 compatibility)
+            if hasattr(self.config, 'model_dump'):
+                config_dict = self.config.model_dump() 
+            else:
+                config_dict = self.config.dict()
             
             # Redact API keys
             if "instances" in config_dict:
@@ -307,8 +343,11 @@ class ConfigLoader:
             # Save to environment-specific file
             config_path = os.path.join(self.config_path, f"{self.env}.yaml")
             
-            # Convert to dict
-            config_dict = config.dict(exclude_none=True)
+            # Convert to dict (Pydantic v2 compatibility)
+            if hasattr(config, 'model_dump'):
+                config_dict = config.model_dump(exclude_none=True)
+            else:
+                config_dict = config.dict(exclude_none=True)
             
             with open(config_path, "w") as f:
                 yaml.dump(config_dict, f, default_flow_style=False)
@@ -320,4 +359,4 @@ class ConfigLoader:
             return False
 
 # Create a singleton instance
-config_loader = ConfigLoader() 
+config_loader = ConfigLoader()
