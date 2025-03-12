@@ -176,6 +176,36 @@ The configuration can be reloaded without restarting the service:
 curl -X POST http://localhost:3010/config/reload
 ```
 
+## Running with Gunicorn (Multiple Workers)
+
+The proxy service supports running with multiple Gunicorn workers to handle more concurrent requests. When running with multiple workers, each worker has its own process space, so we use a file-based shared state mechanism to ensure that changes made to the instance configuration by one worker are visible to all other workers.
+
+### Configuration
+
+By default, the shared state file is stored in the system temporary directory. You can customize the location by setting the environment variable:
+
+```bash
+export INSTANCE_MANAGER_STATE_FILE=/path/to/shared/state.json
+```
+
+### Running with Gunicorn
+
+To start the service with Gunicorn:
+
+```bash
+pip install gunicorn
+gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:3010
+```
+
+This will start 4 worker processes, each handling requests independently but sharing the instance state through the shared state file.
+
+### Important Notes
+
+- Each worker checks for updates from the shared state file before processing a request.
+- Changes to instances (adding, removing, or modifying) are automatically saved to the shared state file.
+- The shared state file includes all instance configuration and basic status information.
+- For better performance, file access is minimized by checking modification times.
+
 ## License
 
 MIT

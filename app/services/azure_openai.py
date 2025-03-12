@@ -39,27 +39,21 @@ class AzureOpenAIService:
         # Use exact model name matching only
         exact_model_name = model_name.lower()
         
-        # Find Azure instances that support this model
+        # Find Azure instances that support this model with strict compatibility checking
         azure_instances = [
             instance for instance in instance_manager.instances.values()
             if (
                 # Must be Azure provider type
                 instance.provider_type == "azure" and
-                (
-                    # Instance has this model in its supported_models list
-                    exact_model_name in [m.lower() for m in instance.supported_models] or
-                    # Instance has a deployment mapping for this model
-                    exact_model_name in instance.model_deployments or
-                    # Instance has no model restrictions (empty supported_models means it supports all models)
-                    not instance.supported_models
-                )
+                # Strict model compatibility check - exact match in supported_models only
+                exact_model_name in [m.lower() for m in instance.supported_models]
             )
         ]
         
-        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{model_name}'")
+        logger.debug(f"Found {len(azure_instances)} Azure instances with strict model compatibility for '{model_name}'")
         
         if not azure_instances:
-            logger.warning(f"No Azure instances found supporting model '{model_name}'")
+            logger.warning(f"No Azure instances found with strict model compatibility for '{model_name}'")
         
         # Get the deployment name from the first instance that has a mapping for this model
         deployment_name = None
@@ -199,35 +193,55 @@ class AzureOpenAIService:
 
     def _select_primary_instance(self, instances: list, tokens: int, model_or_deployment: str) -> Optional[object]:
         """
-        Select primary instance based on routing strategy.
+        Select primary instance based on routing strategy with strict model compatibility checking.
         
         Args:
             instances: List of available Azure instances
             tokens: Required tokens for the request
             model_or_deployment: The original model name (preferred) or azure deployment name
         """
-        # Try selecting an instance using the instance manager
-        # This will use the exact model matching logic we implemented earlier
-        # This also enforces token limits through the selection process
+        # Filter instances to only those that explicitly support this model
+        eligible_instances = []
+        for instance in instances:
+            # Strict model compatibility check - exact match in supported_models only
+            if model_or_deployment in instance.supported_models:
+                # Verify token capacity
+                if instance.instance_stats.current_tpm + tokens <= instance.max_tpm:
+                    # Verify instance is healthy
+                    if instance.status == "healthy":
+                        eligible_instances.append(instance)
+                
+        # If we found eligible instances, select one based on the routing strategy
+        if eligible_instances:
+            # Choose the instance with the lowest load
+            selected_instance = min(eligible_instances, key=lambda i: i.instance_stats.current_tpm)
+            logger.debug(f"Selected instance '{selected_instance.name}' with strict model compatibility for '{model_or_deployment}'")
+            # Store the model used for selection to ensure consistent fallback selection
+            setattr(selected_instance, "_original_model_for_selection", model_or_deployment)
+            return selected_instance
+            
+        # If no eligible instances found, try using the instance manager's selection
+        # This is a fallback mechanism that might use more complex routing rules
         instance = instance_manager.select_instance(tokens, model_or_deployment)
-        if instance and instance.provider_type == "azure":
-            logger.debug(f"Selected instance '{instance.name}' for model/deployment '{model_or_deployment}' via instance manager")
+        if instance and instance.provider_type == "azure" and model_or_deployment in instance.supported_models:
+            logger.debug(f"Selected instance '{instance.name}' via instance manager with strict model compatibility for '{model_or_deployment}'")
+            # Store the model used for selection to ensure consistent fallback selection
+            setattr(instance, "_original_model_for_selection", model_or_deployment)
             return instance
             
-        # If instance manager failed (which already enforces token limits), 
-        # we should NOT try to select instances directly without enforcing the same limits
-        # Log the error and return None
-        logger.error(f"No instances available that support model '{model_or_deployment}' with enough capacity for {tokens} tokens")
+        # If no instances are available that meet our criteria, return None
+        logger.error(f"No instances available with strict model compatibility for '{model_or_deployment}' and capacity for {tokens} tokens")
         return None
         
-        # The rest of this method is removed because it bypassed token limit checks
-
     async def _execute_request(
         self, endpoint: str, deployment: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[object]
     ) -> Dict[str, Any]:
         """Execute the request with failover handling."""
         # We already check for None in forward_request, but add an assertion for safety
         assert instance is not None, "Instance should not be None at this point"
+        
+        # Preserve the original model for consistent instance selection in fallbacks
+        original_model = getattr(instance, "_original_model_for_selection", deployment)
             
         try:
             # Use the already selected instance directly instead of redoing selection
@@ -271,16 +285,78 @@ class AzureOpenAIService:
             else:
                 instance.mark_error(str(e))
             
-            # Try other instances
-            try:
-                result, used_instance = await instance_manager.try_instances(
-                    endpoint, deployment, payload, required_tokens, method, "azure"
+            # Get all eligible Azure instances that support this model
+            # This ensures we use the same selection criteria as the primary selection
+            azure_instances = self._get_azure_instances()
+            eligible_instances = []
+            
+            for candidate in azure_instances:
+                # Don't include the failed instance
+                if candidate.name == instance.name:
+                    continue
+                    
+                # Strict model compatibility check - exact match in supported_models only
+                model_supported = original_model in candidate.supported_models
+                    
+                # Verify token capacity
+                token_capacity_sufficient = candidate.instance_stats.current_tpm + required_tokens <= candidate.max_tpm
+                
+                # Check instance is healthy (not rate limited or in error state)
+                is_healthy = candidate.status == "healthy"
+                
+                if model_supported and token_capacity_sufficient and is_healthy:
+                    eligible_instances.append(candidate)
+            
+            # Log the number of eligible instances with model support information
+            logger.debug(f"Found {len(eligible_instances)} eligible fallback instances with strict model support for '{original_model}'")
+            
+            # Try all eligible instances
+            if eligible_instances:
+                fallback_errors = []
+                
+                for fallback_instance in eligible_instances:
+                    try:
+                        # Forward the request to the fallback instance
+                        logger.debug(f"Trying fallback instance {fallback_instance.name} for model {original_model}")
+                        
+                        result = await instance_manager.forwarder.forward_request(
+                            fallback_instance, endpoint, deployment, payload, method
+                        )
+                        
+                        # Mark instance as healthy and update TPM
+                        fallback_instance.mark_healthy()
+                        if "usage" in result and "total_tokens" in result["usage"]:
+                            fallback_instance.update_tpm_usage(result["usage"]["total_tokens"])
+                            
+                        logger.debug(f"Request completed using fallback Azure instance {fallback_instance.name}")
+                        return self._clean_response(result)
+                    except Exception as fallback_e:
+                        error_msg = str(fallback_e)
+                        logger.warning(f"Fallback instance {fallback_instance.name} failed with error: {error_msg}")
+                        fallback_errors.append(f"{fallback_instance.name}: {error_msg}")
+                        
+                        # Update fallback instance status
+                        if isinstance(fallback_e, HTTPException) and fallback_e.status_code == 429:
+                            retry_after = None
+                            if hasattr(fallback_e, 'headers') and fallback_e.headers and 'retry-after' in fallback_e.headers:
+                                try:
+                                    retry_after = int(fallback_e.headers['retry-after'])
+                                except (ValueError, TypeError):
+                                    pass
+                            fallback_instance.mark_rate_limited(retry_after)
+                        else:
+                            fallback_instance.mark_error(error_msg)
+                
+                # If we get here, all fallbacks failed
+                error_detail = f"All eligible fallback instances failed. Primary error: {e.detail}. Fallback errors: {', '.join(fallback_errors)}"
+                logger.error(error_detail)
+                raise HTTPException(
+                    status_code=e.status_code,
+                    detail=error_detail,
+                    headers=e.headers if hasattr(e, "headers") else {}
                 )
-                logger.debug(f"Request completed using fallback Azure instance {used_instance.name}")
-                return self._clean_response(result)
-            except HTTPException:
-                # Re-raise original error if fallback also fails
-                logger.debug(f"Azure API error: {e.status_code} - {e.detail}")
+            else:
+                logger.error(f"No eligible fallback instances found with strict model compatibility for '{original_model}' and capacity for {required_tokens} tokens")
                 raise e
 
     async def get_instances_status(self) -> List[Dict[str, Any]]:

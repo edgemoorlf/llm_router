@@ -307,4 +307,89 @@ class RequestForwarder:
         raise HTTPException(
             status_code=status_code,
             detail=error_message,
-        ) 
+        )
+
+    async def try_specific_instance(self,
+                                  instance_name: str,
+                                  endpoint: str, 
+                                  deployment: str, 
+                                  payload: Dict[str, Any], 
+                                  required_tokens: int,
+                                  method: str = "POST") -> Tuple[Dict[str, Any], APIInstance]:
+        """
+        Try a specific instance to handle a request.
+        
+        This is useful for testing or verification purposes when you want to ensure
+        a request is handled by a specific instance rather than using the load balancing.
+        
+        Args:
+            instance_name: The name of the instance to use
+            endpoint: The API endpoint
+            deployment: The deployment name
+            payload: The request payload
+            required_tokens: Estimated tokens required for the request
+            method: HTTP method
+            
+        Returns:
+            Tuple of (response, instance used)
+            
+        Raises:
+            HTTPException: If the instance fails or doesn't exist
+        """
+        from app.instance.manager import instance_manager
+        
+        # Check if the instance exists
+        if instance_name not in instance_manager.instances:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Instance '{instance_name}' not found"
+            )
+            
+        # Get the instance
+        instance = instance_manager.instances[instance_name]
+        
+        # Try to forward the request to the specific instance
+        try:
+            response = await self.forward_request(instance, endpoint, deployment, payload, method)
+            
+            # Mark instance as healthy and update TPM
+            instance.mark_healthy()
+            if "usage" in response and "total_tokens" in response["usage"]:
+                instance.update_tpm_usage(response["usage"]["total_tokens"])
+                
+            return response, instance
+        except HTTPException as e:
+            # If the instance fails, mark it accordingly and re-raise the exception
+            status_code = e.status_code
+            detail = e.detail
+            
+            # Handle rate limiting specifically
+            if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+                retry_after = None
+                # Extract retry-after from headers if available
+                if hasattr(e, 'headers') and e.headers and 'retry-after' in e.headers:
+                    try:
+                        retry_after = int(e.headers['retry-after'])
+                    except (ValueError, TypeError):
+                        pass
+                
+                instance.mark_rate_limited(retry_after)
+                logger.warning(f"Instance {instance.name} rate limited: {detail}")
+            else:
+                instance.mark_error(str(e))
+                logger.warning(f"Error from instance {instance.name}: {detail}")
+            
+            raise
+        except Exception as e:
+            # If there's an unexpected error, mark the instance as having an error
+            instance.mark_error(str(e))
+            logger.error(f"Unexpected error from instance {instance.name}: {str(e)}")
+            
+            # Re-raise the exception with a more informative message
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Unexpected error with API instance {instance.name}: {str(e)}"
+            )
+
+# Create a singleton instance
+instance_forwarder = RequestForwarder() 

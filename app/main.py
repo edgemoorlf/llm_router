@@ -8,6 +8,7 @@ from threading import Thread
 from fastapi import FastAPI, Depends, Request
 from dotenv import load_dotenv
 import uvicorn
+import argparse
 
 # Load environment variables
 load_dotenv()
@@ -130,6 +131,18 @@ async def log_requests(request: Request, call_next):
         logger.error(f"Error processing request {request_id}: {str(e)}")
         raise
 
+@app.middleware("http")
+async def check_instance_updates(request: Request, call_next):
+    """Middleware to check for instance updates before processing each request."""
+    from app.instance.manager import instance_manager
+    
+    # Check for updates from the shared state file
+    instance_manager.check_for_updates()
+    
+    # Process the request
+    response = await call_next(request)
+    return response
+
 # Import routers after app is created to avoid circular imports
 from app.routers import openai_proxy
 from app.routers import stats
@@ -227,5 +240,12 @@ async def reload_config():
         }
 
 if __name__ == "__main__":
-    port = config.port
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Azure OpenAI Proxy Server")
+    parser.add_argument("--port", type=int, default=config.port, help="Port to bind the server to")
+    args = parser.parse_args()
+    
+    # Use the port from command line arguments or config
+    port = args.port
+    
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
