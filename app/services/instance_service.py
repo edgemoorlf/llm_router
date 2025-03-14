@@ -15,28 +15,32 @@ logger = logging.getLogger(__name__)
 class InstanceService:
     """Service for managing API instances at runtime."""
     
-    async def add_instance(self, instance_config: InstanceConfig) -> Dict[str, Any]:
+    async def _add_single_instance(self, instance_config: InstanceConfig) -> Dict[str, Any]:
         """
-        Add a new API instance at runtime.
+        Private helper method to add a single instance.
         
         Args:
             instance_config: Instance configuration
             
         Returns:
-            Dictionary with status and details
+            Dictionary with status and details:
+            - On success: {"status": "success", "instance": instance_dict}
+            - On error: {"status": "error", "message": error_message, "reason": reason_string}
         """
         # Check if instance with this name already exists
-        if instance_config.name in instance_manager.instances:
+        if instance_manager.has_instance(instance_config.name):
             return {
                 "status": "error",
-                "message": f"Instance with name '{instance_config.name}' already exists"
+                "message": f"Instance with name '{instance_config.name}' already exists",
+                "reason": "duplicate_name"
             }
         
         # Basic validation
         if not instance_config.api_key or not instance_config.api_base:
             return {
                 "status": "error", 
-                "message": "API key and API base URL are required"
+                "message": "API key and API base URL are required",
+                "reason": "missing_required_fields"
             }
         
         try:
@@ -60,10 +64,7 @@ class InstanceService:
             instance.initialize_client()
             
             # Add the instance to the manager
-            with instance_manager.instances_lock:
-                instance_manager.instances[instance_config.name] = instance
-                # The _save_state_to_file method will be called by the add_instance method
-                instance_manager._save_state_to_file()
+            instance_manager.add_instance(instance_config.name, instance)
             
             # Set initial RPM window
             config = config_loader.get_config()
@@ -103,14 +104,39 @@ class InstanceService:
             
             return {
                 "status": "success",
-                "message": f"Added instance {instance_config.name}",
                 "instance": instance_dict
             }
         except Exception as e:
             logger.error(f"Error adding instance {instance_config.name}: {str(e)}\n{traceback.format_exc()}")
             return {
                 "status": "error",
-                "message": f"Error adding instance: {str(e)}"
+                "message": f"Error adding instance: {str(e)}",
+                "reason": "exception"
+            }
+    
+    async def add_instance(self, instance_config: InstanceConfig) -> Dict[str, Any]:
+        """
+        Add a new API instance at runtime.
+        
+        Args:
+            instance_config: Instance configuration
+            
+        Returns:
+            Dictionary with status and details
+        """
+        result = await self._add_single_instance(instance_config)
+        
+        # Format the response appropriately for the public API
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Added instance {instance_config.name}",
+                "instance": result["instance"]
+            }
+        else:
+            return {
+                "status": "error",
+                "message": result["message"]
             }
     
     async def add_many_instances(self, instances: List[InstanceConfig]) -> Dict[str, Any]:
@@ -134,64 +160,25 @@ class InstanceService:
         failed = []
         
         for instance_config in instances:
-            try:
-                # Check if instance with this name already exists
-                if instance_config.name in instance_manager.instances:
-                    skipped.append({
-                        "name": instance_config.name,
-                        "reason": "Instance with this name already exists"
-                    })
-                    continue
-                
-                # Basic validation
-                if not instance_config.api_key or not instance_config.api_base:
-                    failed.append({
-                        "name": instance_config.name,
-                        "reason": "API key and API base URL are required"
-                    })
-                    continue
-                
-                # Create the API instance
-                instance = APIInstance(
-                    name=instance_config.name,
-                    provider_type=instance_config.provider_type,
-                    api_key=instance_config.api_key,
-                    api_base=instance_config.api_base,
-                    api_version=instance_config.api_version,
-                    proxy_url=instance_config.proxy_url,
-                    priority=instance_config.priority,
-                    weight=instance_config.weight,
-                    max_tpm=instance_config.max_tpm,
-                    max_input_tokens=instance_config.max_input_tokens,
-                    supported_models=instance_config.supported_models,
-                    model_deployments=instance_config.model_deployments
-                )
-                
-                # Initialize the client for this instance
-                instance.initialize_client()
-                
-                # Add the instance to the manager
-                with instance_manager.instances_lock:
-                    instance_manager.instances[instance_config.name] = instance
-                
-                # Set initial RPM window
-                config = config_loader.get_config()
-                if config and config.monitoring and config.monitoring.stats_window_minutes > 0:
-                    instance.set_rpm_window(config.monitoring.stats_window_minutes)
-                
+            result = await self._add_single_instance(instance_config)
+            
+            if result["status"] == "success":
+                # Extract basic info for the success list
                 added.append({
                     "name": instance_config.name,
                     "provider_type": instance_config.provider_type,
                     "api_base": instance_config.api_base
                 })
-            except Exception as e:
+            elif result.get("reason") == "duplicate_name":
+                skipped.append({
+                    "name": instance_config.name,
+                    "reason": "Instance with this name already exists"
+                })
+            else:
                 failed.append({
                     "name": instance_config.name,
-                    "reason": f"Error: {str(e)}"
+                    "reason": result["message"]
                 })
-        
-        # Save state to file after adding all instances
-        instance_manager._save_state_to_file()
         
         return {
             "status": "success" if added else "warning" if skipped and not added else "error",
@@ -200,6 +187,118 @@ class InstanceService:
             "skipped": skipped,
             "failed": failed
         }
+    
+    async def update_instance(self, instance_name: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update attributes of an existing instance.
+        
+        Args:
+            instance_name: Name of the instance to update
+            update_data: Dictionary of attributes to update
+            
+        Returns:
+            Dictionary with status and details about the updated instance
+            
+        Raises:
+            HTTPException: If the instance doesn't exist or if there are validation errors
+        """
+        # Check if instance exists
+        instance = instance_manager.get_instance(instance_name)
+        if not instance:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Instance '{instance_name}' not found"
+            )
+        
+        # Track what was updated
+        updated_fields = {}
+        
+        try:
+            # Update attributes if provided in update_data
+            if "priority" in update_data:
+                instance.priority = update_data["priority"]
+                updated_fields["priority"] = update_data["priority"]
+                
+            if "weight" in update_data:
+                instance.weight = update_data["weight"]
+                updated_fields["weight"] = update_data["weight"]
+                
+            if "max_tpm" in update_data:
+                instance.max_tpm = update_data["max_tpm"]
+                updated_fields["max_tpm"] = update_data["max_tpm"]
+                
+            if "max_input_tokens" in update_data:
+                instance.max_input_tokens = update_data["max_input_tokens"]
+                updated_fields["max_input_tokens"] = update_data["max_input_tokens"]
+                
+            if "supported_models" in update_data:
+                instance.supported_models = update_data["supported_models"]
+                updated_fields["supported_models"] = update_data["supported_models"]
+                
+            if "model_deployments" in update_data:
+                instance.model_deployments = update_data["model_deployments"]
+                updated_fields["model_deployments"] = update_data["model_deployments"]
+                
+            if "api_version" in update_data:
+                instance.api_version = update_data["api_version"]
+                updated_fields["api_version"] = update_data["api_version"]
+                
+            if "proxy_url" in update_data:
+                instance.proxy_url = update_data["proxy_url"]
+                updated_fields["proxy_url"] = update_data["proxy_url"]
+                
+            # Only update API key if provided (and not empty)
+            if "api_key" in update_data and update_data["api_key"]:
+                instance.api_key = update_data["api_key"]
+                updated_fields["api_key"] = "********" # Redacted for security
+                
+            # Only update API base if provided (and not empty)
+            if "api_base" in update_data and update_data["api_base"]:
+                instance.api_base = update_data["api_base"]
+                updated_fields["api_base"] = update_data["api_base"]
+                
+                # If API base changed, we need to re-initialize the client
+                instance.initialize_client()
+                
+            # Only update provider_type if provided (and not empty)
+            if "provider_type" in update_data and update_data["provider_type"]:
+                instance.provider_type = update_data["provider_type"]
+                updated_fields["provider_type"] = update_data["provider_type"]
+                
+                # If provider type changed, we need to re-initialize the client
+                instance.initialize_client()
+            
+            # If nothing was updated
+            if not updated_fields:
+                return {
+                    "status": "warning",
+                    "message": f"No fields were updated for instance '{instance_name}'",
+                    "instance": {
+                        "name": instance.name,
+                        "provider_type": instance.provider_type,
+                        "api_base": instance.api_base
+                    }
+                }
+            
+            # Return success with updated fields
+            return {
+                "status": "success",
+                "message": f"Updated instance '{instance_name}' successfully",
+                "updated_fields": updated_fields,
+                "instance": {
+                    "name": instance.name,
+                    "provider_type": instance.provider_type,
+                    "api_base": instance.api_base,
+                    "status": instance.status
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating instance {instance_name}: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error updating instance: {str(e)}"
+            )
     
     async def test_instance(self, instance_config_or_name: Union[InstanceConfig, str]) -> Dict[str, Any]:
         """
@@ -216,12 +315,12 @@ class InstanceService:
         if isinstance(instance_config_or_name, str):
             # We're testing an existing instance by name
             instance_name = instance_config_or_name
-            if instance_name not in instance_manager.instances:
+            instance = instance_manager.get_instance(instance_name)
+            if not instance:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Instance '{instance_name}' not found"
                 )
-            instance = instance_manager.instances[instance_name]
         else:
             # We're testing a new instance config
             instance_config = instance_config_or_name
@@ -367,24 +466,22 @@ class InstanceService:
             Status information about the removal
         """
         # Check if instance exists
-        if instance_name not in instance_manager.instances:
+        instance = instance_manager.get_instance(instance_name)
+        if not instance:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Instance '{instance_name}' not found"
             )
         
+        # Store instance details for the response before removal
+        instance_details = {
+            "name": instance.name,
+            "provider_type": instance.provider_type,
+            "api_base": instance.api_base
+        }
+        
         # Remove the instance
-        with instance_manager.instances_lock:
-            # Get instance details for the response
-            instance = instance_manager.instances[instance_name]
-            instance_details = {
-                "name": instance.name,
-                "provider_type": instance.provider_type,
-                "api_base": instance.api_base
-            }
-            
-            # Remove the instance
-            del instance_manager.instances[instance_name]
+        instance_manager.remove_instance(instance_name)
         
         logger.info(f"Removed instance '{instance_name}' at runtime")
         

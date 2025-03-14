@@ -40,7 +40,7 @@ class GenericOpenAIService:
         
         # Find instances that support this model and are generic provider type
         model_instances = [
-            instance for instance in instance_manager.instances.values()
+            instance for instance in instance_manager.get_all_instances().values()
             if (
                 # Must be generic provider type
                 instance.provider_type == "generic" and
@@ -135,7 +135,7 @@ class GenericOpenAIService:
         
         # Filter instances to only include generic provider types
         generic_instances = [
-            instance for instance in instance_manager.instances.values()
+            instance for instance in instance_manager.get_all_instances().values()
             if instance.provider_type == "generic"
         ]
         

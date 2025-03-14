@@ -39,40 +39,13 @@ class AzureOpenAIService:
         # Use exact model name matching only
         exact_model_name = model_name.lower()
         
-        # Find Azure instances that support this model with strict compatibility checking
-        azure_instances = [
-            instance for instance in instance_manager.instances.values()
-            if (
-                # Must be Azure provider type
-                instance.provider_type == "azure" and
-                # Strict model compatibility check - exact match in supported_models only
-                exact_model_name in [m.lower() for m in instance.supported_models]
-            )
-        ]
-        
-        logger.debug(f"Found {len(azure_instances)} Azure instances with strict model compatibility for '{model_name}'")
+        # Verify there are Azure instances that support this model
+        azure_instances = self._get_azure_instances_for_model(exact_model_name)
         
         if not azure_instances:
-            logger.warning(f"No Azure instances found with strict model compatibility for '{model_name}'")
-        
-        # Get the deployment name from the first instance that has a mapping for this model
-        deployment_name = None
-        for instance in azure_instances:
-            # Use only exact model name matching
-            if exact_model_name in instance.model_deployments:
-                deployment_name = instance.model_deployments[exact_model_name]
-                logger.debug(f"Found deployment mapping for model '{model_name}' in Azure instance '{instance.name}': {deployment_name}")
-                break
-        
-        # If no instance has a mapping, fall back to the global model mapper
-        if not deployment_name:
-            deployment_name = model_mapper.get_deployment_name(model_name)
-            logger.debug(f"Using global model mapper for model '{model_name}': {deployment_name}")
-        
-        if not deployment_name:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No deployment mapped for model '{model_name}' in any Azure instance",
+                detail=f"No Azure instances found that support model '{model_name}'",
             )
         
         # Clone the payload and remove the model field since Azure uses deployment names
@@ -80,35 +53,7 @@ class AzureOpenAIService:
         azure_payload.pop("model", None)
         
         # Estimate tokens for rate limiting and instance selection
-        required_tokens = 0
-        
-        # For handling specific endpoints
-        if endpoint == "/v1/chat/completions":
-            # Estimate tokens for chat completions
-            required_tokens = estimate_chat_tokens(
-                azure_payload.get("messages", []),
-                azure_payload.get("functions", None),
-                model_name,
-                "azure"
-            )
-
-        # For completions endpoint
-        elif endpoint == "/v1/completions":
-            # Estimate tokens for standard completions
-            required_tokens = estimate_completion_tokens(azure_payload)
-        
-        # For embeddings endpoint (rough estimate)
-        elif endpoint == "/v1/embeddings":
-            # Estimate tokens for embeddings
-            input_text = azure_payload.get("input", "")
-            if isinstance(input_text, str):
-                required_tokens = len(input_text.split()) * 2  # Rough approximation
-            elif isinstance(input_text, list):
-                required_tokens = sum(len(text.split()) * 2 for text in input_text if isinstance(text, str))
-        
-        # For other endpoints, use a minimum token count for rate limiting
-        else:
-            required_tokens = 100  # Minimum token count for unknown endpoints
+        required_tokens = self._estimate_tokens(endpoint, azure_payload, model_name)
         
         # Check against global rate limiter (if enabled)
         if not azure_payload.get("stream", False) and required_tokens > 0:
@@ -123,16 +68,44 @@ class AzureOpenAIService:
                     headers={"Retry-After": str(retry_after)},
                 )
         
-        # Log the transformation
-        logger.debug(f"Transformed request for model '{model_name}' to Azure deployment '{deployment_name}' (est. {required_tokens} tokens)")
-        
+        # Add tokens to payload for later use
         azure_payload["required_tokens"] = required_tokens
-        logger.debug(f"azure_payload required_tokens {required_tokens}")
+        logger.debug(f"Transformed request for model '{model_name}' (est. {required_tokens} tokens)")
+        
         return {
-            "azure_deployment": deployment_name,
-            "original_model": model_name,  # Preserve the original model name for instance matching
+            "original_model": exact_model_name,  # Preserve the original model name for instance selection
             "payload": azure_payload
         }
+    
+    def _estimate_tokens(self, endpoint: str, payload: Dict[str, Any], model_name: str) -> int:
+        """Estimate tokens for the payload based on endpoint type."""
+        # For handling specific endpoints
+        if endpoint == "/v1/chat/completions":
+            # Estimate tokens for chat completions
+            return estimate_chat_tokens(
+                payload.get("messages", []),
+                payload.get("functions", None),
+                model_name,
+                "azure"
+            )
+
+        # For completions endpoint
+        elif endpoint == "/v1/completions":
+            # Estimate tokens for standard completions
+            return estimate_completion_tokens(payload)
+        
+        # For embeddings endpoint (rough estimate)
+        elif endpoint == "/v1/embeddings":
+            # Estimate tokens for embeddings
+            input_text = payload.get("input", "")
+            if isinstance(input_text, str):
+                return len(input_text.split()) * 2  # Rough approximation
+            elif isinstance(input_text, list):
+                return sum(len(text.split()) * 2 for text in input_text if isinstance(text, str))
+        
+        # For other endpoints, use a minimum token count for rate limiting
+        else:
+            return 100  # Minimum token count for unknown endpoints
         
     def _clean_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Remove Azure-specific fields from the response to match OpenAI format."""
@@ -153,103 +126,109 @@ class AzureOpenAIService:
         return response
 
     async def forward_request(
-        self, endpoint: str, azure_deployment: str, payload: Dict[str, Any], original_model: str = None, method: str = "POST"
+        self, endpoint: str, payload: Dict[str, Any], original_model: str, method: str = "POST"
     ) -> Dict[str, Any]:
         """Forward request to Azure instances with failover handling."""
         required_tokens = payload.pop("required_tokens", 1000)
-        azure_instances = self._get_azure_instances()
+        
+        # Get Azure instances that support this model
+        azure_instances = self._get_azure_instances_for_model(original_model)
         
         if not azure_instances:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                detail="No Azure instances available"
+                detail=f"No Azure instances available that support model '{original_model}'"
             )
             
-        # Use the original model name for instance selection when available
-        model_for_selection = original_model if original_model else azure_deployment
-        
-        # Log which model name is being used for selection
-        if original_model:
-            logger.debug(f"Using original model '{original_model}' for instance selection")
-        else:
-            logger.warning(f"Original model name not available, using deployment '{azure_deployment}' for instance selection")
-            
-        primary_instance = self._select_primary_instance(azure_instances, required_tokens, model_for_selection)
+        # Select the best instance based on capacity and health
+        primary_instance = self._select_primary_instance(azure_instances, required_tokens, original_model)
         
         # If no instance is found that can handle this request with its token limits, return 503
         if not primary_instance:
-            error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_for_selection}'"
+            error_detail = f"No instances available that can handle {required_tokens} tokens for model '{original_model}'"
             logger.error(error_detail)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=error_detail
             )
             
-        return await self._execute_request(endpoint, azure_deployment, payload, required_tokens, method, primary_instance)
+        return await self._execute_request(endpoint, original_model, payload, required_tokens, method, primary_instance)
 
     def _get_azure_instances(self) -> list:
         """Get all available Azure instances."""
-        return [i for i in instance_manager.instances.values() if i.provider_type == "azure"]
+        return [i for i in instance_manager.get_all_instances().values() if i.provider_type == "azure"]
+        
+    def _get_azure_instances_for_model(self, model_name: str) -> list:
+        """Get Azure instances that support a specific model."""
+        return [
+            instance for instance in self._get_azure_instances()
+            if (
+                # Strict model compatibility check - exact match in supported_models only
+                model_name.lower() in [m.lower() for m in instance.supported_models]
+            )
+        ]
 
-    def _select_primary_instance(self, instances: list, tokens: int, model_or_deployment: str) -> Optional[object]:
+    def _select_primary_instance(self, instances: list, tokens: int, model_name: str) -> Optional[object]:
         """
         Select primary instance based on routing strategy with strict model compatibility checking.
         
         Args:
-            instances: List of available Azure instances
+            instances: List of available Azure instances that support the model
             tokens: Required tokens for the request
-            model_or_deployment: The original model name (preferred) or azure deployment name
+            model_name: The model name to use
         """
-        # Filter instances to only those that explicitly support this model
+        # Filter instances by token capacity and health
         eligible_instances = []
         for instance in instances:
-            # Strict model compatibility check - exact match in supported_models only
-            if model_or_deployment in instance.supported_models:
-                # Verify token capacity
-                if instance.instance_stats.current_tpm + tokens <= instance.max_tpm:
-                    # Verify instance is healthy
-                    if instance.status == "healthy":
-                        eligible_instances.append(instance)
+            # Verify token capacity
+            if instance.instance_stats.current_tpm + tokens <= instance.max_tpm:
+                # Verify instance is healthy
+                if instance.status == "healthy":
+                    eligible_instances.append(instance)
                 
-        # If we found eligible instances, select one based on the routing strategy
+        # If we found eligible instances, select one based on the lowest load
         if eligible_instances:
             # Choose the instance with the lowest load
             selected_instance = min(eligible_instances, key=lambda i: i.instance_stats.current_tpm)
-            logger.debug(f"Selected instance '{selected_instance.name}' with strict model compatibility for '{model_or_deployment}'")
+            logger.debug(f"Selected instance '{selected_instance.name}' for model '{model_name}'")
             # Store the model used for selection to ensure consistent fallback selection
-            setattr(selected_instance, "_original_model_for_selection", model_or_deployment)
+            setattr(selected_instance, "_original_model_for_selection", model_name)
             return selected_instance
             
-        # If no eligible instances found, try using the instance manager's selection
+        # If no eligible instances found with capacity, try using the instance manager's selection
         # This is a fallback mechanism that might use more complex routing rules
-        instance = instance_manager.select_instance(tokens, model_or_deployment)
-        if instance and instance.provider_type == "azure" and model_or_deployment in instance.supported_models:
-            logger.debug(f"Selected instance '{instance.name}' via instance manager with strict model compatibility for '{model_or_deployment}'")
+        instance = instance_manager.select_instance(tokens, model_name)
+        if instance and instance.provider_type == "azure" and model_name.lower() in [m.lower() for m in instance.supported_models]:
+            logger.debug(f"Selected instance '{instance.name}' via instance manager for model '{model_name}'")
             # Store the model used for selection to ensure consistent fallback selection
-            setattr(instance, "_original_model_for_selection", model_or_deployment)
+            setattr(instance, "_original_model_for_selection", model_name)
             return instance
             
         # If no instances are available that meet our criteria, return None
-        logger.error(f"No instances available with strict model compatibility for '{model_or_deployment}' and capacity for {tokens} tokens")
+        logger.error(f"No instances available with capacity for {tokens} tokens for model '{model_name}'")
         return None
         
     async def _execute_request(
-        self, endpoint: str, deployment: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[object]
+        self, endpoint: str, model_name: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[object]
     ) -> Dict[str, Any]:
         """Execute the request with failover handling."""
         # We already check for None in forward_request, but add an assertion for safety
         assert instance is not None, "Instance should not be None at this point"
         
         # Preserve the original model for consistent instance selection in fallbacks
-        original_model = getattr(instance, "_original_model_for_selection", deployment)
+        original_model = getattr(instance, "_original_model_for_selection", model_name)
+        
+        # Ensure the model name is in the payload for deployment name resolution
+        payload_with_model = payload.copy()
+        payload_with_model["model"] = original_model
             
         try:
-            # Use the already selected instance directly instead of redoing selection
-            logger.debug(f"Executing request using Azure instance {instance.name} for deployment {deployment}")
+            # Use the already selected instance directly
+            logger.debug(f"Executing request using Azure instance {instance.name} for model {model_name}")
             
             # Forward the request directly to the selected instance
             result = await instance_manager.forwarder.forward_request(
-                instance, endpoint, deployment, payload, method
+                instance, endpoint, payload_with_model, method
             )
             
             # Mark instance as healthy and update TPM
@@ -262,7 +241,7 @@ class AzureOpenAIService:
         except HTTPException as e:
             # Check for content management policy errors
             if "content management policy" in e.detail.lower():
-                logger.warning(f"Content policy violation (HTTP {e.status_code}) - prompt: {payload.get('messages', '')}")
+                logger.warning(f"Content policy violation (HTTP {e.status_code}) - prompt: {payload_with_model.get('messages', '')}")
                 # Ensure we're preserving the original error (which should be 400) for content policy violations
                 raise HTTPException(
                     status_code=e.status_code,  # Preserve original status code (should be 400)
@@ -285,9 +264,8 @@ class AzureOpenAIService:
             else:
                 instance.mark_error(str(e))
             
-            # Get all eligible Azure instances that support this model
-            # This ensures we use the same selection criteria as the primary selection
-            azure_instances = self._get_azure_instances()
+            # Get all eligible Azure instances that support this model (excluding the failed one)
+            azure_instances = self._get_azure_instances_for_model(original_model)
             eligible_instances = []
             
             for candidate in azure_instances:
@@ -295,20 +273,17 @@ class AzureOpenAIService:
                 if candidate.name == instance.name:
                     continue
                     
-                # Strict model compatibility check - exact match in supported_models only
-                model_supported = original_model in candidate.supported_models
-                    
                 # Verify token capacity
                 token_capacity_sufficient = candidate.instance_stats.current_tpm + required_tokens <= candidate.max_tpm
                 
                 # Check instance is healthy (not rate limited or in error state)
                 is_healthy = candidate.status == "healthy"
                 
-                if model_supported and token_capacity_sufficient and is_healthy:
+                if token_capacity_sufficient and is_healthy:
                     eligible_instances.append(candidate)
             
-            # Log the number of eligible instances with model support information
-            logger.debug(f"Found {len(eligible_instances)} eligible fallback instances with strict model support for '{original_model}'")
+            # Log the number of eligible instances
+            logger.debug(f"Found {len(eligible_instances)} eligible fallback instances for model '{original_model}'")
             
             # Try all eligible instances
             if eligible_instances:
@@ -320,7 +295,7 @@ class AzureOpenAIService:
                         logger.debug(f"Trying fallback instance {fallback_instance.name} for model {original_model}")
                         
                         result = await instance_manager.forwarder.forward_request(
-                            fallback_instance, endpoint, deployment, payload, method
+                            fallback_instance, endpoint, payload_with_model, method
                         )
                         
                         # Mark instance as healthy and update TPM
@@ -356,7 +331,7 @@ class AzureOpenAIService:
                     headers=e.headers if hasattr(e, "headers") else {}
                 )
             else:
-                logger.error(f"No eligible fallback instances found with strict model compatibility for '{original_model}' and capacity for {required_tokens} tokens")
+                logger.error(f"No eligible fallback instances found with capacity for {required_tokens} tokens for model '{original_model}'")
                 raise e
 
     async def get_instances_status(self) -> List[Dict[str, Any]]:

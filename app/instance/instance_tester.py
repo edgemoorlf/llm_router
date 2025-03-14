@@ -23,8 +23,8 @@ async def perform_instance_test(instance_name: str) -> dict:
         return {"success": False, "error": "Empty instance name"}
         
     try:
-        # Get the instance from the manager
-        instance = instance_manager.instances.get(instance_name)
+        # Get the instance from the manager using the encapsulated method
+        instance = instance_manager.get_instance(instance_name)
         if not instance:
             return {"success": False, "error": f"Instance {instance_name} not found"}
             

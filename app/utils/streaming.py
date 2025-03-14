@@ -13,14 +13,13 @@ from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_
 
 logger = logging.getLogger(__name__)
 
-async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict[str, Any], provider_type: str = "azure", original_model: str = None) -> StreamingResponse:
+async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provider_type: str = "azure", original_model: str = None) -> StreamingResponse:
     """
     Handle streaming requests by forwarding them to the API and streaming the response back.
     Supports multiple API instances with automatic failover.
     
     Args:
         endpoint: The API endpoint
-        deployment: The deployment name
         payload: The request payload
         provider_type: The provider type ("azure" or "generic")
         original_model: The original model name from the client request
@@ -30,10 +29,14 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     """
     # Ensure streaming is enabled
     payload["stream"] = True
-    payload.pop("required_tokens", 1000)
+    payload.pop("required_tokens", None)
     
     # Save the original model for adding to response chunks
-    original_model = original_model or payload.get("model", "unknown")
+    model_name = original_model or payload.get("model", "unknown")
+    
+    # Ensure model_name is in the payload for Azure deployment mapping
+    if "model" not in payload and model_name:
+        payload["model"] = model_name
     
     # Estimate tokens for rate limiting and instance selection
     required_tokens = 0
@@ -42,18 +45,18 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
         required_tokens = estimate_chat_tokens(
             messages=payload.get("messages", []),
             functions=payload.get("functions"),
-            model=payload.get("model", ""),
+            model=model_name,
             provider=provider_type
         )
         
         # Validate against max input tokens before proceeding
-        max_input_tokens = next((inst.max_input_tokens for inst in instance_manager.instances.values() 
+        max_input_tokens = next((inst.max_input_tokens for inst in instance_manager.get_all_instances().values() 
                                if inst.max_input_tokens > 0), None)
         logger.debug(f"required tokens {required_tokens} vs max input tokens {max_input_tokens}")        
         if max_input_tokens and required_tokens > max_input_tokens:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Request exceeds maximum input tokens ({required_tokens} > {max_input_tokens})"
+                detail=f"Input is too large, exceeds max token limit of {max_input_tokens}",
             )
         
         # Enforce strict token limits before instance selection
@@ -65,43 +68,27 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
     elif endpoint == "/v1/completions":
         required_tokens = estimate_completion_tokens(
             payload.get("prompt", ""),
-            payload.get("model", ""),
+            model_name,
             provider_type
         )
     else:
         required_tokens = 500  # Default for unknown endpoints
     
-    # Extract model name from payload if available
-    model_name = payload.get("model")
-    
-    # Use the original model name for instance selection when available
-    model_for_selection = original_model if original_model else payload.get("model")
-    
     # Select an instance based on the routing strategy and model support
-    # Use the original model name to ensure proper matching against supported_models and model_deployments
-    primary_instance = instance_manager.select_instance(required_tokens, model_for_selection)
-    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_for_selection} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
+    primary_instance = instance_manager.select_instance(required_tokens, model_name)
+    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
     
     # If no instance was found that can handle this request with its token limits, return 503
     if not primary_instance:
-        error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_for_selection}'"
+        error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_name}'"
         logger.error(error_detail)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=error_detail
         )
     
-    # For Azure provider types, remove the model field since it uses deployment names
-    # For generic provider types, keep the model field since it's required
-    if provider_type == "azure":
-        # Remove the model field for Azure provider types
-        payload.pop("model", None)
-        logger.debug(f"Removed model field for Azure provider type")
-    else:
-        logger.debug(f"Keeping model field for generic provider type")
-    
     # Filter out instances in error state
-    available_instances = [instance for instance in instance_manager.instances.values() 
+    available_instances = [instance for instance in instance_manager.get_all_instances().values() 
                            if instance.status != InstanceStatus.ERROR]
     
     if not available_instances:
@@ -124,24 +111,42 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
             # Initialize the instance if needed
             instance.initialize_client()
             
-            # Build the URL for this instance based on provider type
-            if provider_type == "azure":
-                # Azure uses deployment names in the path
-                url = instance.build_url(deployment_name=deployment, endpoint=endpoint)
-            else:
-                # Generic providers use model parameter
-                url = instance.build_url(endpoint).replace("{model}", deployment)
-                
-            logger.debug(f"Constructed {provider_type} URL: {url}")
+            # For each instance, make sure the model name is in the payload for deployment mapping
+            instance_payload = payload.copy()
+            
+            # Determine deployment name based on the model (for Azure instances)
+            deployment = ""
+            curr_model_name = instance_payload.get("model", "").lower()
+            if curr_model_name and instance.provider_type == "azure" and instance.model_deployments:
+                # Look up the deployment name for this model in this specific instance
+                deployment = instance.model_deployments.get(curr_model_name, "")
+                if deployment:
+                    logger.debug(f"Resolved deployment '{deployment}' for model '{curr_model_name}' in instance '{instance.name}'")
+                else:
+                    logger.warning(f"No deployment mapping found for model '{curr_model_name}' in instance '{instance.name}'")
+                    
+                    # Skip this instance if it doesn't have a deployment mapping for this model
+                    if instance.provider_type == "azure":
+                        logger.warning(f"Skipping Azure instance {instance.name} that lacks deployment mapping for model {curr_model_name}")
+                        continue
+            
+            # Build the URL for this instance based on provider type and deployment
+            url = instance.build_url(endpoint=endpoint, deployment_name=deployment)
+            logger.debug(f"Constructed URL for {instance.provider_type} instance: {url}")
             
             logger.debug(f"Streaming request via instance {instance.name} to {url}")
             
             # Create a new client for streaming (we can't reuse the existing client)
             client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
-            client.headers.update({"api-key": instance.api_key})
+            
+            # Set appropriate headers based on provider type
+            if instance.provider_type == "azure":
+                client.headers.update({"api-key": instance.api_key})
+            else:
+                client.headers.update({"Authorization": f"Bearer {instance.api_key}"})
             
             # Make the request to the API
-            response = await client.post(url, json=payload, headers={"Accept": "application/json"})
+            response = await client.post(url, json=instance_payload, headers={"Accept": "application/json"})
             
             # Check for HTTP errors
             response.raise_for_status()
@@ -183,7 +188,7 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
                                     
                             # Add model if it's missing
                             if "model" not in chunk:
-                                chunk["model"] = original_model
+                                chunk["model"] = model_name
                                 
                             # Ensure correct object type
                             if "object" not in chunk:
@@ -204,10 +209,50 @@ async def handle_streaming_request(endpoint: str, deployment: str, payload: Dict
                     background=BackgroundTask(client.aclose),
                 )
             else:
-                # For other endpoints, return the raw stream
+                # For other endpoints like completions, we still need to ensure SSE format
+                async def process_stream():
+                    async for line in response.aiter_lines():
+                        if not line or line.strip() == "":
+                            continue
+                            
+                        # If the line already starts with data:, just yield it
+                        if line.startswith("data:"):
+                            yield f"{line}\n\n"
+                            continue
+                            
+                        # Handle the "[DONE]" message
+                        if line == "[DONE]":
+                            yield f"data: [DONE]\n\n"
+                            continue
+                            
+                        try:
+                            # Try to parse as JSON
+                            chunk = json.loads(line)
+                            
+                            # Ensure all required fields exist
+                            if "choices" not in chunk:
+                                chunk["choices"] = []
+                                
+                            # Add model if it's missing
+                            if "model" not in chunk:
+                                chunk["model"] = model_name
+                                
+                            # Ensure correct object type for completions
+                            if "object" not in chunk:
+                                chunk["object"] = "text_completion.chunk"
+                                
+                            # Format as SSE
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Error decoding streaming response JSON: {str(e)} - Line: {line}")
+                            # Pass through as SSE anyway
+                            yield f"data: {line}\n\n"
+                        except Exception as e:
+                            logger.error(f"Error processing streaming chunk: {str(e)}")
+                
                 return StreamingResponse(
-                    response.aiter_bytes(),
-                    media_type="application/json",
+                    process_stream(),
+                    media_type="text/event-stream",
                     background=BackgroundTask(client.aclose),
                 )
                 

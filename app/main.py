@@ -143,22 +143,34 @@ async def check_instance_updates(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# Import routers after app is created to avoid circular imports
+# Import router modules
 from app.routers import openai_proxy
 from app.routers import stats
 from app.routers import config as config_router
+from app.routers import health
+from app.routers import verification
+from app.routers import instance_management
 
 # Include routers
 app.include_router(openai_proxy.router)
 app.include_router(stats.router)
 app.include_router(config_router.router)
+app.include_router(health.router)
+app.include_router(verification.router)
+app.include_router(instance_management.router)
 
 @app.get("/")
 async def root():
     return {
         "message": f"{config.name} API is running",
         "docs": "/docs",
-        "version": config.version
+        "version": config.version,
+        "config_endpoints": {
+            "configuration": "/config",
+            "instances": "/config/instances",
+            "instance_details": "/config/instances?detailed=true",
+            "reload": "/config/reload"
+        }
     }
 
 @app.get("/health")
@@ -207,36 +219,6 @@ async def health_check():
             "message": f"Error performing health check: {str(e)}",
             "timestamp": int(time.time()),
             "version": config.version
-        }
-
-# Add configuration endpoints
-@app.get("/config")
-async def get_config():
-    """Get the current configuration (excluding secrets)."""
-    return config_loader.to_dict()
-
-@app.post("/config/reload")
-async def reload_config():
-    """Reload configuration from disk."""
-    from app.instance.manager import instance_manager
-    
-    try:
-        # Reload configuration
-        config = config_loader.reload()
-        
-        # Reload instance manager
-        instance_manager.reload_config()
-        
-        return {
-            "status": "success",
-            "message": "Configuration reloaded successfully",
-            "instances": len(instance_manager.instances)
-        }
-    except Exception as e:
-        logger.error(f"Error reloading configuration: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Error reloading configuration: {str(e)}"
         }
 
 if __name__ == "__main__":

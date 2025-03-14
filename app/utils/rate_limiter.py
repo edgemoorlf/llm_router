@@ -25,6 +25,10 @@ class TokenUsage(BaseModel):
 class RateLimiter(ABC):
     """Abstract base class for rate limiters."""
     
+    def __init__(self):
+        """Initialize the base rate limiter with token encoding cache."""
+        self.encoding_cache: Dict[str, tiktoken.Encoding] = {}
+    
     @abstractmethod
     def check_and_update(self, tokens: int) -> Tuple[bool, int]:
         """
@@ -38,7 +42,6 @@ class RateLimiter(ABC):
         """
         pass
     
-    @abstractmethod
     def estimate_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
         """
         Estimate the number of tokens in the given text for the specified model.
@@ -50,7 +53,22 @@ class RateLimiter(ABC):
         Returns:
             Estimated token count
         """
-        pass
+        try:
+            # Use tiktoken for accurate token counting
+            if model not in self.encoding_cache:
+                try:
+                    self.encoding_cache[model] = tiktoken.encoding_for_model(model)
+                except KeyError:
+                    # Fall back to cl100k_base encoding for new models
+                    self.encoding_cache[model] = tiktoken.get_encoding("cl100k_base")
+            
+            encoding = self.encoding_cache[model]
+            token_count = len(encoding.encode(text))
+            return token_count
+        except Exception as e:
+            logger.warning(f"Error estimating tokens: {str(e)}. Using character-based estimation.")
+            # Fallback to character-based estimation
+            return len(text) // 4  # Rough estimate: 4 chars per token
     
     @abstractmethod
     def reset(self) -> None:
@@ -70,12 +88,12 @@ class InMemoryRateLimiter(RateLimiter):
         Args:
             tokens_per_minute: Token rate limit per minute
         """
+        super().__init__()  # Initialize base class
         self.tokens_per_minute = tokens_per_minute
         self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
         self.usage_window: Dict[int, int] = {}  # timestamp (s) -> tokens used
         self.lock = threading.Lock()
-        self.encoding_cache: Dict[str, tiktoken.Encoding] = {}
         
         logger.info(f"Initialized in-memory rate limiter with {tokens_per_minute} tokens per minute")
     
@@ -117,34 +135,6 @@ class InMemoryRateLimiter(RateLimiter):
             self.usage_window[current_time] = self.usage_window.get(current_time, 0) + tokens
             return True, 0
     
-    def estimate_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
-        """
-        Estimate the number of tokens in the given text.
-        
-        Args:
-            text: Text to estimate tokens for
-            model: Model to use for token counting
-            
-        Returns:
-            Estimated token count
-        """
-        try:
-            # Use tiktoken for accurate token counting
-            if model not in self.encoding_cache:
-                try:
-                    self.encoding_cache[model] = tiktoken.encoding_for_model(model)
-                except KeyError:
-                    # Fall back to cl100k_base encoding for new models
-                    self.encoding_cache[model] = tiktoken.get_encoding("cl100k_base")
-            
-            encoding = self.encoding_cache[model]
-            token_count = len(encoding.encode(text))
-            return token_count
-        except Exception as e:
-            logger.warning(f"Error estimating tokens: {str(e)}. Using character-based estimation.")
-            # Fallback to character-based estimation
-            return len(text) // 4  # Rough estimate: 4 chars per token
-    
     def reset(self) -> None:
         """Reset the rate limiter."""
         with self.lock:
@@ -158,6 +148,7 @@ class RedisRateLimiter(RateLimiter):
         self, 
         tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
         redis_url: str = "redis://localhost:6379",
+        redis_password: str = "",
         max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT
     ):
         """
@@ -168,12 +159,12 @@ class RedisRateLimiter(RateLimiter):
             redis_url: URL for Redis connection
             max_input_tokens: Maximum allowed tokens per request
         """
+        super().__init__()  # Initialize base class
         self.tokens_per_minute = tokens_per_minute
         self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
         self.redis_key_prefix = "azure_openai_proxy:rate_limit"
-        self.redis = redis.from_url(redis_url)
-        self.encoding_cache: Dict[str, tiktoken.Encoding] = {}
+        self.redis = redis.from_url(url=redis_url, password=redis_password)
         
         logger.info(f"Initialized Redis rate limiter with {tokens_per_minute} tokens per minute")
     
@@ -225,34 +216,6 @@ class RedisRateLimiter(RateLimiter):
             
             return True, 0
     
-    def estimate_tokens(self, text: str, model: str = "gpt-3.5-turbo") -> int:
-        """
-        Estimate the number of tokens in the given text.
-        
-        Args:
-            text: Text to estimate tokens for
-            model: Model to use for token counting
-            
-        Returns:
-            Estimated token count
-        """
-        try:
-            # Use tiktoken for accurate token counting
-            if model not in self.encoding_cache:
-                try:
-                    self.encoding_cache[model] = tiktoken.encoding_for_model(model)
-                except KeyError:
-                    # Fall back to cl100k_base encoding for new models
-                    self.encoding_cache[model] = tiktoken.get_encoding("cl100k_base")
-            
-            encoding = self.encoding_cache[model]
-            token_count = len(encoding.encode(text))
-            return token_count
-        except Exception as e:
-            logger.warning(f"Error estimating tokens: {str(e)}. Using character-based estimation.")
-            # Fallback to character-based estimation
-            return len(text) // 4  # Rough estimate: 4 chars per token
-    
     def reset(self) -> None:
         """Reset the rate limiter."""
         window_key = f"{self.redis_key_prefix}:window"
@@ -263,13 +226,16 @@ def get_rate_limiter(
     tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
     use_redis: bool = False,
     redis_url: str = "redis://localhost:6379",
+    redis_password: str = "",
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT
 ) -> RateLimiter:
     """Factory function to create a rate limiter with specified configuration."""
     if use_redis:
+        logger.info(f"Using Redis rate limiter with URL: {redis_url} and token per minute: {tokens_per_minute}")
         return RedisRateLimiter(
             tokens_per_minute=tokens_per_minute,
             redis_url=redis_url,
+            redis_password=redis_password,
             max_input_tokens=max_input_tokens
         )
     return InMemoryRateLimiter(
@@ -283,5 +249,6 @@ rate_limiter = get_rate_limiter(
     tokens_per_minute=int(os.environ.get("TOKEN_RATE_LIMIT", DEFAULT_TOKEN_RATE_LIMIT)),
     use_redis=os.environ.get("USE_REDIS", "").lower() in ("true", "1", "yes"),
     redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
+    redis_password=os.environ.get("REDIS_PASSWORD", ""),
     max_input_tokens=int(os.environ.get("MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS_LIMIT))
 )

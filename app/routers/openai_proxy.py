@@ -1,9 +1,11 @@
 """Router for proxying OpenAI API requests to OpenAI-compatible services."""
 import json
 import logging
-from typing import Any, Tuple
+from typing import Any, Tuple, Dict, Optional
+import uuid
+import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Body, Header
 
 from app.instance.manager import instance_manager
 from app.services.azure_openai import azure_openai_service
@@ -33,13 +35,13 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     
     # Get available instances for each provider type
     azure_instances = instance_manager.router.get_available_instances_for_model(
-        instance_manager.instances, 
+        instance_manager.get_all_instances(), 
         model_name,
         provider_type="azure"
     )
     
     generic_instances = instance_manager.router.get_available_instances_for_model(
-        instance_manager.instances, 
+        instance_manager.get_all_instances(), 
         model_name,
         provider_type="generic"
     )
@@ -70,40 +72,45 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
         logger.warning(f"No instances explicitly support model '{model_name}', defaulting to Azure service")
         return azure_openai_service, "azure"
 
-@router.post("/chat/completions")
-async def chat_completions(request: Request) -> Any:
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request, 
+    body: Dict[str, Any] = Body(...),  # Use Body for accessing raw request body
+    x_ms_client_id: Optional[str] = Header(None),  # Optional Azure client ID
+    x_ms_trace_id: Optional[str] = Header(None),   # Optional Azure trace ID
+) -> Dict[str, Any]:
     """
-    Proxy for OpenAI /v1/chat/completions endpoint.
+    Handle chat completions API requests.
     
-    Forwards chat completion requests to OpenAI-compatible services with appropriate transformations.
-    Supports both streaming and non-streaming responses.
+    This is a specialized endpoint for the chat completions format with message sequence.
     """
+    request_id = str(uuid.uuid4())
+    request_start_time = time.time()
+    
+    # Set a logger prefix for this request
+    log_prefix = f"[{request_id}]"
+    
     try:
-        # Parse the request body
-        payload = await request.json()
+        # Keep the original model name for metadata
+        original_model = body.get("model", "")
         
-        # Check if streaming is requested
-        stream = payload.get("stream", False)
+        # Extract stream parameter
+        stream = body.get("stream", False)
         
-        # Get the model name from the payload
-        model_name = payload.get("model")
-        if not model_name:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Model name is required",
-            )
+        # Determine the service to use based on the model
+        service, provider_type = determine_service_by_model(original_model)
         
-        # Determine which service to use based on the model name
-        service, provider_type = determine_service_by_model(model_name)
+        # Save a copy of the original payload
+        payload = {**body}
         
-        # Transform request for the appropriate service
+        # Transform the request for the appropriate backend
+        logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
         transformed = await service.transform_request("/v1/chat/completions", payload)
         
         if stream:
             # For streaming, we need to process the response as a stream
             return await handle_streaming_request(
                 "/v1/chat/completions",
-                transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
                 provider_type,
                 original_model=transformed.get("original_model")
@@ -112,9 +119,8 @@ async def chat_completions(request: Request) -> Any:
             # For regular requests, we can forward and return directly
             response = await service.forward_request(
                 "/v1/chat/completions",
-                transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
-                original_model=transformed.get("original_model")
+                transformed.get("original_model")
             )
             
             # Ensure the response matches OpenAI's expected format
@@ -128,69 +134,80 @@ async def chat_completions(request: Request) -> Any:
                 
             # Ensure each choice has a message with role and content for non-streaming
             for choice in response["choices"]:
-                if "message" not in choice:
-                    # If the API returns a different format, attempt to fix it
-                    if "text" in choice:
-                        # Some versions might return text directly
-                        choice["message"] = {
-                            "role": "assistant",
-                            "content": choice["text"]
-                        }
+                if "message" not in choice or "role" not in choice["message"] or "content" not in choice["message"]:
+                    # Azure OpenAI might not always include content in case of content filtering
+                    if "message" in choice and "role" in choice["message"] and "content" not in choice["message"]:
+                        choice["message"]["content"] = ""
                         
-            # Add any missing standard fields
+            # Add the model info to the response if not present
             if "model" not in response:
-                response["model"] = payload.get("model", "unknown")
+                response["model"] = original_model or "Unknown"
                 
-            # Ensure correct object type
-            if "object" not in response:
-                response["object"] = "chat.completion"
-                
+            # Ensure finish_reason is always included
+            for choice in response["choices"]:
+                if "finish_reason" not in choice:
+                    choice["finish_reason"] = "stop"  # Set a default
+                    
+            # Track request completion
+            duration_ms = int((time.time() - request_start_time) * 1000)
+            logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
+                    
             return response
-    
-    except HTTPException:
-        # Re-raise FastAPI HTTP exceptions
-        raise
+                
     except Exception as e:
-        logger.exception("Error processing chat completions request")
+        # Log any errors
+        logger.error(f"Error processing chat completions request")
+        logger.exception(e)
+        
+        # Re-raise HTTPExceptions
+        if isinstance(e, HTTPException):
+            raise
+            
+        # For any other exception, return a 500 error
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}",
+            detail=f"Error processing request: {str(e)}"
         )
-
-@router.post("/completions")
-async def completions(request: Request) -> Any:
+        
+@router.post("/v1/completions")
+async def completions(
+    request: Request, 
+    body: Dict[str, Any] = Body(...),
+    x_ms_client_id: Optional[str] = Header(None),  # Optional Azure client ID
+    x_ms_trace_id: Optional[str] = Header(None),   # Optional Azure trace ID
+) -> Dict[str, Any]:
     """
-    Proxy for OpenAI /v1/completions endpoint.
+    Handle standard completions API requests.
     
-    Forwards completion requests to OpenAI-compatible services with appropriate transformations.
-    Supports both streaming and non-streaming responses.
+    This is the legacy non-chat API for text completion.
     """
+    request_id = str(uuid.uuid4())
+    request_start_time = time.time()
+    
+    # Set a logger prefix for this request
+    log_prefix = f"[{request_id}]"
+    
     try:
-        # Parse the request body
-        payload = await request.json()
+        # Keep the original model name for metadata
+        original_model = body.get("model", "")
         
-        # Check if streaming is requested
-        stream = payload.get("stream", False)
+        # Extract stream parameter
+        stream = body.get("stream", False)
         
-        # Get the model name from the payload
-        model_name = payload.get("model")
-        if not model_name:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Model name is required",
-            )
+        # Determine the service to use based on the model
+        service, provider_type = determine_service_by_model(original_model)
         
-        # Determine which service to use based on the model name
-        service, provider_type = determine_service_by_model(model_name)
+        # Save a copy of the original payload
+        payload = {**body}
         
-        # Transform request for the appropriate service
+        # Transform the request for the appropriate backend
+        logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
         transformed = await service.transform_request("/v1/completions", payload)
         
         if stream:
             # For streaming, we need to process the response as a stream
             return await handle_streaming_request(
                 "/v1/completions",
-                transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
                 provider_type,
                 original_model=transformed.get("original_model")
@@ -199,9 +216,8 @@ async def completions(request: Request) -> Any:
             # For regular requests, we can forward and return directly
             response = await service.forward_request(
                 "/v1/completions",
-                transformed["azure_deployment" if provider_type == "azure" else "deployment"],
                 transformed["payload"],
-                original_model=transformed.get("original_model")
+                transformed.get("original_model")
             )
             
             # Ensure the response matches OpenAI's expected format
@@ -230,16 +246,25 @@ async def completions(request: Request) -> Any:
             if "object" not in response:
                 response["object"] = "text_completion"
                 
+            # Track request completion
+            duration_ms = int((time.time() - request_start_time) * 1000)
+            logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
+            
             return response
-    
-    except HTTPException:
-        # Re-raise FastAPI HTTP exceptions
-        raise
+                
     except Exception as e:
-        logger.exception("Error processing completions request")
+        # Log any errors
+        logger.error(f"Error processing completions request")
+        logger.exception(e)
+        
+        # Re-raise HTTPExceptions
+        if isinstance(e, HTTPException):
+            raise
+            
+        # For any other exception, return a 500 error
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}",
+            detail=f"Error processing request: {str(e)}"
         )
 
 @router.post("/embeddings")
@@ -270,9 +295,8 @@ async def embeddings(request: Request) -> Any:
         # Forward request to the API
         response = await service.forward_request(
             "/v1/embeddings",
-            transformed["azure_deployment" if provider_type == "azure" else "deployment"],
             transformed["payload"],
-            original_model=transformed.get("original_model")
+            transformed.get("original_model")
         )
         
         # Ensure the response matches OpenAI's expected format
@@ -358,20 +382,32 @@ async def catch_all(request: Request, path: str) -> Any:
             # Get the model name from the payload
             model_name = payload.get("model")
             
+            # Extract stream parameter if it exists
+            stream = payload.get("stream", False)
+            
             # Determine which service to use based on the model name
             service, provider_type = determine_service_by_model(model_name)
             
             # If there's a model parameter, we can try to transform and forward
             transformed = await service.transform_request(full_path, payload)
             
-            # Forward the request to the API
-            response = await service.forward_request(
-                full_path,
-                transformed["azure_deployment" if provider_type == "azure" else "deployment"],
-                transformed["payload"],
-                method=request.method,
-                original_model=transformed.get("original_model")
-            )
+            # Handle streaming requests differently
+            if stream:
+                # Process as a streaming request
+                return await handle_streaming_request(
+                    full_path,
+                    transformed["payload"],
+                    provider_type,
+                    original_model=transformed.get("original_model")
+                )
+            else:
+                # For regular requests, forward and return directly
+                response = await service.forward_request(
+                    full_path,
+                    transformed["payload"],
+                    transformed.get("original_model"),
+                    method=request.method
+                )
             
             # Ensure the response includes the model information
             if "model" not in response:

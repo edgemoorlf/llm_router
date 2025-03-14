@@ -3,6 +3,8 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 import threading
+import uuid
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -12,31 +14,21 @@ from .config_loader import InstanceConfigLoader
 from .router import InstanceRouter
 from .forwarder import RequestForwarder
 from .monitor import InstanceMonitor
+from .state_manager import StateManager, create_state_manager
 
 # Import the new configuration system
 from app.config import config_loader, InstanceConfig
 
-# Add new imports for file-based state management
-import json
-import tempfile
-import os.path
-import time
-import uuid
-
 class InstanceManager:
     """Manager for multiple API service instances with load balancing and failover."""
     
-    # Add configuration for shared state file
-    SHARED_STATE_FILE = os.environ.get('INSTANCE_MANAGER_STATE_FILE', 
-                                      os.path.join(tempfile.gettempdir(), 'azure_openai_proxy_instances.json'))
-    STATE_FILE_POLL_INTERVAL = 5  # seconds
-    
-    def __init__(self, routing_strategy: Optional[RoutingStrategy] = None):
+    def __init__(self, routing_strategy: Optional[RoutingStrategy] = None, state_manager: Optional[StateManager] = None):
         """
         Initialize the instance manager.
         
         Args:
             routing_strategy: Strategy for selecting instances
+            state_manager: StateManager for persisting instance state
         """
         self.instances: Dict[str, APIInstance] = {}
         self.instances_lock = threading.RLock()  # Lock for thread-safe access to instances
@@ -45,9 +37,12 @@ class InstanceManager:
         self.config_loader = InstanceConfigLoader()
         self.monitor = InstanceMonitor()
         
-        # Add worker ID for state file operations
+        # Create worker ID and initialize last state check time
         self.worker_id = str(uuid.uuid4())
         self.last_state_check = 0
+        
+        # Initialize state manager (use file-based by default)
+        self.state_manager = state_manager or create_state_manager("file")
         
         try:
             # Load configuration (may raise an exception)
@@ -66,9 +61,9 @@ class InstanceManager:
         # Initialize router now that we have the routing strategy
         self.router = InstanceRouter(routing_strategy)
         
-        # First try to load state from shared file
-        if self._load_state_from_file():
-            logger.info(f"Loaded instance state from shared file: {len(self.instances)} instances")
+        # First try to load state from the state manager
+        if self._load_state():
+            logger.info(f"Loaded instance state from state manager: {len(self.instances)} instances")
         else:
             # Load instances from configuration
             try:
@@ -96,8 +91,8 @@ class InstanceManager:
             except Exception as e:
                 logger.error(f"Error setting RPM window: {str(e)}")
             
-            # Save initial state to file
-            self._save_state_to_file()
+            # Save initial state
+            self._save_state()
         
         logger.info(f"Initialized {len(self.instances)} API instances with {routing_strategy} routing strategy")
     
@@ -130,6 +125,94 @@ class InstanceManager:
             except Exception as e:
                 logger.error(f"Error loading instance {config.name} from configuration: {str(e)}")
     
+    def _load_state(self) -> bool:
+        """
+        Load instance state from the state manager.
+        
+        Returns:
+            True if state was loaded successfully, False otherwise
+        """
+        try:
+            state = self.state_manager.load_state()
+            if not state:
+                return False
+                
+            with self.instances_lock:
+                # Clear existing instances
+                self.instances.clear()
+                
+                # Load instances from state
+                for instance_data in state.get('instances', []):
+                    try:
+                        instance = APIInstance(
+                            name=instance_data['name'],
+                            provider_type=instance_data['provider_type'],
+                            api_key=instance_data['api_key'],
+                            api_base=instance_data['api_base'],
+                            api_version=instance_data.get('api_version', '2023-05-15'),
+                            proxy_url=instance_data.get('proxy_url'),
+                            priority=instance_data.get('priority', 100),
+                            weight=instance_data.get('weight', 100),
+                            max_tpm=instance_data.get('max_tpm', 240000),
+                            max_input_tokens=instance_data.get('max_input_tokens', 0),
+                            supported_models=instance_data.get('supported_models', []),
+                            model_deployments=instance_data.get('model_deployments', {})
+                        )
+                        instance.initialize_client()
+                        
+                        # Load stats if available
+                        if 'stats' in instance_data:
+                            instance.error_count = instance_data['stats'].get('error_count', 0)
+                            instance.last_error = instance_data['stats'].get('last_error')
+                            instance.rate_limited_until = instance_data['stats'].get('rate_limited_until')
+                            
+                        self.instances[instance_data['name']] = instance
+                    except Exception as e:
+                        logger.error(f"Error loading instance {instance_data.get('name', 'unknown')} from state: {str(e)}")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Error loading state: {str(e)}")
+            return False
+    
+    def _save_state(self) -> bool:
+        """
+        Save instance state using the state manager.
+        
+        Returns:
+            True if state was saved successfully, False otherwise
+        """
+        try:
+            instances_data = []
+            
+            with self.instances_lock:
+                for name, instance in self.instances.items():
+                    instance_data = {
+                        'name': instance.name,
+                        'provider_type': instance.provider_type,
+                        'api_key': instance.api_key,
+                        'api_base': instance.api_base,
+                        'api_version': instance.api_version,
+                        'proxy_url': instance.proxy_url,
+                        'priority': instance.priority,
+                        'weight': instance.weight,
+                        'max_tpm': instance.max_tpm,
+                        'max_input_tokens': instance.max_input_tokens,
+                        'supported_models': instance.supported_models,
+                        'model_deployments': instance.model_deployments,
+                        'stats': {
+                            'error_count': instance.error_count,
+                            'last_error': instance.last_error,
+                            'rate_limited_until': instance.rate_limited_until,
+                        }
+                    }
+                    instances_data.append(instance_data)
+            
+            return self.state_manager.save_state(instances_data, self.worker_id)
+        except Exception as e:
+            logger.error(f"Error saving state: {str(e)}")
+            return False
+    
     def load_from_csv(self, csv_path: str) -> None:
         """
         Load instances from a CSV file, replacing existing configuration.
@@ -144,6 +227,9 @@ class InstanceManager:
         if not self.instances:
             logger.warning("No instances loaded from CSV. Falling back to environment variables.")
             self.instances = self.config_loader.load_from_env()
+            
+        # Save state after loading instances
+        self._save_state()
             
         logger.info(f"Loaded {len(self.instances)} instances from CSV")
     
@@ -185,13 +271,99 @@ class InstanceManager:
                 logger.error(f"Error setting RPM window: {str(e)}")
             
             # Save state after reloading config
-            self._save_state_to_file()
+            self._save_state()
             
             logger.info(f"Reloaded configuration with {len(self.instances)} instances")
         except Exception as e:
             logger.error(f"Error reloading configuration: {str(e)}")
             raise
     
+    def check_for_updates(self) -> bool:
+        """
+        Check for updates from other workers.
+        
+        Returns:
+            True if updates were loaded, False otherwise
+        """
+        has_updates, current_time = self.state_manager.check_for_updates(self.last_state_check)
+        
+        # Update last check time
+        self.last_state_check = current_time
+        
+        # If updates are available, reload state
+        if has_updates:
+            return self._load_state()
+            
+        return False
+
+    def add_instance(self, name: str, instance: APIInstance) -> None:
+        """
+        Add an instance to the manager.
+        
+        Args:
+            name: Name of the instance
+            instance: The APIInstance object
+        """
+        with self.instances_lock:
+            self.instances[name] = instance
+            # Save state after modifying instances
+            self._save_state()
+            
+    def remove_instance(self, name: str) -> bool:
+        """
+        Remove an instance from the manager.
+        
+        Args:
+            name: Name of the instance to remove
+            
+        Returns:
+            True if the instance was removed, False if it was not found
+        """
+        with self.instances_lock:
+            if name in self.instances:
+                del self.instances[name]
+                # Save state after modifying instances
+                self._save_state()
+                return True
+            return False
+    
+    def has_instance(self, name: str) -> bool:
+        """
+        Check if an instance exists in the manager.
+        
+        Args:
+            name: Name of the instance to check
+            
+        Returns:
+            True if the instance exists, False otherwise
+        """
+        with self.instances_lock:
+            return name in self.instances
+    
+    def get_instance(self, name: str) -> Optional[APIInstance]:
+        """
+        Get an instance by name.
+        
+        Args:
+            name: Name of the instance to get
+            
+        Returns:
+            The instance if it exists, None otherwise
+        """
+        with self.instances_lock:
+            return self.instances.get(name)
+    
+    def get_all_instances(self) -> Dict[str, APIInstance]:
+        """
+        Get all instances.
+        
+        Returns:
+            Dictionary of instance name to APIInstance
+        """
+        with self.instances_lock:
+            # Return a copy to avoid external modifications
+            return dict(self.instances)
+
     def select_instance(self, required_tokens: int, model_name: Optional[str] = None) -> Optional[APIInstance]:
         """
         Select an instance based on the router strategy.
@@ -245,7 +417,6 @@ class InstanceManager:
     
     async def try_instances(self, 
                            endpoint: str, 
-                           deployment: str, 
                            payload: Dict[str, Any], 
                            required_tokens: int,
                            method: str = "POST",
@@ -270,7 +441,6 @@ class InstanceManager:
         return await self.forwarder.try_instances(
             self.instances,
             endpoint,
-            deployment,
             payload,
             required_tokens,
             self.router,
@@ -340,161 +510,6 @@ class InstanceManager:
             instance.set_rpm_window(minutes)
             
         logger.info(f"Set RPM window for all instances to {minutes} minutes")
-
-    def _load_state_from_file(self) -> bool:
-        """
-        Load instance state from shared file.
-        
-        Returns:
-            True if state was loaded successfully, False otherwise
-        """
-        if not os.path.exists(self.SHARED_STATE_FILE):
-            return False
-            
-        try:
-            # Check file modification time to avoid unnecessary reads
-            mtime = os.path.getmtime(self.SHARED_STATE_FILE)
-            if mtime <= self.last_state_check and self.instances:
-                return True
-                
-            self.last_state_check = time.time()
-            
-            with open(self.SHARED_STATE_FILE, 'r') as f:
-                state = json.load(f)
-                
-            with self.instances_lock:
-                # Clear existing instances
-                self.instances.clear()
-                
-                # Load instances from state
-                for instance_data in state.get('instances', []):
-                    try:
-                        instance = APIInstance(
-                            name=instance_data['name'],
-                            provider_type=instance_data['provider_type'],
-                            api_key=instance_data['api_key'],
-                            api_base=instance_data['api_base'],
-                            api_version=instance_data.get('api_version', '2023-05-15'),
-                            proxy_url=instance_data.get('proxy_url'),
-                            priority=instance_data.get('priority', 100),
-                            weight=instance_data.get('weight', 100),
-                            max_tpm=instance_data.get('max_tpm', 240000),
-                            max_input_tokens=instance_data.get('max_input_tokens', 0),
-                            supported_models=instance_data.get('supported_models', []),
-                            model_deployments=instance_data.get('model_deployments', {})
-                        )
-                        instance.initialize_client()
-                        
-                        # Load stats if available
-                        if 'stats' in instance_data:
-                            instance.error_count = instance_data['stats'].get('error_count', 0)
-                            instance.last_error = instance_data['stats'].get('last_error')
-                            instance.rate_limited_until = instance_data['stats'].get('rate_limited_until')
-                            
-                        self.instances[instance_data['name']] = instance
-                    except Exception as e:
-                        logger.error(f"Error loading instance {instance_data.get('name', 'unknown')} from state file: {str(e)}")
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error loading state from file: {str(e)}")
-            return False
-    
-    def _save_state_to_file(self) -> bool:
-        """
-        Save instance state to shared file.
-        
-        Returns:
-            True if state was saved successfully, False otherwise
-        """
-        try:
-            state = {
-                'timestamp': time.time(),
-                'worker_id': self.worker_id,
-                'instances': []
-            }
-            
-            with self.instances_lock:
-                for name, instance in self.instances.items():
-                    instance_data = {
-                        'name': instance.name,
-                        'provider_type': instance.provider_type,
-                        'api_key': instance.api_key,
-                        'api_base': instance.api_base,
-                        'api_version': instance.api_version,
-                        'proxy_url': instance.proxy_url,
-                        'priority': instance.priority,
-                        'weight': instance.weight,
-                        'max_tpm': instance.max_tpm,
-                        'max_input_tokens': instance.max_input_tokens,
-                        'supported_models': instance.supported_models,
-                        'model_deployments': instance.model_deployments,
-                        'stats': {
-                            'error_count': instance.error_count,
-                            'last_error': instance.last_error,
-                            'rate_limited_until': instance.rate_limited_until,
-                        }
-                    }
-                    state['instances'].append(instance_data)
-            
-            # Write to temporary file first, then rename for atomicity
-            temp_file = f"{self.SHARED_STATE_FILE}.{self.worker_id}.tmp"
-            with open(temp_file, 'w') as f:
-                json.dump(state, f)
-                
-            # Atomic rename
-            os.replace(temp_file, self.SHARED_STATE_FILE)
-            
-            self.last_state_check = time.time()
-            return True
-        except Exception as e:
-            logger.error(f"Error saving state to file: {str(e)}")
-            return False
-    
-    def check_for_updates(self) -> bool:
-        """
-        Check for updates from other workers.
-        
-        Returns:
-            True if updates were loaded, False otherwise
-        """
-        # Only check every STATE_FILE_POLL_INTERVAL seconds
-        if time.time() - self.last_state_check < self.STATE_FILE_POLL_INTERVAL:
-            return False
-            
-        return self._load_state_from_file()
-
-    # Add state saving to all methods that modify instances
-    def add_instance(self, name: str, instance: APIInstance) -> None:
-        """
-        Add an instance to the manager.
-        
-        Args:
-            name: Name of the instance
-            instance: The APIInstance object
-        """
-        with self.instances_lock:
-            self.instances[name] = instance
-            # Save state after modifying instances
-            self._save_state_to_file()
-            
-    def remove_instance(self, name: str) -> bool:
-        """
-        Remove an instance from the manager.
-        
-        Args:
-            name: Name of the instance to remove
-            
-        Returns:
-            True if the instance was removed, False if it was not found
-        """
-        with self.instances_lock:
-            if name in self.instances:
-                del self.instances[name]
-                # Save state after modifying instances
-                self._save_state_to_file()
-                return True
-            return False
 
 # Create a singleton instance with the default routing strategy from config
 instance_manager = InstanceManager() 

@@ -17,7 +17,6 @@ class RequestForwarder:
     async def forward_request(
             instance: APIInstance, 
             endpoint: str, 
-            deployment: str, 
             payload: Dict[str, Any],
             method: str = "POST") -> Dict[str, Any]:
         """
@@ -26,7 +25,6 @@ class RequestForwarder:
         Args:
             instance: The instance to use
             endpoint: The API endpoint
-            deployment: The deployment name
             payload: The request payload
             method: HTTP method
             
@@ -36,6 +34,19 @@ class RequestForwarder:
         Raises:
             HTTPException: If the request fails
         """
+        # Extract model from payload
+        model_name = payload.get("model", "").lower() if payload and "model" in payload else ""
+        
+        # Determine deployment name based on the model
+        deployment = ""
+        if model_name and instance.provider_type == "azure" and instance.model_deployments:
+            # Look up the deployment name for this model in this specific instance
+            deployment = instance.model_deployments.get(model_name, "")
+            if deployment:
+                logger.debug(f"Resolved deployment '{deployment}' for model '{model_name}' in instance '{instance.name}'")
+            else:
+                logger.warning(f"No deployment mapping found for model '{model_name}' in instance '{instance.name}'")
+        
         url = instance.build_url(endpoint, deployment)
         instance.last_used = time.time()
         current_time = int(time.time())
@@ -164,7 +175,6 @@ class RequestForwarder:
     async def try_instances(self,
                           instances: Dict[str, APIInstance],
                           endpoint: str, 
-                          deployment: str, 
                           payload: Dict[str, Any], 
                           required_tokens: int,
                           instance_router,
@@ -176,7 +186,6 @@ class RequestForwarder:
         Args:
             instances: Dictionary of available API instances
             endpoint: The API endpoint
-            deployment: The deployment name
             payload: The request payload
             required_tokens: Estimated tokens required for the request
             instance_router: The router to select instances
@@ -200,9 +209,9 @@ class RequestForwarder:
         # Try strategy-based instance first, prioritizing instances that support this model
         primary_instance = instance_router.select_instance(instances, required_tokens, model_name)
         if primary_instance:
-            logger.debug(f"Selected primary instance: {primary_instance.name if primary_instance else 'None'} for model: {model_name} with max input tokens: {primary_instance.max_input_tokens} vs required tokens: {required_tokens}")
+            logger.debug(f"Selected primary instance: {primary_instance.name} for model: {model_name} with max input tokens: {primary_instance.max_input_tokens} vs required tokens: {required_tokens}")
             try:
-                response = await self.forward_request(primary_instance, endpoint, deployment, payload, method)
+                response = await self.forward_request(primary_instance, endpoint, payload, method)
                 # Mark instance as healthy and update TPM
                 primary_instance.mark_healthy()
                 if "usage" in response and "total_tokens" in response["usage"]:
@@ -263,7 +272,7 @@ class RequestForwarder:
                 continue
                 
             try:
-                response = await self.forward_request(instance, endpoint, deployment, payload, method)
+                response = await self.forward_request(instance, endpoint, payload, method)
                 # Mark instance as healthy and update TPM
                 instance.mark_healthy()
                 if "usage" in response and "total_tokens" in response["usage"]:
@@ -309,29 +318,24 @@ class RequestForwarder:
             detail=error_message,
         )
 
-    async def try_specific_instance(self,
-                                  instance_name: str,
-                                  endpoint: str, 
-                                  deployment: str, 
-                                  payload: Dict[str, Any], 
-                                  required_tokens: int,
-                                  method: str = "POST") -> Tuple[Dict[str, Any], APIInstance]:
+    async def try_specific_instance(
+        self, 
+        instance_name: str, 
+        endpoint: str, 
+        payload: Dict[str, Any],
+        method: str = "POST"
+    ) -> Dict[str, Any]:
         """
-        Try a specific instance to handle a request.
-        
-        This is useful for testing or verification purposes when you want to ensure
-        a request is handled by a specific instance rather than using the load balancing.
+        Try a specific instance by name.
         
         Args:
             instance_name: The name of the instance to use
             endpoint: The API endpoint
-            deployment: The deployment name
             payload: The request payload
-            required_tokens: Estimated tokens required for the request
             method: HTTP method
             
         Returns:
-            Tuple of (response, instance used)
+            API response
             
         Raises:
             HTTPException: If the instance fails or doesn't exist
@@ -339,25 +343,23 @@ class RequestForwarder:
         from app.instance.manager import instance_manager
         
         # Check if the instance exists
-        if instance_name not in instance_manager.instances:
+        instance = instance_manager.get_instance(instance_name)
+        if not instance:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Instance '{instance_name}' not found"
             )
-            
-        # Get the instance
-        instance = instance_manager.instances[instance_name]
         
         # Try to forward the request to the specific instance
         try:
-            response = await self.forward_request(instance, endpoint, deployment, payload, method)
+            response = await self.forward_request(instance, endpoint, payload, method)
             
             # Mark instance as healthy and update TPM
             instance.mark_healthy()
             if "usage" in response and "total_tokens" in response["usage"]:
                 instance.update_tpm_usage(response["usage"]["total_tokens"])
                 
-            return response, instance
+            return response
         except HTTPException as e:
             # If the instance fails, mark it accordingly and re-raise the exception
             status_code = e.status_code

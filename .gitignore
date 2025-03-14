@@ -50,7 +50,16 @@ dump.rdb
 
 # Misc
 .DS_Store
+*.bak
 
 # Data
 data/
 *.csv
+
+# Config
+config/
+development.yaml
+production.yaml
+*.json
+*.jsonl
+*.jsonl.gz
