@@ -9,15 +9,21 @@ from fastapi import FastAPI, Depends, Request
 from dotenv import load_dotenv
 import uvicorn
 import argparse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from starlette.status import HTTP_307_TEMPORARY_REDIRECT
 
 # Load environment variables
 load_dotenv()
 
 # Import configuration system
 from app.config import config_loader
+from app.config.config_hierarchy import config_hierarchy
 
 # Load configuration
 config = config_loader.load_config()
+# Get hierarchical configuration
+hierarchy_config = config_hierarchy.get_configuration()
 
 # Configure logging
 log_level = getattr(logging, config.logging.level)
@@ -100,12 +106,22 @@ if config.logging.feishu_webhook:
     # Also add to file handler for consistency
     logging.getLogger().addHandler(feishu_handler)
 
+    # Initialize the instance manager
+    # Instances can be loaded from:
+    # 1. YAML configuration files in app/config/instances/
+    # 2. Saved state in a temporary file (for persistence across restarts)
+    global instance_manager
+
 # Create FastAPI app
 app = FastAPI(
     title=config.name,
     description="A proxy service to convert OpenAI API calls to Azure OpenAI API calls with rate limiting",
     version=config.version,
 )
+
+# Import and register exception handlers
+from app.errors.handlers import register_exception_handlers
+register_exception_handlers(app)
 
 # Add middleware for request/response logging
 @app.middleware("http")
@@ -147,17 +163,15 @@ async def check_instance_updates(request: Request, call_next):
 from app.routers import openai_proxy
 from app.routers import stats
 from app.routers import config as config_router
-from app.routers import health
-from app.routers import verification
 from app.routers import instance_management
+from app.routers import admin
 
 # Include routers
 app.include_router(openai_proxy.router)
 app.include_router(stats.router)
 app.include_router(config_router.router)
-app.include_router(health.router)
-app.include_router(verification.router)
 app.include_router(instance_management.router)
+app.include_router(admin.router)
 
 @app.get("/")
 async def root():
@@ -220,6 +234,22 @@ async def health_check():
             "timestamp": int(time.time()),
             "version": config.version
         }
+
+# Add backward compatibility redirects
+@app.get("/health/instances", status_code=HTTP_307_TEMPORARY_REDIRECT)
+async def redirect_health_instances():
+    """Redirect from old health/instances endpoint to new stats/instances endpoint"""
+    return RedirectResponse(url="/stats/instances", status_code=HTTP_307_TEMPORARY_REDIRECT)
+
+@app.get("/health/instances/{instance_name}", status_code=HTTP_307_TEMPORARY_REDIRECT)
+async def redirect_health_instance(instance_name: str):
+    """Redirect from old health/instances/{instance_name} endpoint to new instances/{instance_name} endpoint"""
+    return RedirectResponse(url=f"/instances/{instance_name}", status_code=HTTP_307_TEMPORARY_REDIRECT)
+
+@app.post("/verification/instances/{instance_name}", status_code=HTTP_307_TEMPORARY_REDIRECT)
+async def redirect_verify_instance(instance_name: str):
+    """Redirect from old verification/instances/{instance_name} endpoint to new instances/verify/{instance_name} endpoint"""
+    return RedirectResponse(url=f"/instances/verify/{instance_name}", status_code=HTTP_307_TEMPORARY_REDIRECT)
 
 if __name__ == "__main__":
     # Parse command line arguments

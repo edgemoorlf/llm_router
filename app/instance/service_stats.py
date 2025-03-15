@@ -2,6 +2,7 @@ import time
 import logging
 from typing import Dict, List, Any, Optional, Set
 from collections import defaultdict
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -83,88 +84,148 @@ class ServiceStats:
     
     def get_metrics(self, window_minutes: Optional[int] = None) -> Dict[str, Any]:
         """获取指定时间窗口的服务指标"""
-        if window_minutes is None:
-            window_minutes = self.default_window_minutes
+        try:
+            if window_minutes is None:
+                window_minutes = self.default_window_minutes
+                
+            if window_minutes <= 0:
+                window_minutes = 5  # 默认为 5 分钟
+                
+            current_time = int(time.time())
+            window_seconds = window_minutes * 60
+            window_start = current_time - window_seconds
             
-        if window_minutes <= 0:
-            window_minutes = 5  # 默认为 5 分钟
+            # 计算时间窗口内的请求数
+            requests_in_window = sum(count for ts, count in self.request_window.items() if ts >= window_start)
             
-        current_time = int(time.time())
-        window_seconds = window_minutes * 60
-        window_start = current_time - window_seconds
-        
-        # 计算时间窗口内的请求数
-        requests_in_window = sum(count for ts, count in self.request_window.items() if ts >= window_start)
-        
-        # 计算时间窗口内的令牌数
-        tokens_in_window = sum(count for ts, count in self.tokens_window.items() if ts >= window_start)
-        
-        # 计算时间窗口内的客户端错误数
-        client_errors_500 = sum(count for ts, count in self.client_error_500_window.items() if ts >= window_start)
-        client_errors_503 = sum(count for ts, count in self.client_error_503_window.items() if ts >= window_start)
-        client_errors_other = sum(count for ts, count in self.client_error_other_window.items() if ts >= window_start)
-        client_errors_total = client_errors_500 + client_errors_503 + client_errors_other
-        
-        # 计算时间窗口内的成功请求数
-        successful_requests = sum(count for ts, count in self.successful_requests_window.items() if ts >= window_start)
-        
-        # 计算时间窗口内的上游错误数
-        upstream_errors = sum(count for ts, count in self.upstream_error_window.items() if ts >= window_start)
-        
-        # 计算速率
-        requests_per_minute = round(requests_in_window / window_minutes, 2) if window_minutes > 0 else 0
-        tokens_per_minute = round(tokens_in_window / window_minutes, 2) if window_minutes > 0 else 0
-        
-        # 计算错误率和成功率
-        error_rate = round(client_errors_total / requests_in_window, 4) if requests_in_window > 0 else 0.0
-        success_rate = round(successful_requests / requests_in_window, 4) if requests_in_window > 0 else 1.0
-        upstream_error_rate = round(upstream_errors / requests_in_window, 4) if requests_in_window > 0 else 0.0
-        
-        # 清理旧数据
-        self._cleanup_old_data(window_start)
-        
-        return {
-            "window_minutes": window_minutes,
-            "requests_per_minute": requests_per_minute,
-            "tokens_per_minute": tokens_per_minute,
-            "success_rate": success_rate,
-            "error_rate": error_rate,
-            "upstream_error_rate": upstream_error_rate,
-            "total_requests_in_window": requests_in_window,
-            "successful_requests_in_window": successful_requests,
-            "failed_requests_in_window": client_errors_total,
-            "total_tokens_in_window": tokens_in_window,
-            "client_errors_500": client_errors_500,
-            "client_errors_503": client_errors_503,
-            "client_errors_other": client_errors_other,
-            "upstream_errors_in_window": upstream_errors,
+            # 计算时间窗口内的令牌数
+            tokens_in_window = sum(count for ts, count in self.tokens_window.items() if ts >= window_start)
             
-            # 总计统计
-            "total_requests": self.total_requests,
-            "total_successful_requests": self.total_successful_requests,
-            "total_client_errors_500": self.total_client_errors_500,
-            "total_client_errors_503": self.total_client_errors_503,
-            "total_client_errors_other": self.total_client_errors_other,
-            "total_client_errors": self.total_client_errors_500 + self.total_client_errors_503 + self.total_client_errors_other,
-            "total_upstream_errors": self.total_upstream_errors,
-            "total_tokens_served": self.total_tokens_served
-        }
+            # 计算时间窗口内的客户端错误数
+            client_errors_500 = sum(count for ts, count in self.client_error_500_window.items() if ts >= window_start)
+            client_errors_503 = sum(count for ts, count in self.client_error_503_window.items() if ts >= window_start)
+            client_errors_other = sum(count for ts, count in self.client_error_other_window.items() if ts >= window_start)
+            client_errors_total = client_errors_500 + client_errors_503 + client_errors_other
+            
+            # 计算时间窗口内的成功请求数
+            successful_requests = sum(count for ts, count in self.successful_requests_window.items() if ts >= window_start)
+            
+            # 计算时间窗口内的上游错误数
+            upstream_errors = sum(count for ts, count in self.upstream_error_window.items() if ts >= window_start)
+            
+            # 计算速率
+            requests_per_minute = round(requests_in_window / window_minutes, 2) if window_minutes > 0 else 0
+            tokens_per_minute = round(tokens_in_window / window_minutes, 2) if window_minutes > 0 else 0
+            
+            # 计算错误率和成功率
+            error_rate = round(client_errors_total / requests_in_window, 4) if requests_in_window > 0 else 0.0
+            success_rate = round(successful_requests / requests_in_window, 4) if requests_in_window > 0 else 1.0
+            upstream_error_rate = round(upstream_errors / requests_in_window, 4) if requests_in_window > 0 else 0.0
+            
+            # 清理旧数据
+            self._cleanup_old_data(window_start)
+            
+            metrics = {
+                "window_minutes": window_minutes,
+                "requests_per_minute": requests_per_minute,
+                "tokens_per_minute": tokens_per_minute,
+                "success_rate": success_rate,
+                "error_rate": error_rate,
+                "upstream_error_rate": upstream_error_rate,
+                "total_requests_in_window": requests_in_window,
+                "successful_requests_in_window": successful_requests,
+                "failed_requests_in_window": client_errors_total,
+                "total_tokens_in_window": tokens_in_window,
+                "client_errors_500": client_errors_500,
+                "client_errors_503": client_errors_503,
+                "client_errors_other": client_errors_other,
+                "upstream_errors_in_window": upstream_errors,
+                
+                # 总计统计
+                "total_requests": self.total_requests,
+                "total_successful_requests": self.total_successful_requests,
+                "total_client_errors_500": self.total_client_errors_500,
+                "total_client_errors_503": self.total_client_errors_503,
+                "total_client_errors_other": self.total_client_errors_other,
+                "total_client_errors": self.total_client_errors_500 + self.total_client_errors_503 + self.total_client_errors_other,
+                "total_upstream_errors": self.total_upstream_errors,
+                "total_tokens_served": self.total_tokens_served
+            }
+            
+            return {
+                "status": "success",
+                "metrics": metrics
+            }
+        except Exception as e:
+            error_msg = f"Error calculating service metrics: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
-    def get_multiple_window_metrics(self, windows: List[int] = [5, 15, 30, 60]) -> Dict[str, Dict[str, Any]]:
+    def get_multiple_window_metrics(self, windows: List[int] = [5, 15, 30, 60]) -> Dict[str, Any]:
         """获取多个时间窗口的指标"""
-        return {f"{window}min": self.get_metrics(window) for window in windows}
+        try:
+            result = {}
+            for window in windows:
+                metrics_response = self.get_metrics(window)
+                if metrics_response["status"] == "success":
+                    result[f"{window}min"] = metrics_response["metrics"]
+                else:
+                    result[f"{window}min"] = {"error": metrics_response["message"]}
+            
+            return {
+                "status": "success",
+                "windows": result
+            }
+        except Exception as e:
+            error_msg = f"Error calculating multiple window metrics: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
     def _cleanup_old_data(self, cutoff_timestamp: int):
-        """清理旧数据以减少内存使用"""
-        # 只保留最近的数据
+        """清理超过指定时间戳的数据"""
         self.request_window = {ts: count for ts, count in self.request_window.items() if ts >= cutoff_timestamp}
         self.tokens_window = {ts: count for ts, count in self.tokens_window.items() if ts >= cutoff_timestamp}
+        self.successful_requests_window = {ts: count for ts, count in self.successful_requests_window.items() if ts >= cutoff_timestamp}
         self.client_error_500_window = {ts: count for ts, count in self.client_error_500_window.items() if ts >= cutoff_timestamp}
         self.client_error_503_window = {ts: count for ts, count in self.client_error_503_window.items() if ts >= cutoff_timestamp}
         self.client_error_other_window = {ts: count for ts, count in self.client_error_other_window.items() if ts >= cutoff_timestamp}
-        self.successful_requests_window = {ts: count for ts, count in self.successful_requests_window.items() if ts >= cutoff_timestamp}
         self.upstream_error_window = {ts: count for ts, count in self.upstream_error_window.items() if ts >= cutoff_timestamp}
+        
+    def reset(self) -> Dict[str, Any]:
+        """
+        Reset all service statistics.
+        
+        Returns:
+            Dictionary with status and reset confirmation
+        """
+        try:
+            # Reset all cumulative counters
+            self.total_requests = 0
+            self.total_tokens_served = 0
+            self.total_successful_requests = 0
+            self.total_client_errors_500 = 0
+            self.total_client_errors_503 = 0
+            self.total_client_errors_other = 0
+            self.total_upstream_errors = 0
+            
+            # Reset all window tracking
+            self.request_window = {}
+            self.tokens_window = {}
+            self.successful_requests_window = {}
+            self.client_error_500_window = {}
+            self.client_error_503_window = {}
+            self.client_error_other_window = {}
+            self.upstream_error_window = {}
+            
+            return {
+                "status": "success",
+                "message": "Service statistics have been reset",
+                "timestamp": int(time.time())
+            }
+        except Exception as e:
+            error_msg = f"Error resetting service stats: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
 
-
-# 创建全局单例
+# Create a singleton instance
 service_stats = ServiceStats() 

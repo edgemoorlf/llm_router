@@ -1,26 +1,41 @@
 """Instance manager for multiple OpenAI-compatible service instances."""
 import os
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import threading
 import uuid
 import time
+import traceback
 
 logger = logging.getLogger(__name__)
 
 from .routing_strategy import RoutingStrategy
 from .api_instance import APIInstance
-from .config_loader import InstanceConfigLoader
 from .router import InstanceRouter
 from .forwarder import RequestForwarder
 from .monitor import InstanceMonitor
 from .state_manager import StateManager, create_state_manager
 
-# Import the new configuration system
-from app.config import config_loader, InstanceConfig
+# Import the configuration system
+from app.config import config_loader
+from app.config.config_hierarchy import config_hierarchy
 
 class InstanceManager:
-    """Manager for multiple API service instances with load balancing and failover."""
+    """
+    Manages OpenAI-compatible API instances.
+    
+    This class handles the loading, tracking, and selection of API instances
+    for forwarding requests to OpenAI-compatible APIs. Instances can be loaded from:
+    
+    1. SQLite database (highest priority)
+    2. State files (temporary persistence)
+    3. YAML configuration files in app/config/instances/
+    4. Default values (lowest priority)
+    
+    The manager also tracks instance health, usage statistics, and handles
+    the selection of the appropriate instance for a request based on the
+    current routing strategy.
+    """
     
     def __init__(self, routing_strategy: Optional[RoutingStrategy] = None, state_manager: Optional[StateManager] = None):
         """
@@ -34,23 +49,22 @@ class InstanceManager:
         self.instances_lock = threading.RLock()  # Lock for thread-safe access to instances
         self.router = None  # Will be initialized later
         self.forwarder = RequestForwarder()
-        self.config_loader = InstanceConfigLoader()
         self.monitor = InstanceMonitor()
         
         # Create worker ID and initialize last state check time
         self.worker_id = str(uuid.uuid4())
         self.last_state_check = 0
         
-        # Initialize state manager (use file-based by default)
-        self.state_manager = state_manager or create_state_manager("file")
+        # Initialize state manager (use SQLite-based by default)
+        self.state_manager = state_manager or create_state_manager("sqlite")
         
         try:
-            # Load configuration (may raise an exception)
-            config = config_loader.load_config()
+            # Load configuration using the config hierarchy
+            config = config_hierarchy.get_configuration()
             
             # Use routing strategy from config if not provided
-            if routing_strategy is None:
-                routing_strategy = RoutingStrategy(config.routing.strategy)
+            if routing_strategy is None and 'routing' in config and 'strategy' in config['routing']:
+                routing_strategy = RoutingStrategy(config['routing']['strategy'])
         except Exception as e:
             logger.error(f"Error loading configuration: {str(e)}")
             # Fall back to default routing strategy
@@ -61,33 +75,28 @@ class InstanceManager:
         # Initialize router now that we have the routing strategy
         self.router = InstanceRouter(routing_strategy)
         
-        # First try to load state from the state manager
+        # First try to load state from the state manager (highest priority)
         if self._load_state():
             logger.info(f"Loaded instance state from state manager: {len(self.instances)} instances")
         else:
-            # Load instances from configuration
+            # Load instances from configuration hierarchy
             try:
-                if config and config.instances:
-                    self._load_instances_from_config(config.instances)
+                if config and 'instances' in config:
+                    self._load_instances_from_hierarchy(config['instances'])
                 else:
                     logger.warning("No valid configuration found or no instances defined in config")
             except Exception as e:
                 logger.error(f"Error loading instances from config: {str(e)}")
             
-            # If no instances found, try loading from environment variables (backward compatibility)
+            # If no instances found, provide a clear error
             if not self.instances:
-                logger.warning("No API instances found in configuration. Falling back to environment variables.")
-                self.instances = self.config_loader.load_from_env()
-                
-                # If still no instances, try legacy configuration
-                if not self.instances:
-                    logger.warning("No API instances configured. Falling back to legacy single instance configuration.")
-                    self.instances = self.config_loader.load_legacy_instance()
+                logger.error("No API instances found in configuration hierarchy. The application requires at least one instance defined.")
+                self.instances = {}
             
             # Set RPM window for all instances
             try:
-                if config and config.monitoring and config.monitoring.stats_window_minutes > 0:
-                    self.set_rpm_window_for_all(config.monitoring.stats_window_minutes)
+                if config and 'monitoring' in config and 'stats_window_minutes' in config['monitoring'] and config['monitoring']['stats_window_minutes'] > 0:
+                    self.set_rpm_window_for_all(config['monitoring']['stats_window_minutes'])
             except Exception as e:
                 logger.error(f"Error setting RPM window: {str(e)}")
             
@@ -96,34 +105,42 @@ class InstanceManager:
         
         logger.info(f"Initialized {len(self.instances)} API instances with {routing_strategy} routing strategy")
     
-    def _load_instances_from_config(self, instance_configs: List[InstanceConfig]) -> None:
+    def _load_instances_from_hierarchy(self, instances_config: Dict[str, Dict[str, Any]]) -> None:
         """
-        Load instances from configuration objects.
+        Load instances from configuration hierarchy.
         
         Args:
-            instance_configs: List of instance configurations
+            instances_config: Dictionary of instance configurations
         """
-        for config in instance_configs:
+        for name, config in instances_config.items():
             try:
+                # Convert dictionary config to APIInstance
                 instance = APIInstance(
-                    name=config.name,
-                    provider_type=config.provider_type,
-                    api_key=config.api_key,
-                    api_base=config.api_base,
-                    api_version=config.api_version,
-                    proxy_url=config.proxy_url,
-                    priority=config.priority,
-                    weight=config.weight,
-                    max_tpm=config.max_tpm,
-                    max_input_tokens=config.max_input_tokens,
-                    supported_models=config.supported_models,
-                    model_deployments=config.model_deployments
+                    name=name,
+                    provider_type=config.get('provider_type', 'generic'),
+                    api_key=config.get('api_key', ''),
+                    api_base=config.get('api_base', ''),
+                    api_version=config.get('api_version', '2023-05-15'),
+                    proxy_url=config.get('proxy_url'),
+                    priority=config.get('priority', 100),
+                    weight=config.get('weight', 100),
+                    max_tpm=config.get('max_tpm', 240000),
+                    max_input_tokens=config.get('max_input_tokens', 0),
+                    supported_models=config.get('supported_models', []),
+                    model_deployments=config.get('model_deployments', {})
                 )
                 instance.initialize_client()
-                self.instances[config.name] = instance
-                logger.info(f"Loaded API instance {config.name} from configuration")
+                self.instances[name] = instance
+                
+                # Get instance source information for logging
+                source_info = config_hierarchy.get_instance_source(name)
+                sources = source_info.get('sources', {})
+                source_list = [f"{key}: {source}" for key, source in sources.items()]
+                
+                logger.info(f"Loaded API instance {name} from configuration hierarchy")
+                logger.debug(f"Instance {name} configuration sources: {', '.join(source_list)}")
             except Exception as e:
-                logger.error(f"Error loading instance {config.name} from configuration: {str(e)}")
+                logger.error(f"Error loading instance {name} from configuration: {str(e)}")
     
     def _load_state(self) -> bool:
         """
@@ -134,7 +151,7 @@ class InstanceManager:
         """
         try:
             state = self.state_manager.load_state()
-            if not state:
+            if not state or 'instances' not in state:
                 return False
                 
             with self.instances_lock:
@@ -170,6 +187,9 @@ class InstanceManager:
                     except Exception as e:
                         logger.error(f"Error loading instance {instance_data.get('name', 'unknown')} from state: {str(e)}")
                 
+            # Update the database source in configuration hierarchy
+            config_hierarchy.sources['database'].timestamp = time.time()
+            
             return True
         except Exception as e:
             logger.error(f"Error loading state: {str(e)}")
@@ -213,60 +233,41 @@ class InstanceManager:
             logger.error(f"Error saving state: {str(e)}")
             return False
     
-    def load_from_csv(self, csv_path: str) -> None:
-        """
-        Load instances from a CSV file, replacing existing configuration.
-        
-        Args:
-            csv_path: Path to the CSV file
-        """
-        self.instances.clear()
-        instances = self.config_loader.load_from_csv(csv_path)
-        self.instances.update(instances)
-        
-        if not self.instances:
-            logger.warning("No instances loaded from CSV. Falling back to environment variables.")
-            self.instances = self.config_loader.load_from_env()
-            
-        # Save state after loading instances
-        self._save_state()
-            
-        logger.info(f"Loaded {len(self.instances)} instances from CSV")
-    
     def reload_config(self) -> None:
-        """Reload configuration from disk."""
+        """Reload configuration from disk and update instances."""
         try:
-            # Reload configuration
-            config = config_loader.reload()
-            if not config:
+            # Reload configuration using the config hierarchy
+            config = config_hierarchy.get_configuration()
+            if not config or 'instances' not in config:
                 logger.error("Failed to reload configuration")
                 return
                 
             # Clear existing instances
-            self.instances.clear()
+            with self.instances_lock:
+                self.instances.clear()
             
-            # Load instances from configuration
-            if config.instances:
-                self._load_instances_from_config(config.instances)
+            # Load instances from configuration hierarchy
+            if 'instances' in config and config['instances']:
+                self._load_instances_from_hierarchy(config['instances'])
             else:
                 logger.warning("No instances defined in reloaded configuration")
             
-            # If no instances found, try loading from environment variables
+            # If no instances found, provide a clear error
             if not self.instances:
-                logger.warning("No API instances found in configuration. Falling back to environment variables.")
-                self.instances = self.config_loader.load_from_env()
+                logger.error("No API instances found in configuration. The application requires at least one instance defined.")
+                self.instances = {}
             
             # Update routing strategy
             try:
-                if config.routing and config.routing.strategy:
-                    self.router.strategy = RoutingStrategy(config.routing.strategy)
+                if 'routing' in config and 'strategy' in config['routing']:
+                    self.router.strategy = RoutingStrategy(config['routing']['strategy'])
             except Exception as e:
                 logger.error(f"Error updating routing strategy: {str(e)}")
             
             # Set RPM window for all instances
             try:
-                if config.monitoring and config.monitoring.stats_window_minutes > 0:
-                    self.set_rpm_window_for_all(config.monitoring.stats_window_minutes)
+                if 'monitoring' in config and 'stats_window_minutes' in config['monitoring'] and config['monitoring']['stats_window_minutes'] > 0:
+                    self.set_rpm_window_for_all(config['monitoring']['stats_window_minutes'])
             except Exception as e:
                 logger.error(f"Error setting RPM window: {str(e)}")
             
@@ -448,23 +449,79 @@ class InstanceManager:
             provider_type
         )
     
-    def get_instance_stats(self) -> List[Dict[str, Any]]:
+    def get_instance_stats(self, instance_name: Optional[str] = None) -> Union[List[Dict[str, Any]], Dict[str, Any], None, Dict[str, Any]]:
         """
-        Get statistics for all instances.
+        Get statistics for all instances or a specific instance.
+        
+        Note: This is an enhanced version that supports both getting stats for all instances
+        and for a single instance by name.
+        
+        Args:
+            instance_name: Optional name of a specific instance. If provided, returns stats
+                           for only that instance. If None, returns stats for all instances.
         
         Returns:
-            List of instance statistics dictionaries
+            If instance_name is None: List of instance statistics dictionaries
+            If instance_name is provided: Dictionary with statistics for the specified instance,
+                                         or None if the instance doesn't exist
+            If error occurs: Dictionary with error status and message
         """
-        return self.monitor.get_instance_stats(self.instances)
+        try:
+            if instance_name is None:
+                # Return stats for all instances
+                stats = self.monitor.get_instance_stats(self.instances)
+                return {
+                    "status": "success",
+                    "instances": stats,
+                    "count": len(stats) if stats else 0
+                }
+            
+            # Get stats for a specific instance
+            if instance_name not in self.instances:
+                return {
+                    "status": "error",
+                    "message": f"Instance '{instance_name}' not found"
+                }
+                
+            # Create a dictionary with just this instance
+            single_instance = {instance_name: self.instances[instance_name]}
+            
+            # Get stats for this instance
+            all_stats = self.monitor.get_instance_stats(single_instance)
+            
+            # Return the first (and only) item in the list, or None if empty
+            if all_stats:
+                return {
+                    "status": "success",
+                    "instance": all_stats[0],
+                    "name": instance_name
+                }
+            return {
+                "status": "error",
+                "message": f"No stats available for instance '{instance_name}'"
+            }
+        except Exception as e:
+            error_msg = f"Error getting instance stats: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
     def get_health_status(self) -> Dict[str, Any]:
         """
         Get health status summary for all instances.
         
         Returns:
-            Summary of instance health status
+            Dictionary with status and health information or error message
         """
-        return self.monitor.get_health_status(self.instances)
+        try:
+            health_status = self.monitor.get_health_status(self.instances)
+            return {
+                "status": "success",
+                "health_status": health_status
+            }
+        except Exception as e:
+            error_msg = f"Error getting health status: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
     def get_service_metrics(self, window_minutes: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -475,11 +532,20 @@ class InstanceManager:
                            of all instances' rpm_window_minutes
             
         Returns:
-            Overall service metrics for the specified time window
+            Dictionary with status and service metrics or error message
         """
-        return self.monitor.get_service_metrics(self.instances, window_minutes)
+        try:
+            metrics = self.monitor.get_service_metrics(self.instances, window_minutes)
+            return {
+                "status": "success",
+                "metrics": metrics
+            }
+        except Exception as e:
+            error_msg = f"Error getting service metrics: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
-    def get_metrics_for_multiple_windows(self, windows: List[int] = None) -> Dict[str, Dict[str, Any]]:
+    def get_metrics_for_multiple_windows(self, windows: List[int] = None) -> Dict[str, Any]:
         """
         Get service metrics for multiple time windows.
         
@@ -487,14 +553,25 @@ class InstanceManager:
             windows: List of time windows in minutes to calculate metrics for
             
         Returns:
-            Dictionary of service metrics for each time window
+            Dictionary with status and metrics for each window or error message
         """
-        # Use windows from config if not provided
-        if windows is None:
-            config = config_loader.get_config()
-            windows = [config.monitoring.stats_window_minutes] + config.monitoring.additional_windows
-        
-        return self.monitor.get_multiple_window_metrics(self.instances, windows)
+        try:
+            # Use windows from config hierarchy if not provided
+            if windows is None:
+                config = config_hierarchy.get_configuration()
+                stats_window = config.get('monitoring', {}).get('stats_window_minutes', 5)
+                additional_windows = config.get('monitoring', {}).get('additional_windows', [15, 60])
+                windows = [stats_window] + additional_windows
+            
+            metrics = self.monitor.get_multiple_window_metrics(self.instances, windows)
+            return {
+                "status": "success",
+                "windows": metrics
+            }
+        except Exception as e:
+            error_msg = f"Error getting metrics for multiple windows: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return {"status": "error", "message": error_msg}
     
     def set_rpm_window_for_all(self, minutes: int) -> None:
         """
@@ -510,6 +587,7 @@ class InstanceManager:
             instance.set_rpm_window(minutes)
             
         logger.info(f"Set RPM window for all instances to {minutes} minutes")
+
 
 # Create a singleton instance with the default routing strategy from config
 instance_manager = InstanceManager() 

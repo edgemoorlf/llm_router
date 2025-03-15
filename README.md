@@ -19,16 +19,16 @@ The application supports a flexible configuration system with multiple options:
 
 The application uses a hierarchical YAML configuration system with environment-specific overrides:
 
-1. **Base Configuration**: `app/config/base.yaml` contains default settings
-2. **Environment-Specific**: `app/config/production.yaml`, `app/config/development.yaml`, etc.
+1. **Base Configuration**: `/config/base.yaml` contains default settings
+2. **Environment-Specific**: `/config/production.yaml`, `/config/development.yaml`, etc.
 3. **Environment Variables**: Values can be referenced using `${ENV_VAR}` syntax
 
 Example configuration:
 
 ```yaml
-# Base configuration (app/config/base.yaml)
+# Base configuration (/config/base.yaml)
 name: "Azure OpenAI Proxy"
-version: "1.0.9"
+version: "1.2.0"
 port: 3010
 
 routing:
@@ -64,6 +64,8 @@ instances:
       gpt-4o-mini: "gpt4omini"
       gpt-4o: "gpt4o"
 
+Environment variables can be referenced using the `${ENV_VAR}` syntax in YAML configuration files.
+
 ### Version-Specific Model Mappings
 
 The proxy enforces strict model matching to ensure version-specific models are correctly routed:
@@ -89,47 +91,6 @@ instances:
 
 You must configure each specific model version you want to support. For example, if you want to support both the versioned model `gpt-4o-2024-11-20` and the base model `gpt-4o`, you need to include both in your configuration.
 
-You can also use environment variables for version-specific mappings:
-
-```
-API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O-2024-11-20=gpt4o-november
-API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O-2024-08-06=gpt4o-august
-```
-
-### Environment Variables (Legacy Support)
-
-For backward compatibility, the application also supports configuration via environment variables:
-
-```
-# Multiple instances
-API_INSTANCES=instance1,instance2
-
-# Instance 1 configuration
-API_INSTANCE_INSTANCE1_API_KEY=your-api-key
-API_INSTANCE_INSTANCE1_API_BASE=https://instance1.openai.azure.com
-API_INSTANCE_INSTANCE1_API_VERSION=2024-08-01-preview
-API_INSTANCE_INSTANCE1_PRIORITY=1
-API_INSTANCE_INSTANCE1_WEIGHT=100
-API_INSTANCE_INSTANCE1_MAX_TPM=240000
-API_INSTANCE_INSTANCE1_SUPPORTED_MODELS=gpt-4o-mini,gpt-4o
-API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O-MINI=gpt4omini
-API_INSTANCE_INSTANCE1_MODEL_MAP_GPT-4O=gpt4o
-
-# Instance 2 configuration
-API_INSTANCE_INSTANCE2_API_KEY=your-api-key-2
-# ... and so on
-```
-
-### Legacy Single Instance (Deprecated)
-
-For simple deployments, a single instance can be configured:
-
-```
-API_KEY=your-api-key
-API_BASE=https://your-instance.openai.azure.com
-API_VERSION=2024-08-01-preview
-```
-
 ## API Endpoints
 
 ### OpenAI API Compatibility
@@ -138,18 +99,70 @@ API_VERSION=2024-08-01-preview
 - `/v1/completions` - Completions API
 - `/v1/embeddings` - Embeddings API
 
-### Statistics and Monitoring
+### Instance Management
 
-- `/stats` - Get service statistics
-- `/stats/windows` - Get statistics for multiple time windows
-- `/stats/instances` - Get detailed instance statistics
-- `/stats/health` - Get health status
-- `/stats/status` - Get instance status
+- `/instances` - Get configuration of all instances (with filtering options)
+- `/instances/{instance_name}` - Get state of a specific instance including its health and stats
+- `/instances/config/{instance_name}` - Get configuration of a specific instance
+- `/instances/config/all` - Get configuration of all instances
+- `/instances/verify/{instance_name}` - Verify an instance by running a comprehensive set of checks
+- `/instances/add` - Add a new instance
+- `/instances/add-many` - Add multiple instances
+- `/instances/{instance_name}` (DELETE) - Remove an instance
+- `/instances/{instance_name}` (PATCH) - Update instance configuration
+
+### Statistics
+
+- `/stats` - Get overall service metrics
+- `/stats/windows` - Get metrics for multiple time windows
+- `/stats/instances` - Get detailed stats and health info for all instances
+- `/stats/health` - Get overall health status summary
+- `/stats/reset` - Reset statistics
 
 ### Configuration Management
 
 - `/config` - Get current configuration (excluding secrets)
 - `/config/reload` - Reload configuration from disk
+
+### Admin API
+
+- `/admin/config/sources` - Get information about configuration sources
+- `/admin/config/instances/{instance_name}/sources` - See where each instance setting comes from
+- `/admin/config/effective` - Get effective configuration after applying the hierarchy
+- `/admin/config/reload` - Reload configuration from all sources
+
+## Implementation Status: Router Reorganization
+
+The following changes have been implemented to reorganize the router implementations:
+
+1. **Removed Endpoints**:
+   - ✅ Deleted `/verification/instances/test` endpoint completely
+
+2. **Moved Endpoints**:
+   - ✅ Moved `/verification/instances/{instance_name}` → `/instances/verify/{instance_name}`
+   - ✅ Moved `/health/instances/{instance_name}` → merged with `/instances/{instance_name}`
+   - ✅ Moved `/health/instances` → merged with `/stats/instances`
+
+3. **Added New Endpoints**:
+   - ✅ Added `/instances/config/{instance_name}` - Get configuration of a specific instance
+   - ✅ Added `/instances/config/all` - Get configuration of all instances 
+
+4. **Updated Instance Management Router**:
+   - ✅ Enhanced `/instances/{instance_name}` to include health and stats information
+   - ✅ Implemented new config-specific endpoints
+   - ✅ Added the verification functionality from the verification router
+
+5. **Updated Statistics Router**:
+   - ✅ Consolidated health information into `/stats/instances`
+   - ✅ Added `/stats/health` endpoint for overall health status
+
+6. **Removed Deprecated Routers**:
+   - ✅ Removed the verification.py router
+   - ✅ Removed the health.py router
+   - ✅ Deleted the redundant router files from the codebase
+
+7. **Backward Compatibility**:
+   - ✅ Added redirects from old endpoints to new endpoints
 
 ## Deployment
 
@@ -157,7 +170,7 @@ API_VERSION=2024-08-01-preview
 
 ```bash
 docker build -t azure-openai-proxy .
-docker run -p 3010:3010 -v /path/to/config:/app/config azure-openai-proxy
+docker run -p 3010:3010 -v /path/to/config:/config azure-openai-proxy
 ```
 
 ### Environment Selection
@@ -205,6 +218,168 @@ This will start 4 worker processes, each handling requests independently but sha
 - Changes to instances (adding, removing, or modifying) are automatically saved to the shared state file.
 - The shared state file includes all instance configuration and basic status information.
 - For better performance, file access is minimized by checking modification times.
+
+## SQLite Persistence
+
+The proxy service now supports SQLite-based persistence for instance configuration and state management. This provides several advantages over the file-based approach:
+
+- **Improved Reliability**: Atomic transactions ensure data integrity
+- **Version History**: Automatic tracking of configuration changes with rollback capability
+- **Better Concurrency**: More robust handling of multiple processes/workers
+- **Performance**: Optimized for read-heavy workloads
+
+### Configuration Hierarchy
+
+Instance configuration follows a priority-based hierarchy:
+
+1. **SQLite Database** (highest priority)
+2. **State Files** (medium priority) 
+3. **YAML Configuration** (lower priority)
+4. **Default Values** (lowest priority)
+
+Each setting is sourced from the highest-priority location where it's defined, allowing for flexible overrides.
+
+### Database Location
+
+By default, the SQLite database is stored at:
+
+```
+~/.azure_openai_proxy/instance_state.db
+```
+
+You can customize this location by setting the environment variable:
+
+```bash
+export INSTANCE_MANAGER_DB_PATH=/path/to/custom/database.db
+```
+
+### Admin API
+
+A new admin API is available for managing configuration sources and viewing the hierarchy:
+
+- `/admin/config/sources` - Get information about configuration sources
+- `/admin/config/instances/{instance_name}/sources` - See where each instance setting comes from
+- `/admin/config/effective` - Get effective configuration after applying the hierarchy
+- `/admin/config/reload` - Reload configuration from all sources
+
+These endpoints require admin authentication using an API key:
+
+```bash
+export ADMIN_API_KEY=your-secure-admin-key
+```
+
+API requests must include this key in the `X-Admin-API-Key` header.
+
+## Maintenance Utilities
+
+New maintenance utilities are provided for database management:
+
+### Database Backup
+
+The application includes a backup utility for the SQLite database:
+
+```bash
+# Basic backup with default settings
+python -m app.maintenance.sqlite_backup
+
+# Customized backup
+python -m app.maintenance.sqlite_backup \
+  --db-path /path/to/instance_state.db \
+  --backup-dir /path/to/backup/directory \
+  --max-backups 14 \
+  --no-vacuum
+```
+
+Features:
+- Integrity check before backup
+- Database optimization (VACUUM)
+- Automatic backup rotation
+- Timestamped backup files
+
+### Database Health Monitoring
+
+A health check utility is available to monitor database status:
+
+```bash
+# Basic health check
+python -m app.maintenance.sqlite_health
+
+# Save detailed report to file
+python -m app.maintenance.sqlite_health --output health_report.json
+```
+
+The health check reports on:
+- Database integrity
+- File size and growth
+- Table structure and row counts
+- Version history information
+
+### Recommended Maintenance Schedule
+
+For optimal operation, we recommend:
+
+1. **Daily**: Run database backup with rotation
+2. **Weekly**: Run health check and review reports
+3. **Monthly**: Perform VACUUM operation to optimize database size
+4. **As needed**: Review version history and prune if necessary
+
+### Restoring from Backup
+
+To restore from a backup:
+
+```python
+from app.maintenance.sqlite_backup import restore_sqlite_database
+
+restore_sqlite_database(
+    backup_path="/path/to/backup/instance_state_20240615_120000.db",
+    db_path="/path/to/instance_state.db",
+    create_backup=True  # Creates a pre-restore backup
+)
+```
+
+### Automating Maintenance Tasks
+
+You can automate maintenance tasks using cron jobs:
+
+```bash
+# Example crontab entries
+
+# Daily backup at 1:00 AM
+0 1 * * * cd /path/to/project && python -m app.maintenance.sqlite_backup --max-backups 14
+
+# Weekly health check on Sunday at 2:00 AM
+0 2 * * 0 cd /path/to/project && python -m app.maintenance.sqlite_health --output /var/log/azure_openai_proxy/health_$(date +\%Y\%m\%d).json
+
+# Monthly VACUUM operation on the 1st at 3:00 AM
+0 3 1 * * cd /path/to/project && python -c "import sqlite3; conn = sqlite3.connect('/path/to/instance_state.db'); conn.execute('VACUUM'); conn.close()"
+```
+
+For production environments, we recommend wrapping these commands in scripts with proper error handling and notifications.
+
+### Migrating from File-Based State
+
+If you're upgrading from a previous version that used file-based state management, migration happens automatically:
+
+1. The system will attempt to load from SQLite first (which will be empty on first run)
+2. If no data is found in SQLite, it will fall back to loading from the state file
+3. On successful load from the state file, data will be saved to SQLite automatically
+4. Future operations will use SQLite as the primary persistence layer
+
+To manually migrate from an existing state file:
+
+```bash
+# Stop your application first
+python -m app.tools.migrate_from_file \
+  --state-file /path/to/existing/state.json \
+  --db-path /path/to/new/instance_state.db
+```
+
+The migration tool performs these steps:
+- Creates the SQLite database if it doesn't exist
+- Loads data from the state file
+- Converts the data to the new format if needed
+- Saves the data to SQLite with proper versioning
+- Verifies the migration was successful
 
 ## License
 

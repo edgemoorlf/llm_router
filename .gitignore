@@ -63,3 +63,6 @@ production.yaml
 *.json
 *.jsonl
 *.jsonl.gz
+
+# Database
+*.db

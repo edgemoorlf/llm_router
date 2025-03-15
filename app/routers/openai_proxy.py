@@ -4,13 +4,18 @@ import logging
 from typing import Any, Tuple, Dict, Optional
 import uuid
 import time
+import traceback
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Body, Header
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from app.instance.manager import instance_manager
 from app.services.azure_openai import azure_openai_service
 from app.services.generic_openai import generic_openai_service
 from app.utils.streaming import handle_streaming_request
+from app.errors.utils import handle_router_errors
+from app.instance.service_stats import service_stats
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +78,8 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
         return azure_openai_service, "azure"
 
 @router.post("/v1/chat/completions")
-async def chat_completions(
+@handle_router_errors("processing chat completions request")
+async def chat_completion(
     request: Request, 
     body: Dict[str, Any] = Body(...),  # Use Body for accessing raw request body
     x_ms_client_id: Optional[str] = Header(None),  # Optional Azure client ID
@@ -90,87 +96,72 @@ async def chat_completions(
     # Set a logger prefix for this request
     log_prefix = f"[{request_id}]"
     
-    try:
-        # Keep the original model name for metadata
-        original_model = body.get("model", "")
-        
-        # Extract stream parameter
-        stream = body.get("stream", False)
-        
-        # Determine the service to use based on the model
-        service, provider_type = determine_service_by_model(original_model)
-        
-        # Save a copy of the original payload
-        payload = {**body}
-        
-        # Transform the request for the appropriate backend
-        logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
-        transformed = await service.transform_request("/v1/chat/completions", payload)
-        
-        if stream:
-            # For streaming, we need to process the response as a stream
-            return await handle_streaming_request(
-                "/v1/chat/completions",
-                transformed["payload"],
-                provider_type,
-                original_model=transformed.get("original_model")
-            )
-        else:
-            # For regular requests, we can forward and return directly
-            response = await service.forward_request(
-                "/v1/chat/completions",
-                transformed["payload"],
-                transformed.get("original_model")
-            )
-            
-            # Ensure the response matches OpenAI's expected format
-            # Check if response has the expected structure
-            if "choices" not in response or not isinstance(response["choices"], list) or not response["choices"]:
-                logger.error(f"Unexpected API response format: {response}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="The API response does not contain expected 'choices' field",
-                )
-                
-            # Ensure each choice has a message with role and content for non-streaming
-            for choice in response["choices"]:
-                if "message" not in choice or "role" not in choice["message"] or "content" not in choice["message"]:
-                    # Azure OpenAI might not always include content in case of content filtering
-                    if "message" in choice and "role" in choice["message"] and "content" not in choice["message"]:
-                        choice["message"]["content"] = ""
-                        
-            # Add the model info to the response if not present
-            if "model" not in response:
-                response["model"] = original_model or "Unknown"
-                
-            # Ensure finish_reason is always included
-            for choice in response["choices"]:
-                if "finish_reason" not in choice:
-                    choice["finish_reason"] = "stop"  # Set a default
-                    
-            # Track request completion
-            duration_ms = int((time.time() - request_start_time) * 1000)
-            logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
-                    
-            return response
-                
-    except Exception as e:
-        # Log any errors
-        logger.error(f"Error processing chat completions request")
-        logger.exception(e)
-        
-        # Re-raise HTTPExceptions
-        if isinstance(e, HTTPException):
-            raise
-            
-        # For any other exception, return a 500 error
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}"
+    # Keep the original model name for metadata
+    original_model = body.get("model", "")
+    
+    # Extract stream parameter
+    stream = body.get("stream", False)
+    
+    # Determine the service to use based on the model
+    service, provider_type = determine_service_by_model(original_model)
+    
+    # Save a copy of the original payload
+    payload = {**body}
+    
+    # Transform the request for the appropriate backend
+    logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
+    transformed = await service.transform_request("/v1/chat/completions", payload)
+    
+    if stream:
+        # For streaming, we need to process the response as a stream
+        return await handle_streaming_request(
+            "/v1/chat/completions",
+            transformed["payload"],
+            provider_type,
+            original_model=transformed.get("original_model")
+        )
+    else:
+        # For regular requests, we can forward and return directly
+        response = await service.forward_request(
+            "/v1/chat/completions",
+            transformed["payload"],
+            transformed.get("original_model")
         )
         
+        # Ensure the response matches OpenAI's expected format
+        # Check if response has the expected structure
+        if "choices" not in response or not isinstance(response["choices"], list) or not response["choices"]:
+            logger.error(f"Unexpected API response format: {response}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="The API response does not contain expected 'choices' field",
+            )
+            
+        # Ensure each choice has a message with role and content for non-streaming
+        for choice in response["choices"]:
+            if "message" not in choice or "role" not in choice["message"] or "content" not in choice["message"]:
+                # Azure OpenAI might not always include content in case of content filtering
+                if "message" in choice and "role" in choice["message"] and "content" not in choice["message"]:
+                    choice["message"]["content"] = ""
+                    
+        # Add the model info to the response if not present
+        if "model" not in response:
+            response["model"] = original_model or "Unknown"
+            
+        # Ensure finish_reason is always included
+        for choice in response["choices"]:
+            if "finish_reason" not in choice:
+                choice["finish_reason"] = "stop"  # Set a default
+                
+        # Track request completion
+        duration_ms = int((time.time() - request_start_time) * 1000)
+        logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
+                
+        return response
+
 @router.post("/v1/completions")
-async def completions(
+@handle_router_errors("processing completions request")
+async def completion(
     request: Request, 
     body: Dict[str, Any] = Body(...),
     x_ms_client_id: Optional[str] = Header(None),  # Optional Azure client ID
@@ -187,270 +178,234 @@ async def completions(
     # Set a logger prefix for this request
     log_prefix = f"[{request_id}]"
     
-    try:
-        # Keep the original model name for metadata
-        original_model = body.get("model", "")
-        
-        # Extract stream parameter
-        stream = body.get("stream", False)
-        
-        # Determine the service to use based on the model
-        service, provider_type = determine_service_by_model(original_model)
-        
-        # Save a copy of the original payload
-        payload = {**body}
-        
-        # Transform the request for the appropriate backend
-        logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
-        transformed = await service.transform_request("/v1/completions", payload)
-        
-        if stream:
-            # For streaming, we need to process the response as a stream
-            return await handle_streaming_request(
-                "/v1/completions",
-                transformed["payload"],
-                provider_type,
-                original_model=transformed.get("original_model")
-            )
-        else:
-            # For regular requests, we can forward and return directly
-            response = await service.forward_request(
-                "/v1/completions",
-                transformed["payload"],
-                transformed.get("original_model")
-            )
-            
-            # Ensure the response matches OpenAI's expected format
-            # Check if response has the expected structure
-            if "choices" not in response or not isinstance(response["choices"], list) or not response["choices"]:
-                logger.error(f"Unexpected Azure API response format: {response}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="The Azure API response does not contain expected 'choices' field",
-                )
-                
-            # Ensure each choice has the required fields
-            for choice in response["choices"]:
-                if "text" not in choice:
-                    # Some Azure versions might return differently
-                    if "message" in choice and "content" in choice["message"]:
-                        choice["text"] = choice["message"]["content"]
-                    elif "content" in choice:
-                        choice["text"] = choice["content"]
-                        
-            # Add any missing standard fields  
-            if "model" not in response:
-                response["model"] = payload.get("model", "unknown")
-                
-            # Ensure correct object type
-            if "object" not in response:
-                response["object"] = "text_completion"
-                
-            # Track request completion
-            duration_ms = int((time.time() - request_start_time) * 1000)
-            logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
-            
-            return response
-                
-    except Exception as e:
-        # Log any errors
-        logger.error(f"Error processing completions request")
-        logger.exception(e)
-        
-        # Re-raise HTTPExceptions
-        if isinstance(e, HTTPException):
-            raise
-            
-        # For any other exception, return a 500 error
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}"
-        )
-
-@router.post("/embeddings")
-async def embeddings(request: Request) -> Any:
-    """
-    Proxy for OpenAI /v1/embeddings endpoint.
+    # Keep the original model name for metadata
+    original_model = body.get("model", "")
     
-    Forwards embedding requests to OpenAI-compatible services with appropriate transformations.
-    """
-    try:
-        # Parse the request body
-        payload = await request.json()
-        
-        # Get the model name from the payload
-        model_name = payload.get("model")
-        if not model_name:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Model name is required",
-            )
-        
-        # Determine which service to use based on the model name
-        service, provider_type = determine_service_by_model(model_name)
-        
-        # Transform request for the appropriate service
-        transformed = await service.transform_request("/v1/embeddings", payload)
-        
-        # Forward request to the API
+    # Extract stream parameter
+    stream = body.get("stream", False)
+    
+    # Determine the service to use based on the model
+    service, provider_type = determine_service_by_model(original_model)
+    
+    # Save a copy of the original payload
+    payload = {**body}
+    
+    # Transform the request for the appropriate backend
+    logger.debug(f"{log_prefix} Transforming request for provider type: {provider_type}")
+    transformed = await service.transform_request("/v1/completions", payload)
+    
+    if stream:
+        # For streaming, we need to process the response as a stream
+        return await handle_streaming_request(
+            "/v1/completions",
+            transformed["payload"],
+            provider_type,
+            original_model=transformed.get("original_model")
+        )
+    else:
+        # For regular requests, we can forward and return directly
         response = await service.forward_request(
-            "/v1/embeddings",
+            "/v1/completions",
             transformed["payload"],
             transformed.get("original_model")
         )
         
         # Ensure the response matches OpenAI's expected format
         # Check if response has the expected structure
-        if "data" not in response or not isinstance(response["data"], list):
-            logger.error(f"Unexpected API response format for embeddings: {response}")
+        if "choices" not in response or not isinstance(response["choices"], list) or not response["choices"]:
+            logger.error(f"Unexpected Azure API response format: {response}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="The API response does not contain expected 'data' field",
+                detail="The Azure API response does not contain expected 'choices' field",
             )
             
-        # Ensure each embedding item has the required fields
-        for item in response["data"]:
-            if "embedding" not in item:
-                logger.error(f"Missing embedding in response data item: {item}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="The API response contains invalid embedding data",
-                )
-        
-        # Add any missing standard fields
+        # Ensure each choice has the required fields
+        for choice in response["choices"]:
+            if "text" not in choice:
+                # Some Azure versions might return differently
+                if "message" in choice and "content" in choice["message"]:
+                    choice["text"] = choice["message"]["content"]
+                elif "content" in choice:
+                    choice["text"] = choice["content"]
+                    
+        # Add any missing standard fields  
         if "model" not in response:
             response["model"] = payload.get("model", "unknown")
             
         # Ensure correct object type
         if "object" not in response:
-            response["object"] = "list"
+            response["object"] = "text_completion"
             
-        # Ensure usage information exists
-        if "usage" not in response:
-            # Calculate estimated usage based on input and output
-            input_tokens = 0
-            input_text = payload.get("input", "")
-            
-            # Handle both string and list inputs
-            if isinstance(input_text, str):
-                input_tokens = len(input_text.split()) * 2  # Rough estimate
-            elif isinstance(input_text, list):
-                for text in input_text:
-                    if isinstance(text, str):
-                        input_tokens += len(text.split()) * 2  # Rough estimate
-            
-            response["usage"] = {
-                "prompt_tokens": input_tokens,
-                "total_tokens": input_tokens
-            }
-            
+        # Track request completion
+        duration_ms = int((time.time() - request_start_time) * 1000)
+        logger.info(f"{log_prefix} Request completed in {duration_ms}ms")
+        
         return response
+
+@router.post("/v1/embeddings")
+@handle_router_errors("processing embeddings request")
+async def embeddings(request: Request) -> Any:
+    """
+    Proxy for OpenAI /v1/embeddings endpoint.
     
-    except HTTPException:
-        # Re-raise FastAPI HTTP exceptions
-        raise
-    except Exception as e:
-        logger.exception("Error processing embeddings request")
+    Forwards embedding requests to OpenAI-compatible services with appropriate transformations.
+    """
+    # Parse the request body
+    payload = await request.json()
+    
+    # Get the model name from the payload
+    model_name = payload.get("model")
+    if not model_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model name is required",
+        )
+    
+    # Determine which service to use based on the model name
+    service, provider_type = determine_service_by_model(model_name)
+    
+    # Transform request for the appropriate service
+    transformed = await service.transform_request("/v1/embeddings", payload)
+    
+    # Forward request to the API
+    response = await service.forward_request(
+        "/v1/embeddings",
+        transformed["payload"],
+        transformed.get("original_model")
+    )
+    
+    # Ensure the response matches OpenAI's expected format
+    # Check if response has the expected structure
+    if "data" not in response or not isinstance(response["data"], list):
+        logger.error(f"Unexpected API response format for embeddings: {response}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}",
+            detail="The API response does not contain expected 'data' field",
         )
+        
+    # Ensure each embedding item has the required fields
+    for item in response["data"]:
+        if "embedding" not in item:
+            logger.error(f"Missing embedding in response data item: {item}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="The API response contains invalid embedding data",
+            )
+    
+    # Add any missing standard fields
+    if "model" not in response:
+        response["model"] = payload.get("model", "unknown")
+        
+    # Ensure correct object type
+    if "object" not in response:
+        response["object"] = "list"
+        
+    # Ensure usage information exists
+    if "usage" not in response:
+        # Calculate estimated usage based on input and output
+        input_tokens = 0
+        input_text = payload.get("input", "")
+        
+        # Handle both string and list inputs
+        if isinstance(input_text, str):
+            input_tokens = len(input_text.split()) * 2  # Rough estimate
+        elif isinstance(input_text, list):
+            for text in input_text:
+                if isinstance(text, str):
+                    input_tokens += len(text.split()) * 2  # Rough estimate
+        
+        response["usage"] = {
+            "prompt_tokens": input_tokens,
+            "total_tokens": input_tokens
+        }
+        
+    return response
 
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+@handle_router_errors("processing API request")
 async def catch_all(request: Request, path: str) -> Any:
     """
     Catch-all route for handling any other OpenAI API endpoints.
     
     Attempts to map the request to the appropriate API endpoint.
     """
-    try:
-        # Get the full path
-        full_path = f"/v1/{path}"
-        
-        # Parse the request body for non-GET requests
-        if request.method != "GET":
-            try:
-                payload = await request.json()
-            except json.JSONDecodeError:
-                payload = {}
-        else:
-            # Convert query parameters to dict for GET requests
-            payload = dict(request.query_params)
-        
-        # Check if we can handle this endpoint
-        if "model" in payload:
-            # Get the model name from the payload
-            model_name = payload.get("model")
-            
-            # Extract stream parameter if it exists
-            stream = payload.get("stream", False)
-            
-            # Determine which service to use based on the model name
-            service, provider_type = determine_service_by_model(model_name)
-            
-            # If there's a model parameter, we can try to transform and forward
-            transformed = await service.transform_request(full_path, payload)
-            
-            # Handle streaming requests differently
-            if stream:
-                # Process as a streaming request
-                return await handle_streaming_request(
-                    full_path,
-                    transformed["payload"],
-                    provider_type,
-                    original_model=transformed.get("original_model")
-                )
-            else:
-                # For regular requests, forward and return directly
-                response = await service.forward_request(
-                    full_path,
-                    transformed["payload"],
-                    transformed.get("original_model"),
-                    method=request.method
-                )
-            
-            # Ensure the response includes the model information
-            if "model" not in response:
-                response["model"] = payload.get("model", "unknown")
-                
-            # Add some basic verification based on the endpoint pattern
-            if "completions" in full_path:
-                # Make sure we have choices
-                if "choices" not in response:
-                    response["choices"] = []
-                    
-                # Set appropriate object type
-                if "object" not in response:
-                    if "chat" in full_path:
-                        response["object"] = "chat.completion"
-                    else:
-                        response["object"] = "text_completion"
-            elif "embeddings" in full_path:
-                # Make sure we have data array
-                if "data" not in response:
-                    response["data"] = []
-                    
-                # Set appropriate object type    
-                if "object" not in response:
-                    response["object"] = "list"
-                    
-            # Log the response for debugging
-            logger.debug(f"Processed response for {full_path}")
-            
-            return response
-        else:
-            # We can't handle this request
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported endpoint or missing model parameter: {full_path}",
-            )
+    # Get the full path
+    full_path = f"/v1/{path}"
     
-    except HTTPException:
-        # Re-raise FastAPI HTTP exceptions
-        raise
-    except Exception as e:
-        logger.exception(f"Error processing request to {full_path}")
+    # Parse the request body for non-GET requests
+    if request.method != "GET":
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            payload = {}
+    else:
+        # Convert query parameters to dict for GET requests
+        payload = dict(request.query_params)
+    
+    # Check if we can handle this endpoint
+    if "model" in payload:
+        # Get the model name from the payload
+        model_name = payload.get("model")
+        
+        # Extract stream parameter if it exists
+        stream = payload.get("stream", False)
+        
+        # Determine which service to use based on the model name
+        service, provider_type = determine_service_by_model(model_name)
+        
+        # If there's a model parameter, we can try to transform and forward
+        transformed = await service.transform_request(full_path, payload)
+        
+        # Handle streaming requests differently
+        if stream:
+            # Process as a streaming request
+            return await handle_streaming_request(
+                full_path,
+                transformed["payload"],
+                provider_type,
+                original_model=transformed.get("original_model")
+            )
+        else:
+            # For regular requests, forward and return directly
+            response = await service.forward_request(
+                full_path,
+                transformed["payload"],
+                transformed.get("original_model"),
+                method=request.method
+            )
+        
+        # Ensure the response includes the model information
+        if "model" not in response:
+            response["model"] = payload.get("model", "unknown")
+            
+        # Add some basic verification based on the endpoint pattern
+        if "completions" in full_path:
+            # Make sure we have choices
+            if "choices" not in response:
+                response["choices"] = []
+                
+            # Set appropriate object type
+            if "object" not in response:
+                if "chat" in full_path:
+                    response["object"] = "chat.completion"
+                else:
+                    response["object"] = "text_completion"
+        elif "embeddings" in full_path:
+            # Make sure we have data array
+            if "data" not in response:
+                response["data"] = []
+                
+            # Set appropriate object type    
+            if "object" not in response:
+                response["object"] = "list"
+                
+        # Log the response for debugging
+        logger.debug(f"Processed response for {full_path}")
+        
+        return response
+    else:
+        # We can't handle this request
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing request: {str(e)}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported endpoint or missing model parameter: {full_path}",
         )

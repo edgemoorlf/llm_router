@@ -63,7 +63,7 @@ class MonitoringConfig(BaseModel):
 class AppConfig(BaseModel):
     """Main application configuration."""
     name: str = Field(default="Azure OpenAI Proxy", description="Application name")
-    version: str = Field(default="1.0.9", description="Application version")
+    version: str = Field(default="1.2.0", description="Application version")
     port: int = Field(default=3010, description="Server port")
     instances: List[InstanceConfig] = Field(default_factory=list, description="API instances")
     routing: RoutingConfig = Field(default_factory=RoutingConfig, description="Routing configuration")
@@ -83,22 +83,33 @@ class ConfigLoader:
         Load configuration from YAML files with environment variable fallback.
         
         Args:
-            config_dir: Directory containing config files, defaults to app/config
+            config_dir: Directory containing config files, defaults to looking in multiple locations
             
         Returns:
             Loaded configuration
         """
-        # Default config directory to app/config if not specified
-        if config_dir is None:
-            # Find config directory relative to this file
-            current_dir = Path(__file__).parent
-            config_dir = str(current_dir)
+        # If config_dir is provided, use it directly
+        if config_dir is not None:
+            self.config_path = config_dir
+            logger.info(f"Using specified configuration directory: {config_dir}")
+        else:
+            # Try to find config directory in standard locations
+            # 1. Check for a root-level /config directory (preferred)
+            root_config = os.path.normpath(os.path.join(os.getcwd(), 'config'))
+            # 2. Fallback to app/config directory (backward compatibility)
+            app_config = os.path.normpath(os.path.join(os.path.dirname(__file__)))
+            
+            if os.path.exists(os.path.join(root_config, 'base.yaml')):
+                self.config_path = root_config
+                logger.info(f"Using root-level configuration directory: {root_config}")
+            else:
+                self.config_path = app_config
+                logger.info(f"Using app-level configuration directory: {app_config}")
         
-        self.config_path = config_dir
-        logger.info(f"Loading configuration from {config_dir}")
+        logger.debug(f"Loading configuration from {self.config_path}")
         
         # Try to load from YAML first
-        config_dict = self._load_from_yaml(config_dir)
+        config_dict = self._load_from_yaml(self.config_path)
         # Ensure config_dict is at least an empty dict if YAML loading failed
         if config_dict is None:
             config_dict = {}
@@ -120,23 +131,6 @@ class ConfigLoader:
             else:
                 logger.warning(f"Unexpected instances type in YAML: {type(config_dict['instances'])}, initializing as empty list")
                 config_dict["instances"] = []
-                
-        # Load instances from environment variables
-        # YAML config takes precedence over env vars for instances with the same name
-        logger.info("Checking for additional instances from environment variables")
-        env_instances = self._load_instances_from_env()
-        
-        # Create a map of existing instance names for quick lookup
-        existing_instance_names = ({instance['name']: True for instance in config_dict["instances"]}
-                                   if isinstance(config_dict["instances"], list) else {})
-        
-        # Add env instances that don't exist in YAML config
-        for instance in env_instances:
-            if instance["name"] not in existing_instance_names:
-                logger.info(f"Adding instance {instance['name']} from environment variables")
-                config_dict["instances"].append(instance)
-            else:
-                logger.info(f"Skipping instance {instance['name']} from environment variables as it already exists in YAML config")
         
         try:
             # Use model_validate instead of parse_obj if available (Pydantic v2 compatibility)
@@ -168,7 +162,7 @@ class ConfigLoader:
                     base_config = yaml.safe_load(f)
                     if base_config:
                         config_dict.update(base_config)
-                logger.debug(f"Loaded base configuration from {base_path} with content: {base_config}")
+                logger.debug(f"Loaded base configuration from {base_path}")
             except Exception as e:
                 logger.error(f"Error loading base configuration: {str(e)}")
         else:
@@ -220,79 +214,6 @@ class ConfigLoader:
                 result[key] = value
                 
         return result
-    
-    def _load_instances_from_env(self) -> List[Dict[str, Any]]:
-        """Load instance configurations from environment variables."""
-        instances = []
-        
-        # First try the multi-instance format
-        instance_names = os.getenv("API_INSTANCES", "").split(",")
-        instance_names = [name.strip() for name in instance_names if name.strip()]
-        
-        if not instance_names:
-            logger.info("No API_INSTANCES defined in environment variables")
-        
-        for name in instance_names:
-            prefix = f"API_INSTANCE_{name.upper()}_"
-            
-            if not os.getenv(f"{prefix}API_KEY") or not os.getenv(f"{prefix}API_BASE"):
-                logger.warning(f"Skipping incomplete instance configuration for {name}")
-                continue
-                
-            instance = {
-                "name": name,
-                "provider_type": os.getenv(f"{prefix}PROVIDER_TYPE", "azure").lower(),
-                "api_key": os.getenv(f"{prefix}API_KEY", ""),
-                "api_base": os.getenv(f"{prefix}API_BASE", ""),
-                "api_version": os.getenv(f"{prefix}API_VERSION", "2024-08-01-preview"),
-                "proxy_url": os.getenv(f"{prefix}PROXY_URL"),
-                "priority": int(os.getenv(f"{prefix}PRIORITY", "100")),
-                "weight": int(os.getenv(f"{prefix}WEIGHT", "100")),
-                "max_tpm": int(os.getenv(f"{prefix}MAX_TPM", "240000")),
-                "max_input_tokens": int(os.getenv(f"{prefix}MAX_INPUT_TOKENS", "0")),
-            }
-            
-            # Load supported models
-            models_str = os.getenv(f"{prefix}SUPPORTED_MODELS", "")
-            if models_str:
-                instance["supported_models"] = [model.strip() for model in models_str.split(",") if model.strip()]
-            
-            # Load model to deployment mappings
-            model_deployments = {}
-            for key, value in os.environ.items():
-                if key.startswith(f"{prefix}MODEL_MAP_"):
-                    model_name = key[len(f"{prefix}MODEL_MAP_"):].lower().replace("_", "-")
-                    model_deployments[model_name] = value
-            
-            if model_deployments:
-                instance["model_deployments"] = model_deployments
-            
-            instances.append(instance)
-            logger.info(f"Loaded instance {name} from environment variables")
-        
-        # If no instances found, try legacy single instance format
-        if not instances:
-            logger.info("No multi-instance configuration found, checking for legacy single instance format")
-            api_key = os.getenv("API_KEY")
-            api_base = os.getenv("API_BASE")
-            
-            if api_key and api_base:
-                instance = {
-                    "name": "default",
-                    "provider_type": os.getenv("API_PROVIDER_TYPE", "azure").lower(),
-                    "api_key": api_key,
-                    "api_base": api_base,
-                    "api_version": os.getenv("API_VERSION", "2024-08-01-preview"),
-                    "priority": 1,
-                    "weight": 100,
-                    "max_tpm": 240000,
-                }
-                instances.append(instance)
-                logger.info("Loaded legacy instance configuration from environment variables")
-            else:
-                logger.warning("No instance configuration found in environment variables")
-        
-        return instances
     
     def reload(self) -> AppConfig:
         """Reload configuration from disk."""

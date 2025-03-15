@@ -1,12 +1,19 @@
 """Instance management API router."""
 import logging
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, status, Query, Body
+from fastapi import APIRouter, HTTPException, status, Query, Body, BackgroundTasks
 import time
+from datetime import datetime
 
 from app.config import InstanceConfig
+from app.config import config_loader
 from app.instance.manager import instance_manager
 from app.services.instance_service import instance_service
+from app.services.instance_verification_service import instance_verification_service
+from app.services.instance_helper import filter_instances, sort_instances, paginate_instances, format_instance_list
+from app.errors.handlers import handle_errors
+from app.errors.utils import check_instance_exists, handle_router_errors
+from app.errors.exceptions import InstanceNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -49,76 +56,45 @@ async def get_instances_config(
     Returns:
         Standardized response with filtered instance configuration information
     """
-    from app.config import config_loader
-    
-    try:
+    # Define inner function to apply the decorator
+    @handle_errors
+    async def _get_instances_config() -> Dict[str, Any]:
         # Base data: either get from instance_manager or config
         if detailed:
+            # Get all instances as a list
             all_instances = list(instance_manager.get_all_instances().values())
             
-            # Start with full list for filtering
-            filtered_instances = all_instances
+            # Filter instances
+            filtered_instances = filter_instances(
+                all_instances,
+                provider_type=provider_type,
+                status=status,
+                min_tpm=min_tpm,
+                max_tpm=max_tpm,
+                model_support=model_support
+            )
             
-            # Apply filters
-            if provider_type:
-                filtered_instances = [i for i in filtered_instances if i.provider_type == provider_type]
-                
-            if status:
-                filtered_instances = [i for i in filtered_instances if i.status == status]
-                
-            if min_tpm is not None:
-                filtered_instances = [i for i in filtered_instances if i.instance_stats.current_tpm >= min_tpm]
-                
-            if max_tpm is not None:
-                filtered_instances = [i for i in filtered_instances if i.max_tpm <= max_tpm]
-                
-            if model_support:
-                filtered_instances = [
-                    i for i in filtered_instances if 
-                    (not i.supported_models or model_support in i.supported_models)
-                ]
-            
-            # Sort the instances
-            if sort_by:
-                reverse = sort_dir.lower() == "desc"
-                if sort_by == "name":
-                    filtered_instances.sort(key=lambda i: i.name, reverse=reverse)
-                elif sort_by == "status":
-                    filtered_instances.sort(key=lambda i: i.status, reverse=reverse)
-                elif sort_by == "current_tpm":
-                    filtered_instances.sort(key=lambda i: i.instance_stats.current_tpm, reverse=reverse)
-                elif sort_by == "priority":
-                    filtered_instances.sort(key=lambda i: i.priority, reverse=reverse)
+            # Sort instances
+            filtered_instances = sort_instances(
+                filtered_instances,
+                sort_by=sort_by,
+                sort_dir=sort_dir
+            )
             
             # Calculate total before pagination
             total_filtered = len(filtered_instances)
             
             # Apply pagination
-            if limit is not None:
-                paginated_instances = filtered_instances[offset:offset+limit]
-            else:
-                paginated_instances = filtered_instances
-                
-            # Format the instance data
-            instances_list = [
-                {
-                    "name": instance.name,
-                    "provider_type": instance.provider_type,
-                    "api_base": instance.api_base,
-                    "priority": instance.priority,
-                    "weight": instance.weight,
-                    "supported_models": instance.supported_models,
-                    "max_tpm": instance.max_tpm,
-                    "status": instance.status,
-                    "current_tpm": instance.instance_stats.current_tpm,
-                    "tpm_usage_percent": round((instance.instance_stats.current_tpm / instance.max_tpm) * 100, 2) if instance.max_tpm > 0 else 0,
-                    "max_input_tokens": instance.max_input_tokens,
-                    "last_used": instance.last_used
-                }
-                for instance in paginated_instances
-            ]
+            paginated_instances = paginate_instances(
+                filtered_instances,
+                offset=offset,
+                limit=limit
+            )
             
-            # Create the applied_filters object for response metadata
+            # Format the instance data
+            instances_list = format_instance_list(paginated_instances, detailed=True)
+            
+            # Create applied_filters object for response metadata
             applied_filters = {
                 "provider_type": provider_type,
                 "status": status,
@@ -185,7 +161,7 @@ async def get_instances_config(
                 instance_dict = instance.to_dict(exclude_sensitive=True)
                 instances_list.append(instance_dict)
                 
-            # Create the applied_filters object for response metadata
+            # Create applied_filters object for response metadata
             applied_filters = {
                 "provider_type": provider_type,
                 "model_support": model_support,
@@ -212,87 +188,214 @@ async def get_instances_config(
                     "is_configured_view": True
                 }
             }
-    except Exception as e:
-        logger.error(f"Error getting instance configuration: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error getting instance configuration: {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
+    
+    # Call the inner function to get the result
+    return await _get_instances_config()
 
 @router.get("/{instance_name}")
-async def get_instance_config(instance_name: str) -> Dict[str, Any]:
+@handle_router_errors("retrieving instance details")
+async def get_instance_details(
+    instance_name: str,
+    test_connection: bool = Query(False, description="Test the connection to the instance API")
+) -> Dict[str, Any]:
     """
-    Get configuration for a specific instance.
+    Get comprehensive information about a specific instance including:
+    - Configuration
+    - Current state
+    - Health information
+    - Usage statistics
     
     Args:
-        instance_name: Name of the instance
+        instance_name: The name of the instance to retrieve
+        test_connection: Whether to test the connection to the instance API
         
     Returns:
-        Standardized response with instance configuration data
+        Standardized response with detailed instance information
+        
+    Raises:
+        InstanceNotFoundError: If the instance doesn't exist
     """
-    try:
-        # Check if the instance exists
-        instance = instance_manager.get_instance(instance_name)
-        if not instance:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "status": "error",
-                    "message": f"Instance '{instance_name}' not found",
-                    "timestamp": int(time.time()),
-                    "data": None
+    # First check if the instance exists
+    instance = instance_manager.get_instance(instance_name)
+    check_instance_exists(instance, instance_name)
+    
+    # Get instance stats
+    instance_stats_response = instance_manager.get_instance_stats(instance_name)
+    if instance_stats_response.get("status") == "success":
+        instance_stats = instance_stats_response.get("instance", {})
+    else:
+        instance_stats = {}
+    
+    # Get instance config as dict
+    instance_config = instance.model_dump()
+    
+    # Remove sensitive information
+    if "api_key" in instance_config:
+        instance_config["api_key"] = "**REDACTED**"
+    
+    # Get health information
+    health_status = "unknown"
+    health_details = {}
+    
+    # Generate basic health status from stats
+    if instance_stats:
+        if instance_stats.get("error_count", 0) > 0:
+            health_status = "error"
+            health_details["error_count"] = instance_stats.get("error_count", 0)
+            health_details["recent_errors"] = instance_stats.get("recent_errors", [])
+        elif instance_stats.get("rate_limited_count", 0) > 0:
+            health_status = "rate_limited"
+            health_details["rate_limited_count"] = instance_stats.get("rate_limited_count", 0)
+        else:
+            health_status = "healthy"
+        
+        # Get last used time
+        if "last_used" in instance_stats:
+            health_details["last_used"] = instance_stats["last_used"]
+            
+            # Calculate time since last used
+            if instance_stats["last_used"]:
+                last_used_time = datetime.fromtimestamp(instance_stats["last_used"])
+                now = datetime.now()
+                idle_seconds = (now - last_used_time).total_seconds()
+                health_details["idle_time"] = {
+                    "seconds": int(idle_seconds),
+                    "minutes": round(idle_seconds / 60, 1),
+                    "hours": round(idle_seconds / 3600, 2)
                 }
-            )
+    
+    # Test connectivity if requested
+    if test_connection:
+        try:
+            connection_test = await instance_service.test_connectivity(instance_name)
+            health_details["connection_test"] = connection_test
+            
+            # Update health status based on connection test
+            if connection_test["status"] != "passed":
+                health_status = "error"
+        except Exception as e:
+            health_details["connection_test"] = {
+                "status": "error",
+                "details": {"error": str(e)}
+            }
+            health_status = "error"
+    
+    # Build the response
+    result = {
+        "name": instance_name,
+        "status": health_status,  # Overall status from health checks
+        "config": instance_config,
+        "stats": instance_stats,
+        "health": {
+            "status": health_status,
+            "details": health_details
+        },
+        "timestamp": int(time.time())
+    }
+    
+    return result
+
+@router.get("/config/{instance_name}")
+@handle_router_errors("retrieving instance configuration")
+async def get_instance_config(instance_name: str) -> Dict[str, Any]:
+    """
+    Get configuration of a specific instance.
+    
+    This endpoint returns only the configuration data without runtime state or statistics.
+    
+    Args:
+        instance_name: The name of the instance to retrieve
         
-        # Return the instance configuration
-        config = {
+    Returns:
+        Standardized response with instance configuration
+        
+    Raises:
+        InstanceNotFoundError: If the instance doesn't exist
+    """
+    # Check if instance exists
+    instance = instance_manager.get_instance(instance_name)
+    check_instance_exists(instance, instance_name)
+    
+    # Get instance config as dict
+    instance_config = instance.model_dump()
+    
+    # Remove sensitive information
+    if "api_key" in instance_config:
+        instance_config["api_key"] = "**REDACTED**"
+    
+    # Build the response
+    result = {
+        "status": "success",
+        "name": instance_name,
+        "config": instance_config,
+        "timestamp": int(time.time())
+    }
+    
+    return result
+
+@router.get("/config/all")
+@handle_router_errors("retrieving all instance configurations")
+async def get_all_instances_config(
+    provider_type: Optional[str] = Query(None, description="Filter by provider type (azure, generic)"),
+    model_support: Optional[str] = Query(None, description="Filter instances that support this model"),
+    sort_by: Optional[str] = Query("name", description="Field to sort by (name, priority)"),
+    sort_dir: Optional[str] = Query("asc", description="Sort direction (asc, desc)")
+) -> Dict[str, Any]:
+    """
+    Get configuration of all instances.
+    
+    This endpoint returns only configuration data without runtime state or statistics,
+    with options for filtering and sorting.
+    
+    Args:
+        provider_type: Filter by provider type (azure, generic)
+        model_support: Filter instances that support this model
+        sort_by: Field to sort by (name, priority)
+        sort_dir: Sort direction (asc, desc)
+        
+    Returns:
+        Standardized response with filtered instance configurations
+    """
+    # Get all instances as a list
+    instances = list(instance_manager.get_all_instances().values())
+    
+    # Filter instances
+    filtered_instances = filter_instances(
+        instances,
+        provider_type=provider_type,
+        model_support=model_support
+    )
+    
+    # Sort instances
+    sorted_instances = sort_instances(
+        filtered_instances,
+        sort_by=sort_by,
+        sort_dir=sort_dir
+    )
+    
+    # Convert to dicts and redact sensitive info
+    instance_configs = []
+    for instance in sorted_instances:
+        config = instance.model_dump()
+        if "api_key" in config:
+            config["api_key"] = "**REDACTED**"
+        instance_configs.append({
             "name": instance.name,
-            "provider_type": instance.provider_type,
-            "api_base": instance.api_base,
-            "api_version": instance.api_version,
-            "priority": instance.priority,
-            "weight": instance.weight,
-            "max_tpm": instance.max_tpm,
-            "max_input_tokens": instance.max_input_tokens,
-            "supported_models": instance.supported_models,
-            "model_deployments": instance.model_deployments
-        }
-        
-        return {
-            "status": "success",
-            "message": f"Retrieved configuration for instance '{instance_name}'",
-            "timestamp": int(time.time()),
-            "data": config
-        }
-    except HTTPException as e:
-        # Re-raise HTTP exceptions with standardized format
-        raise HTTPException(
-            status_code=e.status_code,
-            detail=e.detail if isinstance(e.detail, dict) else {
-                "status": "error",
-                "message": str(e.detail),
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error getting instance config: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error getting instance config: {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
+            "config": config
+        })
+    
+    # Build the response
+    result = {
+        "status": "success",
+        "count": len(instance_configs),
+        "instances": instance_configs,
+        "timestamp": int(time.time())
+    }
+    
+    return result
 
 @router.post("/add")
+@handle_router_errors("adding new instance")
 async def add_instance(instance_config: InstanceConfig) -> Dict[str, Any]:
     """
     Add a new instance to the proxy service at runtime.
@@ -305,38 +408,16 @@ async def add_instance(instance_config: InstanceConfig) -> Dict[str, Any]:
     Returns:
         Standardized response with status information about the newly added instance
     """
-    try:
-        result = await instance_service.add_instance(instance_config)
-        return {
-            "status": "success",
-            "message": f"Instance '{instance_config.name}' added successfully",
-            "timestamp": int(time.time()),
-            "data": result
-        }
-    except HTTPException as e:
-        # Re-raise HTTP exceptions directly but format them properly
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "status": "error",
-                "message": str(e.detail),
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error adding instance: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error adding instance: {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
+    result = await instance_service.add_instance(instance_config)
+    return {
+        "status": "success",
+        "message": f"Instance '{instance_config.name}' added successfully",
+        "timestamp": int(time.time()),
+        "data": result
+    }
 
 @router.post("/add-many")
+@handle_router_errors("adding multiple instances")
 async def add_many_instances(instances_config: List[InstanceConfig]) -> Dict[str, Any]:
     """
     Add multiple instances to the proxy service at runtime.
@@ -349,44 +430,22 @@ async def add_many_instances(instances_config: List[InstanceConfig]) -> Dict[str
     Returns:
         Standardized response with information about successfully added, skipped, and failed instances
     """
-    try:
-        result = await instance_service.add_many_instances(instances_config)
-        
-        # Create a more structured response
-        return {
-            "status": "success",
-            "message": f"Processed {len(instances_config)} instance configurations",
-            "timestamp": int(time.time()),
-            "data": {
-                "added": result.get("added", []),
-                "skipped": result.get("skipped", []),
-                "failed": result.get("failed", {})
-            }
+    result = await instance_service.add_many_instances(instances_config)
+    
+    # Create a more structured response
+    return {
+        "status": "success",
+        "message": f"Processed {len(instances_config)} instance configurations",
+        "timestamp": int(time.time()),
+        "data": {
+            "added": result.get("added", []),
+            "skipped": result.get("skipped", []),
+            "failed": result.get("failed", {})
         }
-    except HTTPException as e:
-        # Re-raise HTTP exceptions directly but format them properly
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "status": "error",
-                "message": str(e.detail),
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error adding instances: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error adding instances: {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
+    }
 
 @router.delete("/{instance_name}")
+@handle_router_errors("removing instance")
 async def remove_instance(instance_name: str) -> Dict[str, Any]:
     """
     Remove an instance from the proxy service at runtime.
@@ -400,38 +459,16 @@ async def remove_instance(instance_name: str) -> Dict[str, Any]:
     Returns:
         Standardized response with information about the removed instance
     """
-    try:
-        result = await instance_service.remove_instance(instance_name)
-        return {
-            "status": "success",
-            "message": f"Instance '{instance_name}' removed successfully",
-            "timestamp": int(time.time()),
-            "data": {"name": instance_name, "removed": result}
-        }
-    except HTTPException as e:
-        # Re-raise HTTP exceptions directly but format them properly
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "status": "error",
-                "message": str(e.detail),
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error removing instance {instance_name}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error removing instance '{instance_name}': {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
+    result = await instance_service.remove_instance(instance_name)
+    return {
+        "status": "success",
+        "message": f"Instance '{instance_name}' removed successfully",
+        "timestamp": int(time.time()),
+        "data": {"name": instance_name, "removed": result}
+    }
 
 @router.patch("/{instance_name}")
+@handle_router_errors("updating instance")
 async def update_instance(
     instance_name: str, 
     update_data: Dict[str, Any] = Body(..., description="Attributes to update")
@@ -455,37 +492,58 @@ async def update_instance(
     Returns:
         Standardized response with information about the updated instance
     """
-    try:
-        result = await instance_service.update_instance(instance_name, update_data)
-        return {
-            "status": result["status"],
-            "message": result["message"],
-            "timestamp": int(time.time()),
-            "data": {
-                "name": instance_name,
-                "updated_fields": result.get("updated_fields", {}),
-                "instance": result.get("instance", {})
-            }
+    result = await instance_service.update_instance(instance_name, update_data)
+    return {
+        "status": result["status"],
+        "message": result["message"],
+        "timestamp": int(time.time()),
+        "data": {
+            "name": instance_name,
+            "updated_fields": result.get("updated_fields", {}),
+            "instance": result.get("instance", {})
         }
-    except HTTPException as e:
-        # Re-raise HTTP exceptions directly but format them properly
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={
-                "status": "error",
-                "message": str(e.detail),
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error updating instance {instance_name}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "status": "error",
-                "message": f"Error updating instance '{instance_name}': {str(e)}",
-                "timestamp": int(time.time()),
-                "data": None
-            }
-        ) 
+    }
+
+@router.post("/verify/{instance_name}")
+@handle_router_errors("verifying instance")
+async def verify_instance(
+    instance_name: str,
+    request: Optional[Dict[str, Any]] = Body(None, description="Optional request payload with model and message to use for testing")
+) -> Dict[str, Any]:
+    """
+    Verify an instance by running a comprehensive set of checks.
+    
+    This endpoint performs a full verification of an instance including:
+    - Configuration check
+    - Connectivity test
+    - Model support check
+    - Actual model testing
+    
+    Args:
+        instance_name: Name of the instance to verify
+        request: Optional request payload with model and message to use for testing
+        
+    Returns:
+        Standardized response with detailed verification results
+        
+    Raises:
+        InstanceNotFoundError: If the instance doesn't exist
+    """
+    # Determine which model to test
+    model_to_test = None
+    message_to_test = "This is a test message to verify instance functionality."
+    
+    # If request payload is provided, use the model and message from it
+    if request:
+        model_to_test = request.get("model")
+        if "message" in request:
+            message_to_test = request.get("message")
+            
+    # Call the verification service
+    result = await instance_verification_service.verify_instance(
+        instance_name=instance_name,
+        model_to_test=model_to_test,
+        message_to_test=message_to_test
+    )
+    
+    return result 
