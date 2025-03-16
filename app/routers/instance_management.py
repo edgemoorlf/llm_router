@@ -25,7 +25,6 @@ router = APIRouter(
 
 @router.get("/")
 async def get_instances_config(
-    detailed: bool = Query(False, description="Whether to include detailed instance information"),
     provider_type: Optional[str] = Query(None, description="Filter by provider type (azure, generic)"),
     status: Optional[str] = Query(None, description="Filter by instance status (healthy, error, rate_limited)"),
     min_tpm: Optional[int] = Query(None, description="Filter instances with current TPM >= this value"),
@@ -42,7 +41,6 @@ async def get_instances_config(
     This endpoint returns information about all configured instances with extensive filtering options.
     
     Args:
-        detailed: If true, returns more detailed runtime information about instances
         provider_type: Filter by provider type (azure, generic)
         status: Filter by instance status (healthy, error, rate_limited)
         min_tpm: Filter instances with current TPM >= this value
@@ -59,135 +57,69 @@ async def get_instances_config(
     # Define inner function to apply the decorator
     @handle_errors
     async def _get_instances_config() -> Dict[str, Any]:
-        # Base data: either get from instance_manager or config
-        if detailed:
-            # Get all instances as a list
-            all_instances = list(instance_manager.get_all_instances().values())
-            
-            # Filter instances
-            filtered_instances = filter_instances(
-                all_instances,
-                provider_type=provider_type,
-                status=status,
-                min_tpm=min_tpm,
-                max_tpm=max_tpm,
-                model_support=model_support
-            )
-            
-            # Sort instances
-            filtered_instances = sort_instances(
-                filtered_instances,
-                sort_by=sort_by,
-                sort_dir=sort_dir
-            )
-            
-            # Calculate total before pagination
-            total_filtered = len(filtered_instances)
-            
-            # Apply pagination
-            paginated_instances = paginate_instances(
-                filtered_instances,
-                offset=offset,
-                limit=limit
-            )
-            
-            # Format the instance data
-            instances_list = format_instance_list(paginated_instances, detailed=True)
-            
-            # Create applied_filters object for response metadata
-            applied_filters = {
-                "provider_type": provider_type,
-                "status": status,
-                "min_tpm": min_tpm,
-                "max_tpm": max_tpm,
-                "model_support": model_support,
-                "sort_by": sort_by,
-                "sort_dir": sort_dir
+
+        # Get all instances as a list
+        all_instances = list(instance_manager.get_all_instances().values())
+        
+        # Filter instances
+        filtered_instances = filter_instances(
+            all_instances,
+            provider_type=provider_type,
+            status=status,
+            min_tpm=min_tpm,
+            max_tpm=max_tpm,
+            model_support=model_support
+        )
+        
+        # Sort instances
+        filtered_instances = sort_instances(
+            filtered_instances,
+            sort_by=sort_by,
+            sort_dir=sort_dir
+        )
+        
+        # Calculate total before pagination
+        total_filtered = len(filtered_instances)
+        
+        # Apply pagination
+        paginated_instances = paginate_instances(
+            filtered_instances,
+            offset=offset,
+            limit=limit
+        )
+        
+        # Format the instance data
+        instances_list = format_instance_list(paginated_instances, detailed=True)
+        
+        # Create applied_filters object for response metadata
+        applied_filters = {
+            "provider_type": provider_type,
+            "status": status,
+            "min_tpm": min_tpm,
+            "max_tpm": max_tpm,
+            "model_support": model_support,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir
+        }
+        # Remove None values
+        applied_filters = {k: v for k, v in applied_filters.items() if v is not None}
+        
+        return {
+            "status": "success",
+            "message": f"Retrieved {len(instances_list)} instances",
+            "timestamp": int(time.time()),
+            "data": {
+                "instances": instances_list,
+                "total_available": len(all_instances),
+                "total_filtered": total_filtered,
+                "count": len(instances_list),
+                "pagination": {
+                    "offset": offset,
+                    "limit": limit
+                },
+                "filters": applied_filters
             }
-            # Remove None values
-            applied_filters = {k: v for k, v in applied_filters.items() if v is not None}
-            
-            return {
-                "status": "success",
-                "message": f"Retrieved {len(instances_list)} instances",
-                "timestamp": int(time.time()),
-                "data": {
-                    "instances": instances_list,
-                    "total_available": len(all_instances),
-                    "total_filtered": total_filtered,
-                    "count": len(instances_list),
-                    "pagination": {
-                        "offset": offset,
-                        "limit": limit
-                    },
-                    "filters": applied_filters
-                }
-            }
-        else:
-            # Get from configuration
-            configured_instances = config_loader.get_instances()
-            
-            # Filter by provider_type if specified
-            if provider_type:
-                configured_instances = [i for i in configured_instances if i.provider_type == provider_type]
-                
-            # Filter by model_support if specified
-            if model_support:
-                configured_instances = [
-                    i for i in configured_instances if 
-                    (not i.supported_models or model_support in i.supported_models)
-                ]
-                
-            # Sort the instances
-            if sort_by:
-                reverse = sort_dir.lower() == "desc"
-                if sort_by == "name":
-                    configured_instances.sort(key=lambda i: i.name, reverse=reverse)
-                elif sort_by == "priority":
-                    configured_instances.sort(key=lambda i: i.priority, reverse=reverse)
-                
-            # Calculate total before pagination
-            total_filtered = len(configured_instances)
-            
-            # Apply pagination
-            if limit is not None:
-                paginated_instances = configured_instances[offset:offset+limit]
-            else:
-                paginated_instances = configured_instances
-                
-            # Convert to dict format
-            instances_list = []
-            for instance in paginated_instances:
-                instance_dict = instance.to_dict(exclude_sensitive=True)
-                instances_list.append(instance_dict)
-                
-            # Create applied_filters object for response metadata
-            applied_filters = {
-                "provider_type": provider_type,
-                "model_support": model_support,
-                "sort_by": sort_by,
-                "sort_dir": sort_dir
-            }
-            # Remove None values
-            applied_filters = {k: v for k, v in applied_filters.items() if v is not None}
-            
-            return {
-                "status": "success",
-                "message": f"Retrieved {len(instances_list)} configured instances",
-                "timestamp": int(time.time()),
-                "data": {
-                    "instances": instances_list,
-                    "total_available": len(config_loader.get_instances()),
-                    "total_filtered": total_filtered,
-                    "count": len(instances_list),
-                    "pagination": {
-                        "offset": offset,
-                        "limit": limit
-                    },
-                    "filters": applied_filters,
-                    "is_configured_view": True
-                }
-            }
+        }
     
     # Call the inner function to get the result
     return await _get_instances_config()
@@ -290,105 +222,6 @@ async def get_instance_details(
             "status": health_status,
             "details": health_details
         },
-        "timestamp": int(time.time())
-    }
-    
-    return result
-
-@router.get("/config/{instance_name}")
-@handle_router_errors("retrieving instance configuration")
-async def get_instance_config(instance_name: str) -> Dict[str, Any]:
-    """
-    Get configuration of a specific instance.
-    
-    This endpoint returns only the configuration data without runtime state or statistics.
-    
-    Args:
-        instance_name: The name of the instance to retrieve
-        
-    Returns:
-        Standardized response with instance configuration
-        
-    Raises:
-        InstanceNotFoundError: If the instance doesn't exist
-    """
-    # Check if instance exists
-    instance = instance_manager.get_instance(instance_name)
-    check_instance_exists(instance, instance_name)
-    
-    # Get instance config as dict
-    instance_config = instance.model_dump()
-    
-    # Remove sensitive information
-    if "api_key" in instance_config:
-        instance_config["api_key"] = "**REDACTED**"
-    
-    # Build the response
-    result = {
-        "status": "success",
-        "name": instance_name,
-        "config": instance_config,
-        "timestamp": int(time.time())
-    }
-    
-    return result
-
-@router.get("/config/all")
-@handle_router_errors("retrieving all instance configurations")
-async def get_all_instances_config(
-    provider_type: Optional[str] = Query(None, description="Filter by provider type (azure, generic)"),
-    model_support: Optional[str] = Query(None, description="Filter instances that support this model"),
-    sort_by: Optional[str] = Query("name", description="Field to sort by (name, priority)"),
-    sort_dir: Optional[str] = Query("asc", description="Sort direction (asc, desc)")
-) -> Dict[str, Any]:
-    """
-    Get configuration of all instances.
-    
-    This endpoint returns only configuration data without runtime state or statistics,
-    with options for filtering and sorting.
-    
-    Args:
-        provider_type: Filter by provider type (azure, generic)
-        model_support: Filter instances that support this model
-        sort_by: Field to sort by (name, priority)
-        sort_dir: Sort direction (asc, desc)
-        
-    Returns:
-        Standardized response with filtered instance configurations
-    """
-    # Get all instances as a list
-    instances = list(instance_manager.get_all_instances().values())
-    
-    # Filter instances
-    filtered_instances = filter_instances(
-        instances,
-        provider_type=provider_type,
-        model_support=model_support
-    )
-    
-    # Sort instances
-    sorted_instances = sort_instances(
-        filtered_instances,
-        sort_by=sort_by,
-        sort_dir=sort_dir
-    )
-    
-    # Convert to dicts and redact sensitive info
-    instance_configs = []
-    for instance in sorted_instances:
-        config = instance.model_dump()
-        if "api_key" in config:
-            config["api_key"] = "**REDACTED**"
-        instance_configs.append({
-            "name": instance.name,
-            "config": config
-        })
-    
-    # Build the response
-    result = {
-        "status": "success",
-        "count": len(instance_configs),
-        "instances": instance_configs,
         "timestamp": int(time.time())
     }
     
