@@ -1,0 +1,43 @@
+# Production environment configuration
+# Copy this file to production.yaml and modify as needed
+
+# Override base settings as needed
+port: 3010
+routing:
+  strategy: "failover"
+
+logging:
+  level: "INFO"
+  file: "/var/log/azure_openai_proxy/app.log"
+  
+# Define instances for production
+instances:
+  - name: "prod-instance-1"
+    provider_type: "azure"
+    api_key: "${AZURE_API_KEY_1}"
+    api_base: "https://your-prod-instance1.openai.azure.com"
+    api_version: "2024-08-01-preview"
+    priority: 100
+    weight: 100
+    max_tpm: 240000
+    supported_models:
+      - "gpt-4o-mini"
+      - "gpt-4o"
+    model_deployments:
+      gpt-4o-mini: "gpt4omini"
+      gpt-4o: "gpt4o"
+      
+  - name: "prod-instance-2"
+    provider_type: "azure"
+    api_key: "${AZURE_API_KEY_2}"
+    api_base: "https://your-prod-instance2.openai.azure.com"
+    api_version: "2024-08-01-preview"
+    priority: 200  # Lower priority (higher number) = backup instance
+    weight: 100
+    max_tpm: 240000
+    supported_models:
+      - "gpt-4o-mini"
+      - "gpt-4o"
+    model_deployments:
+      gpt-4o-mini: "gpt4omini"
+      gpt-4o: "gpt4o" 

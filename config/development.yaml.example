@@ -1,0 +1,24 @@
+# Development environment configuration
+# Copy this file to development.yaml and modify as needed
+
+# Override base settings as needed
+port: 3010
+routing:
+  strategy: "failover"
+
+# Define instances for development
+instances:
+  - name: "dev-instance"
+    provider_type: "azure"
+    api_key: "${AZURE_API_KEY}"
+    api_base: "https://your-dev-instance.openai.azure.com"
+    api_version: "2024-08-01-preview"
+    priority: 100
+    weight: 100
+    max_tpm: 240000
+    supported_models:
+      - "gpt-4o-mini"
+      - "gpt-4o"
+    model_deployments:
+      gpt-4o-mini: "gpt4omini"
+      gpt-4o: "gpt4o" 
