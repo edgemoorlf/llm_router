@@ -8,6 +8,9 @@ from fastapi import HTTPException, status
 from .api_instance import APIInstance
 from .service_stats import service_stats
 
+# Import instance manager from context
+from app.instance.instance_context import instance_manager
+
 logger = logging.getLogger(__name__)
 
 class RequestForwarder:

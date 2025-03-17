@@ -10,7 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status, Body, He
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.instance.manager import instance_manager
+# Import instance_manager and instance_router from the context module
+from app.instance.instance_context import instance_manager, instance_router
 from app.services.azure_openai import azure_openai_service
 from app.services.generic_openai import generic_openai_service
 from app.utils.streaming import handle_streaming_request
@@ -38,43 +39,46 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     # Normalize the model name
     model_name = model_name.lower()
     
-    # Get available instances for each provider type
-    azure_instances = instance_manager.router.get_available_instances_for_model(
-        instance_manager.get_all_instances(), 
-        model_name,
-        provider_type="azure"
-    )
+    # Get instances from the instance manager directly
+    all_instances = instance_manager.get_all_instances()
     
-    generic_instances = instance_manager.router.get_available_instances_for_model(
-        instance_manager.get_all_instances(), 
-        model_name,
-        provider_type="generic"
-    )
+    # Debug the instance structure
+    logger.debug(f"Instance structure: {str(type(all_instances))}")
+    if all_instances and len(all_instances) > 0:
+        first_key = list(all_instances.keys())[0]
+        first_value = all_instances[first_key]
+        logger.debug(f"First instance: {first_key} has type {type(first_value)}")
+        logger.debug(f"Provider type exists: {'provider_type' in first_value}")
     
-    # Log what we found for debugging
+    # Filter instances by provider type and model support
+    azure_instances = []
+    generic_instances = []
+    
+    for instance_info in all_instances.values():
+        provider_type = instance_info.get("provider_type", "")
+        supported_models = instance_info.get("supported_models", [])
+        
+        # Convert all model names to lowercase for comparison
+        supported_models_lower = [m.lower() for m in supported_models]
+        
+        # Check if this instance supports the model
+        model_supported = model_name in supported_models_lower or not supported_models
+        
+        if provider_type == "azure" and model_supported:
+            azure_instances.append(instance_info)
+        elif provider_type == "generic" and model_supported:
+            generic_instances.append(instance_info)
+    
+    # Select service based on available instances
     if azure_instances:
-        logger.debug(f"Found {len(azure_instances)} Azure instances supporting model '{model_name}'")
-    
-    if generic_instances:
-        logger.debug(f"Found {len(generic_instances)} Generic instances supporting model '{model_name}'")
-    
-    # Decide which service to use based on available instances
-    if generic_instances and not azure_instances:
-        # Only generic instances support this model
-        logger.debug(f"Using generic service for model '{model_name}' (only generic instances available)")
+        logger.debug(f"Found {len(azure_instances)} Azure instances for model {model_name}")
+        return azure_openai_service, "azure"
+    elif generic_instances:
+        logger.debug(f"Found {len(generic_instances)} generic instances for model {model_name}")
         return generic_openai_service, "generic"
-    elif azure_instances and not generic_instances:
-        # Only Azure instances support this model
-        logger.debug(f"Using Azure service for model '{model_name}' (only Azure instances available)")
-        return azure_openai_service, "azure"
-    elif generic_instances and azure_instances:
-        # Both types support this model, prefer Azure by default
-        # This could be made configurable in the future
-        logger.debug(f"Using Azure service for model '{model_name}' (both types available, preferring Azure)")
-        return azure_openai_service, "azure"
     else:
-        # No instances explicitly support this model, default to Azure
-        logger.warning(f"No instances explicitly support model '{model_name}', defaulting to Azure service")
+        # Default to Azure service, which will handle the error if needed
+        logger.warning(f"No instances found for model {model_name}, defaulting to Azure service")
         return azure_openai_service, "azure"
 
 @router.post("/v1/chat/completions")

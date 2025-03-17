@@ -1,15 +1,19 @@
 """Utility functions for handling streaming requests to OpenAI-compatible services."""
 import json
 import logging
+import asyncio
+import re
+import time
 import httpx
-from typing import Dict, Any
-from fastapi import HTTPException, status
+from typing import Dict, Any, Optional
+from fastapi import HTTPException, status, Response
 from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse
 
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 from app.instance.api_instance import InstanceStatus
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
+from app.utils.url_builder import build_instance_url
 
 logger = logging.getLogger(__name__)
 
@@ -38,78 +42,47 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
     if "model" not in payload and model_name:
         payload["model"] = model_name
     
-    # Estimate tokens for rate limiting and instance selection
-    required_tokens = 0
-    if endpoint == "/v1/chat/completions":
-        # Calculate precise token count using improved estimator
-        required_tokens = estimate_chat_tokens(
-            messages=payload.get("messages", []),
-            functions=payload.get("functions"),
-            model=model_name,
-            provider=provider_type
-        )
-        
-        # Validate against max input tokens before proceeding
-        max_input_tokens = next((inst.max_input_tokens for inst in instance_manager.get_all_instances().values() 
-                               if inst.max_input_tokens > 0), None)
-        logger.debug(f"required tokens {required_tokens} vs max input tokens {max_input_tokens}")        
-        if max_input_tokens and required_tokens > max_input_tokens:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Input is too large, exceeds max token limit of {max_input_tokens}",
+    # Get max input tokens from instances
+    max_input_tokens = next((inst.get("max_input_tokens", 0) for inst in instance_manager.get_all_instances().values()
+                           if inst.get("max_input_tokens", 0) > 0), None)
+
+    if max_input_tokens:
+        # Estimate tokens in the request
+        if endpoint == "/v1/chat/completions":
+            token_count = estimate_chat_tokens(
+                payload.get("messages", []),
+                payload.get("functions", None),
+                original_model or payload.get("model", ""),
+                provider=provider_type
             )
-        
-        # Enforce strict token limits before instance selection
-        if required_tokens <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid token count estimation"
-            )
-    elif endpoint == "/v1/completions":
-        required_tokens = estimate_completion_tokens(
-            payload.get("prompt", ""),
-            model_name,
-            provider_type
-        )
-    else:
-        required_tokens = 500  # Default for unknown endpoints
-    
-    # Select an instance based on the routing strategy and model support
-    primary_instance = instance_manager.select_instance(required_tokens, model_name)
-    logger.debug(f"Selected primary instance for streaming: {primary_instance.name if primary_instance else 'None'} for model: {model_name} max input tokens: {primary_instance.max_input_tokens if primary_instance else 'N/A'}")
-    
-    # If no instance was found that can handle this request with its token limits, return 503
-    if not primary_instance:
-        error_detail = f"No instances available that can handle {required_tokens} tokens for model '{model_name}'"
-        logger.error(error_detail)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=error_detail
-        )
-    
+            logger.debug(f"token count: {token_count}")
+            
+            if token_count > max_input_tokens:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Input tokens ({token_count}) exceed maximum allowed ({max_input_tokens})"
+                )
+
     # Filter out instances in error state
     available_instances = [instance for instance in instance_manager.get_all_instances().values() 
-                           if instance.status != InstanceStatus.ERROR]
+                         if instance.get("status", "") != "error"]
     
     if not available_instances:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No available API instances for streaming request",
         )
-    
-    # Try primary instance first, then others in priority order
-    if primary_instance:
-        available_instances = [primary_instance] + [i for i in available_instances if i.name != primary_instance.name]
-    
-    # Sort remaining instances by priority
-    available_instances.sort(key=lambda x: x.priority)
+
+    # Sort instances by priority
+    available_instances.sort(key=lambda x: x.get("priority", 100))
     
     # Try each instance until one succeeds
     last_error = None
     for instance in available_instances:
         try:
             # Initialize the instance if needed
-            instance.initialize_client()
+            instance_name = instance.get("name", "")
+            logger.debug(f"Trying to stream using instance: {instance_name}")
             
             # For each instance, make sure the model name is in the payload for deployment mapping
             instance_payload = payload.copy()
@@ -117,33 +90,40 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
             # Determine deployment name based on the model (for Azure instances)
             deployment = ""
             curr_model_name = instance_payload.get("model", "").lower()
-            if curr_model_name and instance.provider_type == "azure" and instance.model_deployments:
+            if curr_model_name and instance.get("provider_type", "") == "azure" and instance.get("model_deployments", {}):
                 # Look up the deployment name for this model in this specific instance
-                deployment = instance.model_deployments.get(curr_model_name, "")
+                model_deployments = instance.get("model_deployments", {})
+                deployment = model_deployments.get(curr_model_name, "")
                 if deployment:
-                    logger.debug(f"Resolved deployment '{deployment}' for model '{curr_model_name}' in instance '{instance.name}'")
+                    logger.debug(f"Resolved deployment '{deployment}' for model '{curr_model_name}' in instance '{instance_name}'")
                 else:
-                    logger.warning(f"No deployment mapping found for model '{curr_model_name}' in instance '{instance.name}'")
+                    logger.warning(f"No deployment mapping found for model '{curr_model_name}' in instance '{instance_name}'")
                     
                     # Skip this instance if it doesn't have a deployment mapping for this model
-                    if instance.provider_type == "azure":
-                        logger.warning(f"Skipping Azure instance {instance.name} that lacks deployment mapping for model {curr_model_name}")
+                    if instance.get("provider_type", "") == "azure":
+                        logger.warning(f"Skipping Azure instance {instance_name} that lacks deployment mapping for model {curr_model_name}")
                         continue
             
-            # Build the URL for this instance based on provider type and deployment
-            url = instance.build_url(endpoint=endpoint, deployment_name=deployment)
-            logger.debug(f"Constructed URL for {instance.provider_type} instance: {url}")
+            # Add current model to instance for URL building
+            instance = instance.copy()  # Make a copy to avoid modifying the original
+            instance["_current_model"] = curr_model_name
             
-            logger.debug(f"Streaming request via instance {instance.name} to {url}")
+            # Build the URL using shared logic
+            url = build_instance_url(instance, endpoint)
+            if not url:
+                continue  # Skip this instance if URL building failed
+            
+            logger.debug(f"Streaming request via instance {instance_name} to {url}")
             
             # Create a new client for streaming (we can't reuse the existing client)
             client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
             
             # Set appropriate headers based on provider type
-            if instance.provider_type == "azure":
-                client.headers.update({"api-key": instance.api_key})
+            api_key = instance.get("api_key", "")
+            if instance.get("provider_type", "") == "azure":
+                client.headers.update({"api-key": api_key})
             else:
-                client.headers.update({"Authorization": f"Bearer {instance.api_key}"})
+                client.headers.update({"Authorization": f"Bearer {api_key}"})
             
             # Make the request to the API
             response = await client.post(url, json=instance_payload, headers={"Accept": "application/json"})
@@ -152,7 +132,7 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
             response.raise_for_status()
     
             # Mark the instance as healthy
-            instance.mark_healthy()
+            instance_manager.update_instance_state(instance_name, status="healthy")
             
             if endpoint == "/v1/chat/completions":
                 # For chat completions, we need to process each chunk to ensure it matches OpenAI format
@@ -271,28 +251,28 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
             # Handle rate limiting
             if status_code == 429:
                 retry_after = int(e.response.headers.get("retry-after", "60"))
-                instance.mark_rate_limited(retry_after)
-                logger.warning(f"Instance {instance.name} rate limited, retrying with next instance")
+                instance_manager.update_instance_state(instance_name, status="rate_limited", retry_after=retry_after)
+                logger.warning(f"Instance {instance_name} rate limited, retrying with next instance")
                 last_error = f"Rate limit exceeded: {error_detail}"
                 continue
             
             # Handle other errors
-            instance.mark_error(f"HTTP {status_code}: {error_detail}")
-            logger.error(f"Instance {instance.name} returned error {status_code}: {error_detail}")
+            instance_manager.update_instance_state(instance_name, status="error", error_detail=error_detail)
+            logger.error(f"Instance {instance_name} returned error {status_code}: {error_detail}")
             last_error = f"API error: {error_detail}"
             continue
             
         except (httpx.RequestError, httpx.TimeoutException) as e:
             # Handle connection errors
-            instance.mark_error(f"Connection error: {str(e)}")
-            logger.error(f"Connection error to instance {instance.name}: {str(e)}")
+            instance_manager.update_instance_state(instance_name, status="error", error_detail=str(e))
+            logger.error(f"Connection error to instance {instance_name}: {str(e)}")
             last_error = f"Connection error: {str(e)}"
             continue
             
         except Exception as e:
             # Handle unexpected errors
-            instance.mark_error(f"Unexpected error: {str(e)}")
-            logger.exception(f"Unexpected error with instance {instance.name}")
+            instance_manager.update_instance_state(instance_name, status="error", error_detail=str(e))
+            logger.exception(f"Unexpected error with instance {instance_name}")
             last_error = f"Unexpected error: {str(e)}"
             continue
     

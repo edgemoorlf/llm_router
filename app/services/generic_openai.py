@@ -2,8 +2,11 @@
 import logging
 from typing import Any, Dict, List
 from fastapi import HTTPException, status
+import httpx
+import asyncio
+import time
 
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 from app.utils.rate_limiter import rate_limiter
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 
@@ -39,20 +42,19 @@ class GenericOpenAIService:
         normalized_model = model_name.lower().split(':')[0]
         
         # Find instances that support this model and are generic provider type
-        model_instances = [
-            instance for instance in instance_manager.get_all_instances().values()
-            if (
-                # Must be generic provider type
-                instance.provider_type == "generic" and
-                (
-                    # Instance has this model in its supported_models list
-                    normalized_model in [m.lower() for m in instance.supported_models] or
-                    # Instance has no model restrictions (empty supported_models means it supports all models)
-                    not instance.supported_models
-                )
-            )
-        ]
+        all_instances = instance_manager.get_all_instances().values()
+        model_instances = []
         
+        for instance in all_instances:
+            provider_type = instance.get("provider_type", "")
+            supported_models = instance.get("supported_models", [])
+            
+            # Check if this is a generic provider and supports the model
+            if provider_type == "generic" and (
+                normalized_model in [m.lower() for m in supported_models] or not supported_models
+            ):
+                model_instances.append(instance)
+                
         logger.debug(f"Found {len(model_instances)} generic instances supporting model '{normalized_model}'")
         
         if not model_instances:
@@ -136,7 +138,7 @@ class GenericOpenAIService:
         # Filter instances to only include generic provider types
         generic_instances = [
             instance for instance in instance_manager.get_all_instances().values()
-            if instance.provider_type == "generic"
+            if instance.get("provider_type", "") == "generic"
         ]
         
         if not generic_instances:
@@ -150,11 +152,12 @@ class GenericOpenAIService:
         primary_instance = None
         for instance in generic_instances:
             # Check if this instance supports the model
+            supported_models = instance.get("supported_models", [])
             if (
                 # Instance has this model in its supported_models list
-                model_name.lower() in [m.lower() for m in instance.supported_models] or
+                model_name.lower() in [m.lower() for m in supported_models] or
                 # Instance has no model restrictions (empty supported_models means it supports all models)
-                not instance.supported_models
+                not supported_models
             ):
                 # This instance supports the model, use it as primary
                 primary_instance = instance
@@ -163,33 +166,194 @@ class GenericOpenAIService:
         if not primary_instance:
             # If no specific instance was found, use the first generic instance
             primary_instance = generic_instances[0]
-            logger.warning(f"No generic instance explicitly supports model '{model_name}', using {primary_instance.name}")
+            logger.warning(f"No generic instance explicitly supports model '{model_name}', using {primary_instance.get('name', '')}")
         
-        # For generic provider types, we keep the model field
-        # No need to modify the payload
-        
-        # Try to send the request to an available instance with failover
-        # We'll only try generic instances
-        result, instance = await instance_manager.try_instances(
-            endpoint, 
-            model_name,  # For generic providers, we use the model name as the deployment
-            payload, 
-            required_tokens,
-            method,
-            provider_type="generic"  # Only try generic instances
+        # Try to forward the request to each instance until one succeeds
+        errors = []
+        for instance in generic_instances:
+            try:
+                # Try to forward the request to this instance
+                instance_name = instance.get("name", "")
+                logger.debug(f"Trying to forward request to generic instance: {instance_name}")
+                
+                # Forward the request
+                result = await self._forward_request_to_instance(instance, endpoint, payload, method)
+                
+                # If successful, update the instance stats and return the result
+                instance_manager.update_instance_state(instance_name, status="healthy")
+                
+                # If we have usage information, update the TPM
+                if "usage" in result and "total_tokens" in result["usage"]:
+                    current_stats = instance.get("instance_stats", {})
+                    current_tpm = current_stats.get("current_tpm", 0)
+                    new_tpm = current_tpm + result["usage"]["total_tokens"]
+                    instance_manager.update_instance_state(
+                        instance_name,
+                        instance_stats={"current_tpm": new_tpm}
+                    )
+                
+                logger.debug(f"Request completed using generic instance {instance_name}")
+                return result
+                
+            except Exception as e:
+                # Log the error and try the next instance
+                error_message = str(e)
+                logger.warning(f"Failed to forward request to generic instance {instance.get('name', '')}: {error_message}")
+                errors.append(f"{instance.get('name', '')}: {error_message}")
+                
+                # Update the instance state
+                instance_name = instance.get("name", "")
+                if isinstance(e, HTTPException) and getattr(e, "status_code", 0) == 429:
+                    # Rate limited
+                    instance_manager.update_instance_state(instance_name, status="rate_limited")
+                else:
+                    # Other error
+                    instance_manager.update_instance_state(
+                        instance_name,
+                        status="error",
+                        last_error=error_message
+                    )
+                
+                # Continue to the next instance
+                continue
+                
+        # If we're here, all instances failed
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"All generic instances failed. Errors: {', '.join(errors)}"
         )
         
-        logger.debug(f"Request completed using generic instance {instance.name}")
+    async def _forward_request_to_instance(
+        self, instance: Dict[str, Any], endpoint: str, payload: Dict[str, Any], method: str = "POST"
+    ) -> Dict[str, Any]:
+        """
+        Forward a request directly to an instance.
         
-        return result
+        Args:
+            instance: The instance dictionary to use
+            endpoint: The API endpoint
+            payload: The request payload
+            method: HTTP method
+            
+        Returns:
+            The API response
+            
+        Raises:
+            HTTPException: If the request fails
+        """
+        # Get instance properties
+        instance_name = instance.get("name", "")
+        provider_type = instance.get("provider_type", "generic")
+        api_base = instance.get("api_base", "")
+        api_key = instance.get("api_key", "")
+        timeout_seconds = instance.get("timeout_seconds", 60.0)
+        retry_count = instance.get("retry_count", 3)
         
+        # Generate a request ID for tracking
+        request_id = f"{instance_name}-{time.time()}"
+        
+        # Build the URL (for generic instances, we use the endpoint directly)
+        url = f"{api_base}{endpoint}"
+            
+        logger.debug(f"[{request_id}] Forwarding request to generic instance {instance_name}: {url}")
+        
+        # Set up HTTP client with appropriate timeout
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+            # Set headers for generic OpenAI-compatible APIs
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
+                
+            # Make the request with retries
+            response = None
+            last_error = None
+            
+            for retry in range(retry_count + 1):  # +1 for the initial attempt
+                try:
+                    if method == "GET":
+                        response = await client.get(url, headers=headers)
+                    elif method == "POST":
+                        response = await client.post(url, json=payload, headers=headers)
+                    elif method == "PUT":
+                        response = await client.put(url, json=payload, headers=headers)
+                    elif method == "DELETE":
+                        response = await client.delete(url, headers=headers)
+                    else:
+                        raise ValueError(f"Unsupported HTTP method: {method}")
+                        
+                    # Check for HTTP errors
+                    response.raise_for_status()
+                    
+                    # Return the JSON response
+                    return response.json()
+                        
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    
+                    # Don't retry on certain status codes
+                    if e.response.status_code in [400, 401, 403, 404]:
+                        break
+                        
+                    # For other errors, retry with backoff
+                    if retry < retry_count:
+                        backoff_seconds = (2 ** retry) * 0.5  # Exponential backoff
+                        logger.warning(f"[{request_id}] Request failed with HTTP {e.response.status_code}, retrying in {backoff_seconds:.2f}s ({retry+1}/{retry_count})")
+                        await asyncio.sleep(backoff_seconds)
+                    
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                    last_error = e
+                    
+                    # Retry connection errors
+                    if retry < retry_count:
+                        backoff_seconds = (2 ** retry) * 0.5  # Exponential backoff
+                        logger.warning(f"[{request_id}] Connection error: {str(e)}, retrying in {backoff_seconds:.2f}s ({retry+1}/{retry_count})")
+                        await asyncio.sleep(backoff_seconds)
+                
+                except Exception as e:
+                    # Don't retry other exceptions
+                    logger.error(f"[{request_id}] Unexpected error: {str(e)}")
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Unexpected error forwarding request: {str(e)}"
+                    )
+            
+            # If we're here, all retries failed
+            if isinstance(last_error, httpx.HTTPStatusError):
+                # Try to parse error response
+                try:
+                    error_json = last_error.response.json()
+                    error_message = error_json.get("error", {}).get("message", str(last_error))
+                except Exception:
+                    error_message = last_error.response.text or str(last_error)
+                    
+                status_code = last_error.response.status_code
+                
+                # Create headers dict if it doesn't exist
+                headers = {}
+                if hasattr(last_error.response, "headers"):
+                    for key, value in last_error.response.headers.items():
+                        headers[key.lower()] = value
+                
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=error_message,
+                    headers=headers
+                )
+            else:
+                # For connection errors
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Service unavailable: {str(last_error)}"
+                )
+    
     async def get_instances_status(self) -> List[Dict[str, Any]]:
         """Get the status of all generic instances."""
         all_stats = instance_manager.get_instance_stats()
         # Filter to only include generic instances
         return [
             stats for stats in all_stats
-            if stats["provider_type"] == "generic"
+            if stats.get("provider_type", "") == "generic"
         ]
 
 # Create a singleton instance

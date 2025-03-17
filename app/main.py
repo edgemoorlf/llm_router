@@ -106,11 +106,8 @@ if config.logging.feishu_webhook:
     # Also add to file handler for consistency
     logging.getLogger().addHandler(feishu_handler)
 
-    # Initialize the instance manager
-    # Instances can be loaded from:
-    # 1. YAML configuration files in app/config/instances/
-    # 2. Saved state in a temporary file (for persistence across restarts)
-    global instance_manager
+# Import instance manager and router from the context module
+from app.instance.instance_context import instance_manager, instance_router, check_for_updates
 
 # Create FastAPI app
 app = FastAPI(
@@ -148,12 +145,10 @@ async def log_requests(request: Request, call_next):
         raise
 
 @app.middleware("http")
-async def check_instance_updates(request: Request, call_next):
+async def check_instance_updates_middleware(request: Request, call_next):
     """Middleware to check for instance updates before processing each request."""
-    from app.instance.manager import instance_manager
-    
     # Check for updates from the shared state file
-    instance_manager.check_for_updates()
+    check_for_updates()
     
     # Process the request
     response = await call_next(request)
