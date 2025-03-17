@@ -8,8 +8,8 @@ eliminating circular dependencies between modules.
 
 import os
 import logging
-from app.instance.new_manager import NewInstanceManager
-from app.instance.new_router import InstanceRouter
+from app.instance.manager import InstanceManager
+from app.instance.router import InstanceRouter
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ config_file_path = os.environ.get("INSTANCE_CONFIG_FILE", "instance_configs.json
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 # Initialize the instance manager
-instance_manager = NewInstanceManager(
+instance_manager = InstanceManager(
     config_file=config_file_path,
     redis_url=redis_url
 )

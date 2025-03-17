@@ -7,15 +7,117 @@ from fastapi import HTTPException, status
 import traceback
 import time
 
-from app.config import InstanceConfig
-from app.instance.manager import instance_manager
-from app.instance.api_instance import APIInstance
 from app.config import config_loader
+from app.models.instance import InstanceConfig, InstanceState
+from app.instance.manager import InstanceManager
 
 logger = logging.getLogger(__name__)
 
 class InstanceService:
-    """Service for managing API instances at runtime."""
+    """Service for managing API instances and their states."""
+    
+    def __init__(self, instance_manager: InstanceManager):
+        self.instance_manager = instance_manager
+        
+    def get_instance(self, name: str) -> Optional[Tuple[InstanceConfig, InstanceState]]:
+        """
+        Get an instance by name.
+        
+        Args:
+            name: Name of the instance to get
+            
+        Returns:
+            Tuple of (InstanceConfig, InstanceState) if found, None otherwise
+        """
+        return self.instance_manager.get_instance(name)
+        
+    def get_all_instances(self) -> List[Tuple[InstanceConfig, InstanceState]]:
+        """
+        Get all instances.
+        
+        Returns:
+            List of (InstanceConfig, InstanceState) tuples
+        """
+        return self.instance_manager.get_all_instances()
+        
+    def add_instance(self, config: InstanceConfig) -> None:
+        """
+        Add a new instance.
+        
+        Args:
+            config: Instance configuration to add
+        """
+        self.instance_manager.add_instance(config)
+        
+    def remove_instance(self, name: str) -> None:
+        """
+        Remove an instance.
+        
+        Args:
+            name: Name of the instance to remove
+        """
+        self.instance_manager.remove_instance(name)
+        
+    def update_instance(self, name: str, config: InstanceConfig) -> None:
+        """
+        Update an instance's configuration.
+        
+        Args:
+            name: Name of the instance to update
+            config: New instance configuration
+        """
+        self.instance_manager.update_instance(name, config)
+        
+    def update_tpm_usage(self, name: str, tokens: int) -> None:
+        """
+        Update the TPM usage for an instance.
+        
+        Args:
+            name: Name of the instance
+            tokens: Number of tokens used
+        """
+        self.instance_manager.update_tpm_usage(name, tokens)
+        
+    def record_error(self, name: str, error_type: str, error_message: str) -> None:
+        """
+        Record an error for an instance.
+        
+        Args:
+            name: Name of the instance
+            error_type: Type of error (client_error, upstream_error)
+            error_message: Error message
+        """
+        self.instance_manager.record_error(name, error_type, error_message)
+        
+    def is_rate_limited(self, name: str) -> bool:
+        """
+        Check if an instance is rate limited.
+        
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            True if the instance is rate limited, False otherwise
+        """
+        return self.instance_manager.is_rate_limited(name)
+        
+    def mark_rate_limited(self, name: str) -> None:
+        """
+        Mark an instance as rate limited.
+        
+        Args:
+            name: Name of the instance
+        """
+        self.instance_manager.mark_rate_limited(name)
+        
+    def mark_healthy(self, name: str) -> None:
+        """
+        Mark an instance as healthy.
+        
+        Args:
+            name: Name of the instance
+        """
+        self.instance_manager.mark_healthy(name)
     
     async def _add_single_instance(self, instance_config: InstanceConfig) -> Dict[str, Any]:
         """
@@ -30,7 +132,7 @@ class InstanceService:
             - On error: {"status": "error", "message": error_message, "reason": reason_string}
         """
         # Check if instance with this name already exists
-        if instance_manager.has_instance(instance_config.name):
+        if self.instance_manager.has_instance(instance_config.name):
             return {
                 "status": "error",
                 "message": f"Instance with name '{instance_config.name}' already exists",
@@ -46,32 +148,13 @@ class InstanceService:
             }
         
         try:
-            # Create the API instance
-            instance = APIInstance(
-                name=instance_config.name,
-                provider_type=instance_config.provider_type,
-                api_key=instance_config.api_key,
-                api_base=instance_config.api_base,
-                api_version=instance_config.api_version,
-                proxy_url=instance_config.proxy_url,
-                priority=instance_config.priority,
-                weight=instance_config.weight,
-                max_tpm=instance_config.max_tpm,
-                max_input_tokens=instance_config.max_input_tokens,
-                supported_models=instance_config.supported_models,
-                model_deployments=instance_config.model_deployments
-            )
-            
-            # Initialize the client for this instance
-            instance.initialize_client()
-            
             # Add the instance to the manager
-            instance_manager.add_instance(instance_config.name, instance)
+            self.instance_manager.add_instance(instance_config)
             
             # Set initial RPM window
             config = config_loader.get_config()
             if config and config.monitoring and config.monitoring.stats_window_minutes > 0:
-                instance.set_rpm_window(config.monitoring.stats_window_minutes)
+                self.instance_manager.set_rpm_window(instance_config.name, config.monitoring.stats_window_minutes)
             
             # Convert InstanceConfig to dict with Pydantic v1/v2 compatibility
             instance_dict = {}
@@ -190,118 +273,6 @@ class InstanceService:
             "failed": failed
         }
     
-    async def update_instance(self, instance_name: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Update attributes of an existing instance.
-        
-        Args:
-            instance_name: Name of the instance to update
-            update_data: Dictionary of attributes to update
-            
-        Returns:
-            Dictionary with status and details about the updated instance
-            
-        Raises:
-            HTTPException: If the instance doesn't exist or if there are validation errors
-        """
-        # Check if instance exists
-        instance = instance_manager.get_instance(instance_name)
-        if not instance:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Instance '{instance_name}' not found"
-            )
-        
-        # Track what was updated
-        updated_fields = {}
-        
-        try:
-            # Update attributes if provided in update_data
-            if "priority" in update_data:
-                instance.priority = update_data["priority"]
-                updated_fields["priority"] = update_data["priority"]
-                
-            if "weight" in update_data:
-                instance.weight = update_data["weight"]
-                updated_fields["weight"] = update_data["weight"]
-                
-            if "max_tpm" in update_data:
-                instance.max_tpm = update_data["max_tpm"]
-                updated_fields["max_tpm"] = update_data["max_tpm"]
-                
-            if "max_input_tokens" in update_data:
-                instance.max_input_tokens = update_data["max_input_tokens"]
-                updated_fields["max_input_tokens"] = update_data["max_input_tokens"]
-                
-            if "supported_models" in update_data:
-                instance.supported_models = update_data["supported_models"]
-                updated_fields["supported_models"] = update_data["supported_models"]
-                
-            if "model_deployments" in update_data:
-                instance.model_deployments = update_data["model_deployments"]
-                updated_fields["model_deployments"] = update_data["model_deployments"]
-                
-            if "api_version" in update_data:
-                instance.api_version = update_data["api_version"]
-                updated_fields["api_version"] = update_data["api_version"]
-                
-            if "proxy_url" in update_data:
-                instance.proxy_url = update_data["proxy_url"]
-                updated_fields["proxy_url"] = update_data["proxy_url"]
-                
-            # Only update API key if provided (and not empty)
-            if "api_key" in update_data and update_data["api_key"]:
-                instance.api_key = update_data["api_key"]
-                updated_fields["api_key"] = "********" # Redacted for security
-                
-            # Only update API base if provided (and not empty)
-            if "api_base" in update_data and update_data["api_base"]:
-                instance.api_base = update_data["api_base"]
-                updated_fields["api_base"] = update_data["api_base"]
-                
-                # If API base changed, we need to re-initialize the client
-                instance.initialize_client()
-                
-            # Only update provider_type if provided (and not empty)
-            if "provider_type" in update_data and update_data["provider_type"]:
-                instance.provider_type = update_data["provider_type"]
-                updated_fields["provider_type"] = update_data["provider_type"]
-                
-                # If provider type changed, we need to re-initialize the client
-                instance.initialize_client()
-            
-            # If nothing was updated
-            if not updated_fields:
-                return {
-                    "status": "warning",
-                    "message": f"No fields were updated for instance '{instance_name}'",
-                    "instance": {
-                        "name": instance.name,
-                        "provider_type": instance.provider_type,
-                        "api_base": instance.api_base
-                    }
-                }
-            
-            # Return success with updated fields
-            return {
-                "status": "success",
-                "message": f"Updated instance '{instance_name}' successfully",
-                "updated_fields": updated_fields,
-                "instance": {
-                    "name": instance.name,
-                    "provider_type": instance.provider_type,
-                    "api_base": instance.api_base,
-                    "status": instance.status
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error updating instance {instance_name}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Error updating instance: {str(e)}"
-            )
-    
     async def test_instance(self, instance_config_or_name: Union[InstanceConfig, str]) -> Dict[str, Any]:
         """
         Test an instance configuration or existing instance by name.
@@ -317,64 +288,47 @@ class InstanceService:
         if isinstance(instance_config_or_name, str):
             # We're testing an existing instance by name
             instance_name = instance_config_or_name
-            instance = instance_manager.get_instance(instance_name)
+            instance = self.instance_manager.get_instance(instance_name)
             if not instance:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Instance '{instance_name}' not found"
                 )
+            config, state = instance
         else:
             # We're testing a new instance config
-            instance_config = instance_config_or_name
+            config = instance_config_or_name
             # Basic validation
-            if not instance_config.api_key or not instance_config.api_base:
+            if not config.api_key or not config.api_base:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="API key and API base URL are required"
                 )
-            
-            # Create a temporary API instance
-            instance = APIInstance(
-                name=instance_config.name,
-                provider_type=instance_config.provider_type,
-                api_key=instance_config.api_key,
-                api_base=instance_config.api_base,
-                api_version=instance_config.api_version,
-                proxy_url=instance_config.proxy_url,
-                priority=instance_config.priority,
-                weight=instance_config.weight,
-                max_tpm=instance_config.max_tpm,
-                max_input_tokens=instance_config.max_input_tokens,
-                supported_models=instance_config.supported_models,
-                model_deployments=instance_config.model_deployments
-            )
-            
-            # Initialize the client for this instance
-            instance.initialize_client()
+            state = None
         
         # Test the connection - we'll use a simple GET request to the API base URL
         start_time = asyncio.get_event_loop().time()
         
         # Execute the test based on provider type
-        if instance.provider_type == "azure":
-            return await self._test_azure_instance(instance, start_time)
+        if config.provider_type == "azure":
+            return await self._test_azure_instance(config, state, start_time)
         else:
-            return await self._test_generic_instance(instance, start_time)
+            return await self._test_generic_instance(config, state, start_time)
     
-    async def _test_azure_instance(self, instance: APIInstance, start_time: float) -> Dict[str, Any]:
+    async def _test_azure_instance(self, config: InstanceConfig, state: Optional[InstanceState], start_time: float) -> Dict[str, Any]:
         """Test an Azure OpenAI instance by making a request to list models."""
         try:
             # Use the instance's build_url method with the /openai/models endpoint
             # This endpoint doesn't require a deployment name, so we pass an empty string
-            deployment = instance.model_deployments.get(instance.supported_models[0])
-            url = instance.build_url("/v1/chat/completions", deployment)
-            headers = {"api-key": instance.api_key}
+            deployment = config.model_deployments.get(config.supported_models[0])
+            url = f"{config.api_base}/v1/chat/completions"
+            headers = {"api-key": config.api_key}
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(url, 
                                              headers=headers, 
                                              data=json.dumps({
-                                                 "model": instance.supported_models[0], 
+                                                 "model": config.supported_models[0], 
                                                  "messages": [{"role": "user", "content": "Hello, how are you?"}]
                                                  })
                                             )
@@ -388,8 +342,8 @@ class InstanceService:
                 models = [model.get("id", "") for model in response_data.get("data", [])]
             
             # Reset error count and mark healthy if test passed
-            instance.error_count = 0
-            instance.mark_healthy()
+            if state:
+                self.mark_healthy(config.name)
             
             # Successful test
             end_time = asyncio.get_event_loop().time()
@@ -397,28 +351,30 @@ class InstanceService:
                 "status": "success",
                 "message": "Successfully connected to the instance API",
                 "response_time_ms": int((end_time - start_time) * 1000),
-                "provider_type": instance.provider_type,
-                "api_base": instance.api_base,
+                "provider_type": config.provider_type,
+                "api_base": config.api_base,
                 "models_available": len(models),
                 "models": models[:10] if len(models) > 10 else models  # Limit to 10 models to avoid large responses
             }
         except httpx.HTTPStatusError as e:
             # Mark the instance as having an error
             error_message = f"HTTP {e.response.status_code}: {str(e)}"
-            instance.mark_error(error_message)
+            if state:
+                self.record_error(config.name, "client_error", error_message)
             return self._handle_http_error(e, start_time)
         except Exception as e:
             # Mark the instance as having an error
             error_message = f"Connection error: {str(e)}"
-            instance.mark_error(error_message)
+            if state:
+                self.record_error(config.name, "upstream_error", error_message)
             return self._handle_connection_error(e, start_time)
     
-    async def _test_generic_instance(self, instance: APIInstance, start_time: float) -> Dict[str, Any]:
+    async def _test_generic_instance(self, config: InstanceConfig, state: Optional[InstanceState], start_time: float) -> Dict[str, Any]:
         """Test a generic OpenAI instance by making a request to list models."""
         try:
             # Use the instance's build_url method instead of directly constructing the URL
-            url = instance.build_url("/v1/chat/completions", "")
-            headers = {"Authorization": f"Bearer {instance.api_key}"}
+            url = f"{config.api_base}/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {config.api_key}"}
             
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, headers=headers)
@@ -432,8 +388,8 @@ class InstanceService:
                 models = [model.get("id", "") for model in response_data.get("data", [])]
             
             # Reset error count and mark healthy if test passed
-            instance.error_count = 0
-            instance.mark_healthy()
+            if state:
+                self.mark_healthy(config.name)
             
             # Successful test
             end_time = asyncio.get_event_loop().time()
@@ -441,20 +397,22 @@ class InstanceService:
                 "status": "success",
                 "message": "Successfully connected to the instance API",
                 "response_time_ms": int((end_time - start_time) * 1000),
-                "provider_type": instance.provider_type,
-                "api_base": instance.api_base,
+                "provider_type": config.provider_type,
+                "api_base": config.api_base,
                 "models": models,
                 "model_count": len(models)
             }
         except httpx.HTTPStatusError as e:
             # Mark the instance as having an error
             error_message = f"HTTP {e.response.status_code}: {str(e)}"
-            instance.mark_error(error_message)
+            if state:
+                self.record_error(config.name, "client_error", error_message)
             return self._handle_http_error(e, start_time)
         except Exception as e:
             # Mark the instance as having an error
             error_message = f"Connection error: {str(e)}"
-            instance.mark_error(error_message)
+            if state:
+                self.record_error(config.name, "upstream_error", error_message)
             return self._handle_connection_error(e, start_time)
     
     def _handle_http_error(self, e: httpx.HTTPStatusError, start_time: float) -> Dict[str, Any]:
@@ -495,22 +453,24 @@ class InstanceService:
             Status information about the removal
         """
         # Check if instance exists
-        instance = instance_manager.get_instance(instance_name)
+        instance = self.instance_manager.get_instance(instance_name)
         if not instance:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Instance '{instance_name}' not found"
             )
         
+        config, _ = instance
+        
         # Store instance details for the response before removal
         instance_details = {
-            "name": instance.name,
-            "provider_type": instance.provider_type,
-            "api_base": instance.api_base
+            "name": config.name,
+            "provider_type": config.provider_type,
+            "api_base": config.api_base
         }
         
         # Remove the instance
-        instance_manager.remove_instance(instance_name)
+        self.instance_manager.remove_instance(instance_name)
         
         logger.info(f"Removed instance '{instance_name}' at runtime")
         
@@ -546,20 +506,22 @@ class InstanceService:
         Returns:
             True if the instance can handle the model, False otherwise
         """
-        instance = instance_manager.get_instance(instance_name)
+        instance = self.instance_manager.get_instance(instance_name)
         if not instance:
             return False
             
+        config, _ = instance
+            
         # If no supported models list, assume it can handle any model
-        if not instance.supported_models:
+        if not config.supported_models:
             return True
             
         # Check for exact match
-        if model_name in instance.supported_models:
+        if model_name in config.supported_models:
             return True
             
         # Check for case-insensitive match
-        return model_name.lower() in [m.lower() for m in instance.supported_models]
+        return model_name.lower() in [m.lower() for m in config.supported_models]
     
     def get_deployment_for_model(self, instance_name: str, model_name: str) -> Optional[str]:
         """
@@ -572,17 +534,19 @@ class InstanceService:
         Returns:
             Deployment name if found, None otherwise
         """
-        instance = instance_manager.get_instance(instance_name)
-        if not instance or not instance.model_deployments:
+        instance = self.instance_manager.get_instance(instance_name)
+        if not instance:
             return None
             
+        config, _ = instance
+            
         # Check for exact match
-        if model_name in instance.model_deployments:
-            return instance.model_deployments[model_name]
+        if model_name in config.model_deployments:
+            return config.model_deployments[model_name]
             
         # Check for case-insensitive match
         model_name_lower = model_name.lower()
-        for k, v in instance.model_deployments.items():
+        for k, v in config.model_deployments.items():
             if k.lower() == model_name_lower:
                 return v
                 
@@ -602,12 +566,14 @@ class InstanceService:
         """
         try:
             # Get the instance
-            instance = instance_manager.get_instance(instance_name)
+            instance = self.instance_manager.get_instance(instance_name)
             if not instance:
                 return {
                     "status": "error",
                     "details": {"error": f"Instance '{instance_name}' not found"}
                 }
+            
+            config, _ = instance
             
             # Build a simple test payload
             payload = {
@@ -640,4 +606,4 @@ class InstanceService:
             }
 
 # Create a singleton instance
-instance_service = InstanceService() 
+instance_service = InstanceService(InstanceManager()) 

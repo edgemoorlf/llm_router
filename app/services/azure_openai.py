@@ -6,15 +6,19 @@ import random
 import time
 import httpx
 import asyncio
+import os
 
 # Import from instance context
 from app.instance.instance_context import instance_manager, instance_router
-from app.utils.model_mappings import model_mapper
 from app.utils.rate_limiter import rate_limiter
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 from app.utils.url_builder import build_instance_url
 
 logger = logging.getLogger(__name__)
+
+# Default token rate limit (tokens per minute)
+DEFAULT_TOKEN_RATE_LIMIT = 30000
+DEFAULT_MAX_INPUT_TOKENS_LIMIT = 16384
 
 class AzureOpenAIService:
     """Service for Azure OpenAI requests with streamlined endpoint methods."""
@@ -65,7 +69,7 @@ class AzureOpenAIService:
         if not azure_payload.get("stream", False) and required_tokens > 0:
             # Only apply global rate limiting if the per-instance rate limiting is not sufficient
             # This gives us a fallback mechanism while still preferring per-instance limits
-            allowed, retry_after = rate_limiter.check_and_update(required_tokens)
+            allowed, retry_after = rate_limiter.check_and_update(required_tokens, instance_id=None)
             if not allowed:
                 logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
                 raise HTTPException(
@@ -178,12 +182,14 @@ class AzureOpenAIService:
         # Filter instances by token capacity and health
         eligible_instances = []
         for instance in instances:
-            # Verify token capacity
-            instance_stats = instance.get("instance_stats", {})
-            current_tpm = instance_stats.get("current_tpm", 0)
-            max_tpm = instance.get("max_tpm", 0)
+            # Get instance-specific rate limiter
+            instance_name = instance.get("name", "unknown")
             
-            if current_tpm + tokens <= max_tpm:
+            # Get current usage from instance state
+            current_usage = instance.get("current_tpm", 0)
+            max_tpm = instance.get("max_tpm", DEFAULT_TOKEN_RATE_LIMIT)
+            
+            if current_usage + tokens <= max_tpm:
                 # Verify instance is healthy (not in error or rate limited state)
                 status = instance.get("status", "")
                 if status == "healthy":
@@ -191,9 +197,9 @@ class AzureOpenAIService:
                 
         # If we found eligible instances, select one based on the lowest load
         if eligible_instances:
-            # Choose the instance with the lowest load
+            # Choose the instance with the lowest current usage
             selected_instance = min(eligible_instances, 
-                                    key=lambda i: i.get("instance_stats", {}).get("current_tpm", 0))
+                                 key=lambda i: i.get("current_tpm", 0))
             logger.debug(f"Selected instance '{selected_instance.get('name', '')}' for model '{model_name}'")
             # Store the model used for selection to ensure consistent fallback selection
             selected_instance["_original_model_for_selection"] = model_name
@@ -237,19 +243,9 @@ class AzureOpenAIService:
             # Forward the request directly to the selected instance
             result = await self._forward_request_to_instance(instance, endpoint, payload_with_model, method)
             
-            # Mark instance as healthy and update TPM
+            # Mark instance as healthy
             instance_manager.update_instance_state(instance_name, status="healthy")
             
-            if "usage" in result and "total_tokens" in result["usage"]:
-                # Update TPM directly through the instance manager
-                current_stats = instance.get("instance_stats", {})
-                current_tpm = current_stats.get("current_tpm", 0)
-                new_tpm = current_tpm + result["usage"]["total_tokens"]
-                instance_manager.update_instance_state(
-                    instance_name,
-                    instance_stats={"current_tpm": new_tpm}
-                )
-                
             logger.debug(f"Request completed using Azure instance {instance.get('name', '')} for model {model_name}")
             return self._clean_response(result)
         except HTTPException as e:

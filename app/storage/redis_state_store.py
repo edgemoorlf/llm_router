@@ -209,10 +209,14 @@ class RedisStateStore:
             return True
         return False
         
-    def reset_states_on_startup(self):
+    def reset_states_on_startup(self, instance_names: List[str] = None):
         """
         Reset all instance states on server startup.
         Clears all existing states and starts fresh.
+        
+        Args:
+            instance_names: Optional list of instance names to initialize.
+                          If None, only clears existing states.
         """
         try:
             # Clear all keys with our prefixes
@@ -223,17 +227,18 @@ class RedisStateStore:
             
             logger.info("Cleared all existing states from Redis")
             
-            # Initialize fresh states for all configured instances
-            configs = self.instance_manager.get_all_configs()
-            for name in configs:
-                state = create_instance_state(name)
-                key = f"{self.state_prefix}{name}"
-                self.redis.set(key, json.dumps(state.dict()))
-            
-            logger.info(f"Initialized fresh states for {len(configs)} instances")
+            # Initialize fresh states for provided instances
+            if instance_names:
+                for name in instance_names:
+                    state = create_instance_state(name)
+                    key = f"{self.state_prefix}{name}"
+                    self.redis.set(key, json.dumps(state.dict()))
+                logger.info(f"Initialized fresh states for {len(instance_names)} instances")
             
         except Exception as e:
-            logger.error(f"Error resetting states on startup: {e}") 
+            logger.error(f"Error resetting states on startup: {e}")
+        
+        # Reset usage metrics and clear rate limits for all states
         for key in self.redis.keys(f"{self.state_prefix}*"):
             try:
                 data = self.redis.get(key)
@@ -254,6 +259,7 @@ class RedisStateStore:
                         state_data["status"] = "healthy" if state_data.get("error_count", 0) == 0 else "error"
                         state_data["rate_limited_until"] = None
                         
-                    self.update_state(name, **state_data)
+                    # Store updated state directly instead of using update_state
+                    self.redis.set(key, json.dumps(state_data))
             except Exception as e:
                 logger.error(f"Error resetting state for {key}: {e}") 

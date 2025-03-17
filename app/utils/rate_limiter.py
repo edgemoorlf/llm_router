@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Default token rate limit (tokens per minute)
-DEFAULT_TOKEN_RATE_LIMIT = 30000
+DEFAULT_TOKEN_RATE_LIMIT = 100000
 DEFAULT_MAX_INPUT_TOKENS_LIMIT = 16384
 
 class TokenUsage(BaseModel):
@@ -25,17 +25,25 @@ class TokenUsage(BaseModel):
 class RateLimiter(ABC):
     """Abstract base class for rate limiters."""
     
-    def __init__(self):
-        """Initialize the base rate limiter with token encoding cache."""
+    def __init__(self, instance_id: str = "global"):
+        """
+        Initialize the base rate limiter.
+        
+        Args:
+            instance_id: Unique identifier for the instance this limiter belongs to
+                        (defaults to "global" for backward compatibility)
+        """
+        self.instance_id = instance_id
         self.encoding_cache: Dict[str, tiktoken.Encoding] = {}
     
     @abstractmethod
-    def check_and_update(self, tokens: int) -> Tuple[bool, int]:
+    def check_and_update(self, tokens: int, instance_id: Optional[str] = None) -> Tuple[bool, int]:
         """
-        Check if the request can be processed and update token count.
+        Check if the request is allowed and update token count.
         
         Args:
-            tokens: Number of tokens to be used
+            tokens: Number of tokens to check/update
+            instance_id: Optional instance ID for per-instance rate limiting
             
         Returns:
             Tuple of (allowed, retry_after_seconds)
@@ -80,65 +88,78 @@ class InMemoryRateLimiter(RateLimiter):
     """In-memory implementation of rate limiter based on a sliding window."""
     
     def __init__(self, 
+                 instance_id: str = "global",
                  tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT, 
                  max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT):
         """
         Initialize the in-memory rate limiter.
         
         Args:
+            instance_id: Unique identifier for the instance
             tokens_per_minute: Token rate limit per minute
+            max_input_tokens: Maximum allowed tokens per request
         """
-        super().__init__()  # Initialize base class
+        super().__init__(instance_id)
         self.tokens_per_minute = tokens_per_minute
         self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
-        self.usage_window: Dict[int, int] = {}  # timestamp (s) -> tokens used
+        self.usage_windows: Dict[str, Dict[int, int]] = {}
         self.lock = threading.Lock()
         
-        logger.info(f"Initialized in-memory rate limiter with {tokens_per_minute} tokens per minute")
+        logger.info(f"Initialized in-memory rate limiter for instance {instance_id} "
+                   f"with {tokens_per_minute} tokens per minute")
     
-    def check_and_update(self, tokens: int) -> Tuple[bool, int]:
+    def check_and_update(self, tokens: int, instance_id: Optional[str] = None) -> Tuple[bool, int]:
         """
-        Check if the request can be processed under the rate limit.
+        Check if the request is allowed and update token count.
         
         Args:
-            tokens: Number of tokens to be used
+            tokens: Number of tokens to check/update
+            instance_id: Optional instance ID for per-instance rate limiting
             
         Returns:
             Tuple of (allowed, retry_after_seconds)
         """
-        # Validate against maximum allowed tokens per request
-        if tokens > self.max_input_tokens:
-            logger.warning(f"Request exceeds maximum allowed tokens: {tokens} > {self.max_input_tokens}")
-            return (False, 0)
-
-        with self.lock:
-            current_time = int(time.time())
-            cutoff_time = current_time - self.window_seconds
+        if self.max_input_tokens > 0 and tokens > self.max_input_tokens:
+            logger.warning(f"Request exceeds maximum allowed tokens for instance {self.instance_id}: "
+                         f"{tokens} > {self.max_input_tokens}")
+            return False, 60
             
-            # Clean up old entries
-            self.usage_window = {ts: tokens for ts, tokens in self.usage_window.items() if ts >= cutoff_time}
+        current_time = int(time.time())
+        window_key = instance_id or self.instance_id
+        
+        # Initialize window for this instance if not exists
+        if window_key not in self.usage_windows:
+            self.usage_windows[window_key] = {}
             
-            # Calculate current token usage in the window
-            current_usage = sum(self.usage_window.values())
+        window = self.usage_windows[window_key]
+        
+        # Remove entries older than 1 minute
+        cutoff = current_time - 60
+        window = {ts: count for ts, count in window.items() if ts > cutoff}
+        self.usage_windows[window_key] = window
+        
+        # Calculate current token usage
+        current_usage = sum(window.values())
+        
+        # Check if adding these tokens would exceed the limit
+        if current_usage + tokens > self.tokens_per_minute:
+            # Find the oldest timestamp that's still counted
+            oldest = min(window.keys()) if window else current_time
+            retry_after = oldest - cutoff
+            logger.warning(f"Rate limit exceeded for instance {self.instance_id}: "
+                         f"{current_usage}/{self.tokens_per_minute} tokens used. "
+                         f"Retry after {retry_after} seconds")
+            return False, max(1, retry_after)
             
-            # Check if adding these tokens would exceed the limit
-            if current_usage + tokens > self.tokens_per_minute:
-                # Calculate when tokens will be available
-                oldest_timestamp = min(self.usage_window.keys()) if self.usage_window else current_time
-                seconds_until_reset = oldest_timestamp + self.window_seconds - current_time
-                logger.warning(f"Rate limit exceeded: {current_usage}/{self.tokens_per_minute} tokens used. "
-                              f"Retry after {seconds_until_reset} seconds")
-                return False, seconds_until_reset
-            
-            # Update usage window
-            self.usage_window[current_time] = self.usage_window.get(current_time, 0) + tokens
-            return True, 0
+        # Update the window with the new tokens
+        window[current_time] = window.get(current_time, 0) + tokens
+        return True, 0
     
     def reset(self) -> None:
         """Reset the rate limiter."""
         with self.lock:
-            self.usage_window.clear()
+            self.usage_windows.clear()
 
 
 class RedisRateLimiter(RateLimiter):
@@ -146,6 +167,7 @@ class RedisRateLimiter(RateLimiter):
     
     def __init__(
         self, 
+        instance_id: str = "global",
         tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
         redis_url: str = "redis://localhost:6379",
         redis_password: str = "",
@@ -155,65 +177,104 @@ class RedisRateLimiter(RateLimiter):
         Initialize the Redis rate limiter.
         
         Args:
+            instance_id: Unique identifier for the instance
             tokens_per_minute: Token rate limit per minute
             redis_url: URL for Redis connection
+            redis_password: Redis password
             max_input_tokens: Maximum allowed tokens per request
         """
-        super().__init__()  # Initialize base class
+        super().__init__(instance_id)
         self.tokens_per_minute = tokens_per_minute
         self.max_input_tokens = max_input_tokens
         self.window_seconds = 60  # 1 minute window
-        self.redis_key_prefix = "azure_openai_proxy:rate_limit"
+        self.redis_key_prefix = f"azure_openai_proxy:rate_limit:{instance_id}"
         self.redis = redis.from_url(url=redis_url, password=redis_password)
         
-        logger.info(f"Initialized Redis rate limiter with {tokens_per_minute} tokens per minute")
+        logger.info(f"Initialized Redis rate limiter for instance {instance_id} "
+                   f"with {tokens_per_minute} tokens per minute")
     
-    def check_and_update(self, tokens: int) -> Tuple[bool, int]:
+    def get_current_usage(self, instance_id: Optional[str] = None) -> int:
         """
-        Check if the request can be processed under the rate limit.
+        Get current token usage for the instance.
         
         Args:
-            tokens: Number of tokens to be used
+            instance_id: Optional instance ID (defaults to self.instance_id)
+            
+        Returns:
+            Current token usage in the window
+        """
+        window_key = f"{self.redis_key_prefix}:window"
+        try:
+            with self.redis.pipeline() as pipe:
+                # Remove entries older than 1 minute
+                cutoff = int(time.time()) - 60
+                pipe.zremrangebyscore(window_key, "-inf", cutoff)
+                
+                # Get current usage
+                pipe.zrange(window_key, 0, -1, withscores=True)
+                
+                # Execute commands
+                _, entries = pipe.execute()
+                
+                # Calculate current token usage
+                return sum(int(count) for count, _ in entries)
+        except redis.RedisError as e:
+            logger.error(f"Redis error getting usage: {e}")
+            return 0
+    
+    def check_and_update(self, tokens: int, instance_id: Optional[str] = None) -> Tuple[bool, int]:
+        """
+        Check if the request is allowed and update token count.
+        
+        Args:
+            tokens: Number of tokens to check/update
+            instance_id: Optional instance ID for per-instance rate limiting
             
         Returns:
             Tuple of (allowed, retry_after_seconds)
         """
-        # Validate against configured maximum allowed tokens
-        if tokens > self.max_input_tokens:
-            logger.warning(f"Request exceeds maximum allowed tokens: {tokens} > {self.max_input_tokens}")
-            return (False, 0)
-
+        if self.max_input_tokens > 0 and tokens > self.max_input_tokens:
+            logger.warning(f"Request exceeds maximum allowed tokens for instance {self.instance_id}: "
+                         f"{tokens} > {self.max_input_tokens}")
+            return False, 60
+            
         current_time = int(time.time())
-        cutoff_time = current_time - self.window_seconds
         window_key = f"{self.redis_key_prefix}:window"
         
-        # Execute in a pipeline for atomicity
-        with self.redis.pipeline() as pipe:
-            # Clean up old entries and calculate current usage
-            pipe.zremrangebyscore(window_key, 0, cutoff_time)
-            pipe.zrange(window_key, 0, -1, withscores=True)
-            _, window_data = pipe.execute()
-            
-            # Sum up current token usage
-            current_usage = sum(int(item[0]) for item in window_data)
-            
-            # Check if adding these tokens would exceed the limit
-            if current_usage + tokens > self.tokens_per_minute:
-                if window_data:
-                    oldest_timestamp = min(int(score) for _, score in window_data)
-                    seconds_until_reset = oldest_timestamp + self.window_seconds - current_time
-                else:
-                    seconds_until_reset = 0
+        try:
+            with self.redis.pipeline() as pipe:
+                # Remove entries older than 1 minute
+                cutoff = current_time - 60
+                pipe.zremrangebyscore(window_key, "-inf", cutoff)
+                
+                # Get current usage
+                pipe.zrange(window_key, 0, -1, withscores=True)
+                
+                # Execute commands
+                _, entries = pipe.execute()
+                
+                # Calculate current token usage
+                current_usage = sum(int(count) for count, _ in entries)
+                
+                # Check if adding these tokens would exceed the limit
+                if current_usage + tokens > self.tokens_per_minute:
+                    # Find the oldest timestamp that's still counted
+                    oldest = min((ts for _, ts in entries), default=current_time)
+                    retry_after = oldest - cutoff
+                    logger.warning(f"Rate limit exceeded for instance {self.instance_id}: "
+                                 f"{current_usage}/{self.tokens_per_minute} tokens used. "
+                                 f"Retry after {retry_after} seconds")
+                    return False, max(1, retry_after)
                     
-                logger.warning(f"Rate limit exceeded: {current_usage}/{self.tokens_per_minute} tokens used. "
-                              f"Retry after {seconds_until_reset} seconds")
-                return False, max(1, seconds_until_reset)
-            
-            # Update usage window
-            self.redis.zadd(window_key, {str(tokens): current_time})
-            # Set expiry on the sorted set to auto-cleanup
-            self.redis.expire(window_key, self.window_seconds * 2)
-            
+                # Update the window with the new tokens
+                self.redis.zadd(window_key, {str(tokens): current_time})
+                self.redis.expire(window_key, self.window_seconds * 2)
+                
+                return True, 0
+                
+        except redis.RedisError as e:
+            logger.error(f"Redis error in rate limiter: {e}")
+            # Fail open if Redis is unavailable
             return True, 0
     
     def reset(self) -> None:
@@ -223,29 +284,45 @@ class RedisRateLimiter(RateLimiter):
 
 
 def get_rate_limiter(
+    instance_id: str = "global",
     tokens_per_minute: int = DEFAULT_TOKEN_RATE_LIMIT,
     use_redis: bool = False,
     redis_url: str = "redis://localhost:6379",
     redis_password: str = "",
     max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS_LIMIT
 ) -> RateLimiter:
-    """Factory function to create a rate limiter with specified configuration."""
+    """
+    Factory function to create a rate limiter for a specific instance.
+    
+    Args:
+        instance_id: Unique identifier for the instance (defaults to "global" for backward compatibility)
+        tokens_per_minute: Token rate limit per minute
+        use_redis: Whether to use Redis-based rate limiter
+        redis_url: URL for Redis connection
+        redis_password: Redis password
+        max_input_tokens: Maximum allowed tokens per request
+        
+    Returns:
+        Configured rate limiter instance
+    """
     if use_redis:
-        logger.info(f"Using Redis rate limiter with URL: {redis_url} and token per minute: {tokens_per_minute}")
+        logger.info(f"Using Redis rate limiter for instance {instance_id}")
         return RedisRateLimiter(
+            instance_id=instance_id,
             tokens_per_minute=tokens_per_minute,
             redis_url=redis_url,
             redis_password=redis_password,
             max_input_tokens=max_input_tokens
         )
     return InMemoryRateLimiter(
+        instance_id=instance_id,
         tokens_per_minute=tokens_per_minute,
         max_input_tokens=max_input_tokens
     )
 
-# Create a default rate limiter instance
-# This is used by other modules that import it directly
+# Create a default global rate limiter instance for backward compatibility
 rate_limiter = get_rate_limiter(
+    instance_id="global",
     tokens_per_minute=int(os.environ.get("TOKEN_RATE_LIMIT", DEFAULT_TOKEN_RATE_LIMIT)),
     use_redis=os.environ.get("USE_REDIS", "").lower() in ("true", "1", "yes"),
     redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),

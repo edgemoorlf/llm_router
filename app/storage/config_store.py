@@ -151,18 +151,20 @@ class ConfigStore:
     def _load_from_yaml(self):
         """Load initial configurations from YAML if JSON file is empty or missing."""
         try:
-            from app.config.config_hierarchy import config_hierarchy
-            yaml_config = config_hierarchy.get_configuration()
+            from app.config import config_loader
             
-            if yaml_config and 'instances' in yaml_config:
-                for name, instance_data in yaml_config['instances'].items():
+            # Load configuration directly from YAML
+            config = config_loader.load_config()
+            
+            if hasattr(config, 'instances'):
+                for instance_config in config.instances:
                     try:
-                        # Ensure name is in the data
-                        instance_data['name'] = name
+                        # Convert instance config to dictionary
+                        instance_data = instance_config.dict()
                         config = InstanceConfig(**instance_data)
-                        self.configs[name] = config
+                        self.configs[instance_config.name] = config
                     except Exception as e:
-                        logger.error(f"Error loading instance {name} from YAML: {e}")
+                        logger.error(f"Error loading instance {instance_config.name} from YAML: {e}")
                 
                 # If we loaded configs from YAML, save them to JSON for persistence
                 if self.configs:

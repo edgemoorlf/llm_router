@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query, HTTPException, status, Request, Background
 from fastapi.responses import JSONResponse
 
 from app.instance.service_stats import service_stats
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 from app.services.azure_openai import azure_openai_service
 from app.services.generic_openai import generic_openai_service
 from app.instance.monitor import InstanceMonitor

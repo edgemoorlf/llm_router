@@ -4,19 +4,15 @@ import logging
 from typing import Any, Tuple, Dict, Optional
 import uuid
 import time
-import traceback
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Body, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 # Import instance_manager and instance_router from the context module
-from app.instance.instance_context import instance_manager, instance_router
+from app.instance.instance_context import instance_manager
 from app.services.azure_openai import azure_openai_service
 from app.services.generic_openai import generic_openai_service
 from app.utils.streaming import handle_streaming_request
 from app.errors.utils import handle_router_errors
-from app.instance.service_stats import service_stats
 
 logger = logging.getLogger(__name__)
 

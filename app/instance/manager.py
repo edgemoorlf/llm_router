@@ -1,593 +1,504 @@
-"""Instance manager for multiple OpenAI-compatible service instances."""
-import os
+"""
+New instance manager implementation with separated config and state.
+
+This module provides a new implementation of the InstanceManager class
+that uses the separated configuration and state architecture.
+"""
+
 import logging
-from typing import Dict, List, Optional, Tuple, Any, Union
-import threading
-import uuid
 import time
-import traceback
+from typing import Dict, List, Optional, Any, Union
+
+from app.models.instance import InstanceConfig, InstanceState, create_instance_state
+from app.storage.config_store import ConfigStore
+from app.storage.redis_state_store import RedisStateStore
 
 logger = logging.getLogger(__name__)
 
-from .routing_strategy import RoutingStrategy
-from .api_instance import APIInstance
-from .router import InstanceRouter
-from .forwarder import RequestForwarder
-from .monitor import InstanceMonitor
-from .state_manager import StateManager, create_state_manager
-
-# Import the configuration system
-from app.config import config_loader
-from app.config.config_hierarchy import config_hierarchy
-
 class InstanceManager:
     """
-    Manages OpenAI-compatible API instances.
+    Manages OpenAI-compatible API instances with separated config and state.
     
     This class handles the loading, tracking, and selection of API instances
-    for forwarding requests to OpenAI-compatible APIs. Instances can be loaded from:
-    
-    1. SQLite database (highest priority)
-    2. State files (temporary persistence)
-    3. YAML configuration files in app/config/instances/
-    4. Default values (lowest priority)
-    
-    The manager also tracks instance health, usage statistics, and handles
-    the selection of the appropriate instance for a request based on the
-    current routing strategy.
+    for forwarding requests to OpenAI-compatible APIs. It maintains a clear
+    separation between configuration (defined by operators) and state (derived
+    from runtime operation).
     """
     
-    def __init__(self, routing_strategy: Optional[RoutingStrategy] = None, state_manager: Optional[StateManager] = None):
+    def __init__(self, 
+                config_file: str = "instance_configs.json",
+                redis_url: str = "redis://localhost:6379/0",
+                rpm_window_minutes: int = 5):
         """
         Initialize the instance manager.
         
         Args:
-            routing_strategy: Strategy for selecting instances
-            state_manager: StateManager for persisting instance state
+            config_file: Path to the configuration file
+            redis_url: Redis connection URL for state storage
+            rpm_window_minutes: Time window in minutes for statistics calculation
         """
-        self.instances: Dict[str, APIInstance] = {}
-        self.instances_lock = threading.RLock()  # Lock for thread-safe access to instances
+        # Initialize stores
+        self.config_store = ConfigStore(config_file)
+        self.state_store = RedisStateStore(redis_url=redis_url)
+        self.rpm_window_minutes = rpm_window_minutes
+        
+        # Initialize states for all configs
+        self._initialize_states()
+        
         self.router = None  # Will be initialized later
-        self.forwarder = RequestForwarder()
-        self.monitor = InstanceMonitor()
         
-        # Create worker ID and initialize last state check time
-        self.worker_id = str(uuid.uuid4())
-        self.last_state_check = 0
+        # Reset transient states on startup
+        self.state_store.reset_states_on_startup()
         
-        # Initialize state manager (use SQLite-based by default)
-        self.state_manager = state_manager or create_state_manager("sqlite")
+    def _initialize_states(self):
+        """Initialize states for all configured instances."""
+        configs = self.config_store.get_all_configs()
+        if configs:
+            logger.info(f"Initializing states for {len(configs)} instances")
+            # Get list of instance names
+            instance_names = list(configs.keys())
+            # Reset states and initialize new ones
+            self.state_store.reset_states_on_startup(instance_names)
+            # Initialize states for each instance
+            for name in instance_names:
+                if not self.state_store.get_state(name):
+                    state = create_instance_state(name)
+                    self.state_store.update_state(name, **state.dict())
         
-        try:
-            # Load configuration using the config hierarchy
-            config = config_hierarchy.get_configuration()
-            
-            # Use routing strategy from config if not provided
-            if routing_strategy is None and 'routing' in config and 'strategy' in config['routing']:
-                routing_strategy = RoutingStrategy(config['routing']['strategy'])
-        except Exception as e:
-            logger.error(f"Error loading configuration: {str(e)}")
-            # Fall back to default routing strategy
-            if routing_strategy is None:
-                routing_strategy = RoutingStrategy.FAILOVER
-            config = None
-            
-        # Initialize router now that we have the routing strategy
-        self.router = InstanceRouter(routing_strategy)
+    def reload_config(self):
+        """Reload configurations from storage and YAML."""
+        # First try to reload from JSON storage
+        self.config_store = ConfigStore(self.config_store.config_file)
         
-        # First try to load state from the state manager (highest priority)
-        if self._load_state():
-            logger.info(f"Loaded instance state from state manager: {len(self.instances)} instances")
-        else:
-            # Load instances from configuration hierarchy
-            try:
-                if config and 'instances' in config:
-                    self._load_instances_from_hierarchy(config['instances'])
-                else:
-                    logger.warning("No valid configuration found or no instances defined in config")
-            except Exception as e:
-                logger.error(f"Error loading instances from config: {str(e)}")
-            
-            # If no instances found, provide a clear error
-            if not self.instances:
-                logger.error("No API instances found in configuration hierarchy. The application requires at least one instance defined.")
-                self.instances = {}
-            
-            # Set RPM window for all instances
-            try:
-                if config and 'monitoring' in config and 'stats_window_minutes' in config['monitoring'] and config['monitoring']['stats_window_minutes'] > 0:
-                    self.set_rpm_window_for_all(config['monitoring']['stats_window_minutes'])
-            except Exception as e:
-                logger.error(f"Error setting RPM window: {str(e)}")
-            
-            # Save initial state
-            self._save_state()
+        # If no configs loaded, try YAML
+        if not self.config_store.get_all_configs():
+            self.config_store._load_from_yaml()
         
-        logger.info(f"Initialized {len(self.instances)} API instances with {routing_strategy} routing strategy")
-    
-    def _load_instances_from_hierarchy(self, instances_config: Dict[str, Dict[str, Any]]) -> None:
-        """
-        Load instances from configuration hierarchy.
+        # Make sure all configured instances have a state
+        self._initialize_states()
         
-        Args:
-            instances_config: Dictionary of instance configurations
-        """
-        for name, config in instances_config.items():
-            try:
-                # Convert dictionary config to APIInstance
-                instance = APIInstance(
-                    name=name,
-                    provider_type=config.get('provider_type', 'generic'),
-                    api_key=config.get('api_key', ''),
-                    api_base=config.get('api_base', ''),
-                    api_version=config.get('api_version', '2023-05-15'),
-                    proxy_url=config.get('proxy_url'),
-                    priority=config.get('priority', 100),
-                    weight=config.get('weight', 100),
-                    max_tpm=config.get('max_tpm', 240000),
-                    max_input_tokens=config.get('max_input_tokens', 0),
-                    supported_models=config.get('supported_models', []),
-                    model_deployments=config.get('model_deployments', {})
-                )
-                instance.initialize_client()
-                self.instances[name] = instance
-                
-                # Get instance source information for logging
-                source_info = config_hierarchy.get_instance_source(name)
-                sources = source_info.get('sources', {})
-                source_list = [f"{key}: {source}" for key, source in sources.items()]
-                
-                logger.info(f"Loaded API instance {name} from configuration hierarchy")
-                logger.debug(f"Instance {name} configuration sources: {', '.join(source_list)}")
-            except Exception as e:
-                logger.error(f"Error loading instance {name} from configuration: {str(e)}")
-    
-    def _load_state(self) -> bool:
-        """
-        Load instance state from the state manager.
-        
-        Returns:
-            True if state was loaded successfully, False otherwise
-        """
-        try:
-            state = self.state_manager.load_state()
-            if not state or 'instances' not in state:
-                return False
-                
-            with self.instances_lock:
-                # Clear existing instances
-                self.instances.clear()
-                
-                # Load instances from state
-                for instance_data in state.get('instances', []):
-                    try:
-                        instance = APIInstance(
-                            name=instance_data['name'],
-                            provider_type=instance_data['provider_type'],
-                            api_key=instance_data['api_key'],
-                            api_base=instance_data['api_base'],
-                            api_version=instance_data.get('api_version', '2023-05-15'),
-                            proxy_url=instance_data.get('proxy_url'),
-                            priority=instance_data.get('priority', 100),
-                            weight=instance_data.get('weight', 100),
-                            max_tpm=instance_data.get('max_tpm', 240000),
-                            max_input_tokens=instance_data.get('max_input_tokens', 0),
-                            supported_models=instance_data.get('supported_models', []),
-                            model_deployments=instance_data.get('model_deployments', {})
-                        )
-                        instance.initialize_client()
-                        
-                        # Load stats if available
-                        if 'stats' in instance_data:
-                            instance.error_count = instance_data['stats'].get('error_count', 0)
-                            instance.last_error = instance_data['stats'].get('last_error')
-                            instance.rate_limited_until = instance_data['stats'].get('rate_limited_until')
-                            
-                        self.instances[instance_data['name']] = instance
-                    except Exception as e:
-                        logger.error(f"Error loading instance {instance_data.get('name', 'unknown')} from state: {str(e)}")
-                
-            # Update the database source in configuration hierarchy
-            config_hierarchy.sources['database'].timestamp = time.time()
-            
-            return True
-        except Exception as e:
-            logger.error(f"Error loading state: {str(e)}")
-            return False
-    
-    def _save_state(self) -> bool:
-        """
-        Save instance state using the state manager.
-        
-        Returns:
-            True if state was saved successfully, False otherwise
-        """
-        try:
-            instances_data = []
-            
-            with self.instances_lock:
-                for name, instance in self.instances.items():
-                    instance_data = {
-                        'name': instance.name,
-                        'provider_type': instance.provider_type,
-                        'api_key': instance.api_key,
-                        'api_base': instance.api_base,
-                        'api_version': instance.api_version,
-                        'proxy_url': instance.proxy_url,
-                        'priority': instance.priority,
-                        'weight': instance.weight,
-                        'max_tpm': instance.max_tpm,
-                        'max_input_tokens': instance.max_input_tokens,
-                        'supported_models': instance.supported_models,
-                        'model_deployments': instance.model_deployments,
-                        'stats': {
-                            'error_count': instance.error_count,
-                            'last_error': instance.last_error,
-                            'rate_limited_until': instance.rate_limited_until,
-                        }
-                    }
-                    instances_data.append(instance_data)
-            
-            return self.state_manager.save_state(instances_data, self.worker_id)
-        except Exception as e:
-            logger.error(f"Error saving state: {str(e)}")
-            return False
-    
-    def reload_config(self) -> None:
-        """Reload configuration from disk and update instances."""
-        try:
-            # Reload configuration using the config hierarchy
-            config = config_hierarchy.get_configuration()
-            if not config or 'instances' not in config:
-                logger.error("Failed to reload configuration")
-                return
-                
-            # Clear existing instances
-            with self.instances_lock:
-                self.instances.clear()
-            
-            # Load instances from configuration hierarchy
-            if 'instances' in config and config['instances']:
-                self._load_instances_from_hierarchy(config['instances'])
-            else:
-                logger.warning("No instances defined in reloaded configuration")
-            
-            # If no instances found, provide a clear error
-            if not self.instances:
-                logger.error("No API instances found in configuration. The application requires at least one instance defined.")
-                self.instances = {}
-            
-            # Update routing strategy
-            try:
-                if 'routing' in config and 'strategy' in config['routing']:
-                    self.router.strategy = RoutingStrategy(config['routing']['strategy'])
-            except Exception as e:
-                logger.error(f"Error updating routing strategy: {str(e)}")
-            
-            # Set RPM window for all instances
-            try:
-                if 'monitoring' in config and 'stats_window_minutes' in config['monitoring'] and config['monitoring']['stats_window_minutes'] > 0:
-                    self.set_rpm_window_for_all(config['monitoring']['stats_window_minutes'])
-            except Exception as e:
-                logger.error(f"Error setting RPM window: {str(e)}")
-            
-            # Save state after reloading config
-            self._save_state()
-            
-            logger.info(f"Reloaded configuration with {len(self.instances)} instances")
-        except Exception as e:
-            logger.error(f"Error reloading configuration: {str(e)}")
-            raise
-    
-    def check_for_updates(self) -> bool:
-        """
-        Check for updates from other workers.
-        
-        Returns:
-            True if updates were loaded, False otherwise
-        """
-        has_updates, current_time = self.state_manager.check_for_updates(self.last_state_check)
-        
-        # Update last check time
-        self.last_state_check = current_time
-        
-        # If updates are available, reload state
-        if has_updates:
-            return self._load_state()
-            
-        return False
-
-    def add_instance(self, name: str, instance: APIInstance) -> None:
-        """
-        Add an instance to the manager.
-        
-        Args:
-            name: Name of the instance
-            instance: The APIInstance object
-        """
-        with self.instances_lock:
-            self.instances[name] = instance
-            # Save state after modifying instances
-            self._save_state()
-            
-    def remove_instance(self, name: str) -> bool:
-        """
-        Remove an instance from the manager.
-        
-        Args:
-            name: Name of the instance to remove
-            
-        Returns:
-            True if the instance was removed, False if it was not found
-        """
-        with self.instances_lock:
-            if name in self.instances:
-                del self.instances[name]
-                # Save state after modifying instances
-                self._save_state()
-                return True
-            return False
-    
-    def has_instance(self, name: str) -> bool:
-        """
-        Check if an instance exists in the manager.
-        
-        Args:
-            name: Name of the instance to check
-            
-        Returns:
-            True if the instance exists, False otherwise
-        """
-        with self.instances_lock:
-            return name in self.instances
-    
-    def get_instance(self, name: str) -> Optional[APIInstance]:
+    def get_instance(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Get an instance by name.
         
         Args:
-            name: Name of the instance to get
+            name: Name of the instance
             
         Returns:
-            The instance if it exists, None otherwise
+            Combined instance data or None if not found
         """
-        with self.instances_lock:
-            return self.instances.get(name)
-    
-    def get_all_instances(self) -> Dict[str, APIInstance]:
+        config = self.config_store.get_config(name)
+        if not config:
+            return None
+            
+        state = self.state_store.get_state(name)
+        if not state:
+            return config.dict()
+            
+        # Combine config and state, preferring config values
+        result = config.dict()
+        for k, v in state.dict().items():
+            if k != 'name':  # Skip name to avoid duplication
+                result[k] = v
+        return result
+        
+    def get_all_instances(self) -> Dict[str, Dict[str, Any]]:
         """
         Get all instances.
         
         Returns:
-            Dictionary of instance name to APIInstance
+            Dictionary of instance name to combined properties
         """
-        with self.instances_lock:
-            # Return a copy to avoid external modifications
-            return dict(self.instances)
-
-    def select_instance(self, required_tokens: int, model_name: Optional[str] = None) -> Optional[APIInstance]:
+        result = {}
+        configs = self.config_store.get_all_configs()
+        states = self.state_store.get_all_states()
+        
+        for name, config in configs.items():
+            result[name] = config.dict()
+            if name in states:
+                state = states[name]
+                for k, v in state.dict().items():
+                    if k != 'name':  # Skip name to avoid duplication
+                        result[name][k] = v
+                        
+        return result
+        
+    def get_instance_stats(self) -> Dict[str, Any]:
         """
-        Select an instance based on the router strategy.
+        Get statistics for all instances.
+        
+        Returns:
+            Dictionary with instance statistics
+        """
+        states = self.state_store.get_all_states()
+        
+        # Filter to only include instances that have configuration
+        configs = self.config_store.get_all_configs()
+        instance_stats = [
+            state.dict() for name, state in states.items()
+            if name in configs
+        ]
+        
+        return {
+            "status": "success",
+            "timestamp": int(time.time()),
+            "instances": instance_stats,
+            "count": len(instance_stats)
+        }
+        
+    def update_instance_state(self, name: str, **kwargs) -> bool:
+        """
+        Update state for a specific instance.
         
         Args:
-            required_tokens: Estimated number of tokens required
-            model_name: Optional model name to filter instances
+            name: Name of the instance
+            **kwargs: State properties to update
             
         Returns:
-            Selected instance or None if no suitable instance is available
+            True if successful, False otherwise
         """
-        if not self.instances:
-            logger.error("No instances available for selection")
+        # Check if the instance exists in config
+        if not self.config_store.get_config(name):
+            logger.warning(f"Cannot update state for non-existent instance: {name}")
+            return False
+            
+        try:
+            self.state_store.update_state(name, **kwargs)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating state for {name}: {e}")
+            return False
+            
+    def clear_instance_error(self, name: str) -> bool:
+        """
+        Clear error state for an instance.
+        
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        return self.state_store.clear_error_state(name)
+        
+    def record_request(self, name: str, success: bool, tokens: int = 0,
+                      latency_ms: Optional[float] = None,
+                      error: Optional[str] = None,
+                      status_code: Optional[int] = None) -> bool:
+        """
+        Record a request to update instance metrics.
+        
+        Args:
+            name: Name of the instance
+            success: Whether the request was successful
+            tokens: Number of tokens processed
+            latency_ms: Request latency in milliseconds
+            error: Error message if request failed
+            status_code: HTTP status code if request failed
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.state_store.record_request(
+                name=name,
+                success=success,
+                tokens=tokens,
+                latency_ms=latency_ms,
+                error=error,
+                status_code=status_code
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error recording request for {name}: {e}")
+            return False
+
+    def get_all_configs(self) -> Dict[str, InstanceConfig]:
+        """
+        Get all instance configurations.
+        
+        Returns:
+            Dictionary of instance name to configuration
+        """
+        return self.config_store.get_all_configs()
+
+    def get_instance_config(self, name: str) -> Optional[InstanceConfig]:
+        """
+        Get configuration for a specific instance.
+        
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            The instance configuration or None if not found
+        """
+        return self.config_store.get_config(name)
+
+    def get_instance_state(self, name: str) -> Optional[InstanceState]:
+        """
+        Get current state for a specific instance.
+        
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            The instance state or None if not found
+        """
+        return self.state_store.get_state(name)
+
+    def get_all_states(self) -> Dict[str, InstanceState]:
+        """
+        Get all instance states.
+        
+        Returns:
+            Dictionary of instance name to state
+        """
+        return self.state_store.get_all_states()
+
+    def update_tpm_usage(self, name: str, tokens: int) -> None:
+        """Update the tokens per minute usage for an instance."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        current_time = int(time.time())
+        window_start = current_time - 60
+        state.usage_window = {ts: usage for ts, usage in state.usage_window.items() if ts >= window_start}
+        state.usage_window[current_time] = state.usage_window.get(current_time, 0) + tokens
+        state.current_tpm = sum(state.usage_window.values())
+        state.total_tokens_served += tokens
+        
+        self.state_store.update_state(name, **state.dict())
+    
+    def update_rpm_usage(self, name: str) -> None:
+        """Update the requests per minute counter for an instance."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        current_time = int(time.time())
+        window_seconds = self.rpm_window_minutes * 60
+        window_start = current_time - window_seconds
+        
+        # Update sliding window
+        state.request_window = {ts: count for ts, count in state.request_window.items() if ts >= window_start}
+        state.request_window[current_time] = state.request_window.get(current_time, 0) + 1
+        
+        # Calculate RPM
+        total_requests_in_window = sum(state.request_window.values())
+        if self.rpm_window_minutes > 0:
+            state.current_rpm = int(total_requests_in_window / self.rpm_window_minutes)
+        else:
+            state.current_rpm = total_requests_in_window
+            
+        self.state_store.update_state(name, **state.dict())
+        self.update_error_rates(name)
+    
+    def update_error_rates(self, name: str) -> None:
+        """Update error rates based on the time window."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        current_time = int(time.time())
+        window_seconds = self.rpm_window_minutes * 60
+        window_start = current_time - window_seconds
+        
+        # Calculate request count in the window
+        total_requests_in_window = sum(state.request_window.values())
+        
+        # Clean up old entries in error windows
+        state.error_500_window = {ts: count for ts, count in state.error_500_window.items() if ts >= window_start}
+        state.error_503_window = {ts: count for ts, count in state.error_503_window.items() if ts >= window_start}
+        state.error_other_window = {ts: count for ts, count in state.error_other_window.items() if ts >= window_start}
+        
+        # Calculate error counts in the window
+        errors_500_in_window = sum(state.error_500_window.values())
+        errors_503_in_window = sum(state.error_503_window.values())
+        errors_other_in_window = sum(state.error_other_window.values())
+        total_errors_in_window = errors_500_in_window + errors_503_in_window + errors_other_in_window
+        
+        # Update error rates
+        if total_requests_in_window > 0:
+            state.current_error_rate = round(total_errors_in_window / total_requests_in_window, 4)
+            state.current_500_rate = round(errors_500_in_window / total_requests_in_window, 4)
+            state.current_503_rate = round(errors_503_in_window / total_requests_in_window, 4)
+        else:
+            state.current_error_rate = 0.0
+            state.current_500_rate = 0.0
+            state.current_503_rate = 0.0
+            
+        self.state_store.update_state(name, **state.dict())
+    
+    def record_error(self, name: str, status_code: int) -> None:
+        """Record an instance-level error."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        current_time = int(time.time())
+        
+        if status_code == 500:
+            state.total_errors_500 += 1
+            state.error_500_window[current_time] = state.error_500_window.get(current_time, 0) + 1
+        elif status_code == 503:
+            state.total_errors_503 += 1
+            state.error_503_window[current_time] = state.error_503_window.get(current_time, 0) + 1
+        else:
+            state.total_other_errors += 1
+            state.error_other_window[current_time] = state.error_other_window.get(current_time, 0) + 1
+            
+        self.state_store.update_state(name, **state.dict())
+        self.update_error_rates(name)
+        
+        logger.debug(f"Recorded instance-level error {status_code} for instance {name}, "
+                    f"current error rate: {state.current_error_rate:.2%}")
+    
+    def record_client_error(self, name: str, status_code: int, timestamp: Optional[int] = None) -> None:
+        """Record a client-level error."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        if timestamp is None:
+            timestamp = int(time.time())
+            
+        if status_code == 500:
+            state.total_client_errors_500 += 1
+            state.client_error_500_window[timestamp] = state.client_error_500_window.get(timestamp, 0) + 1
+        elif status_code == 503:
+            state.total_client_errors_503 += 1
+            state.client_error_503_window[timestamp] = state.client_error_503_window.get(timestamp, 0) + 1
+        else:
+            state.total_client_errors_other += 1
+            state.client_error_other_window[timestamp] = state.client_error_other_window.get(timestamp, 0) + 1
+            
+        self.state_store.update_state(name, **state.dict())
+        self.update_error_rates(name)
+        
+        logger.debug(f"Recorded client-level error {status_code} for instance {name}, "
+                    f"current client error rate: {state.current_client_error_rate:.2%}")
+    
+    def record_upstream_error(self, name: str, status_code: int) -> None:
+        """Record an upstream error."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        current_time = int(time.time())
+        
+        if status_code == 429:
+            state.total_upstream_429_errors += 1
+            state.upstream_429_window[current_time] = state.upstream_429_window.get(current_time, 0) + 1
+        elif status_code == 400:
+            state.total_upstream_400_errors += 1
+            state.upstream_400_window[current_time] = state.upstream_400_window.get(current_time, 0) + 1
+        elif status_code == 500:
+            state.total_upstream_500_errors += 1
+            state.upstream_500_window[current_time] = state.upstream_500_window.get(current_time, 0) + 1
+        else:
+            state.total_upstream_other_errors += 1
+            state.upstream_other_window[current_time] = state.upstream_other_window.get(current_time, 0) + 1
+            
+        self.state_store.update_state(name, **state.dict())
+        self.update_error_rates(name)
+        
+        logger.debug(f"Recorded upstream error {status_code} for instance {name}, "
+                    f"current upstream error rate: {state.current_upstream_error_rate:.2%}")
+    
+    def is_rate_limited(self, name: str) -> bool:
+        """Check if an instance is currently rate limited."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return True
+            
+        # Check explicit rate limit status
+        if state.status == "rate_limited":
+            current_time = time.time()
+            if state.rate_limited_until and current_time >= state.rate_limited_until:
+                logger.info(f"Instance {name} rate limit has expired, marking as healthy")
+                state.status = "healthy"
+                state.rate_limited_until = None
+                self.state_store.update_state(name, **state.dict())
+                return False
+            return True
+            
+        # Check TPM-based rate limiting
+        config = self.config_store.get_config(name)
+        if config and state.current_tpm >= config.max_tpm * 0.95:
+            logger.warning(f"Instance {name} is approaching TPM limit: {state.current_tpm}/{config.max_tpm}")
+            return True
+            
+        return False
+    
+    def mark_rate_limited(self, name: str, retry_after: Optional[int] = None) -> None:
+        """Mark an instance as rate limited."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        state.status = "rate_limited"
+        if retry_after is None:
+            retry_after = 60
+        state.rate_limited_until = time.time() + retry_after
+        self.state_store.update_state(name, **state.dict())
+        logger.warning(f"Instance {name} marked as rate limited for {retry_after} seconds")
+    
+    def mark_healthy(self, name: str) -> None:
+        """Mark an instance as healthy."""
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        state.status = "healthy"
+        state.error_count = 0
+        state.last_error = None
+        state.rate_limited_until = None
+        self.state_store.update_state(name, **state.dict())
+    
+    def get_metrics(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get all metrics for an instance."""
+        state = self.state_store.get_state(name)
+        if not state:
             return None
             
-        logger.debug(f"Selecting instance for model '{model_name}' requiring {required_tokens} tokens")
-        
-        # Lock access to the instances dictionary to prevent concurrent modification during selection
-        with self.instances_lock:
-            instance = self.router.select_instance(self.instances, required_tokens, model_name)
-            
-        if instance:
-            logger.info(f"Selected instance '{instance.name}' for model '{model_name}'")
-            if model_name:
-                # Log the exact model deployment that will be used
-                if model_name.lower() in instance.model_deployments:
-                    deployment = instance.model_deployments[model_name.lower()]
-                    logger.info(f"Using deployment '{deployment}' for model '{model_name}'")
-                else:
-                    # Check if model_name is in supported_models
-                    if model_name.lower() in [m.lower() for m in instance.supported_models]:
-                        logger.info(f"Model '{model_name}' is in supported_models but has no specific deployment mapping - instance will use default deployments")
-                    else:
-                        logger.warning(f"Model '{model_name}' is neither in supported_models nor has a mapping in model_deployments for instance '{instance.name}'")
-        else:
-            logger.warning(f"No suitable instance found for model '{model_name}' requiring {required_tokens} tokens")
-            # Add a stronger warning if we have instances but none match this model
-            if self.instances:
-                supported_models = set()
-                for inst in self.instances.values():
-                    if inst.supported_models:
-                        supported_models.update([m.lower() for m in inst.supported_models])
-                    if inst.model_deployments:
-                        supported_models.update([k.lower() for k in inst.model_deployments.keys()])
-                
-                if supported_models:
-                    logger.error(f"Available models: {sorted(list(supported_models))}")
-                    logger.error(f"The requested model '{model_name}' is not supported by any configured instance - request will fail")
-            
-        return instance
-    
-    async def try_instances(self, 
-                           endpoint: str, 
-                           payload: Dict[str, Any], 
-                           required_tokens: int,
-                           method: str = "POST",
-                           provider_type: Optional[str] = None) -> Tuple[Dict[str, Any], APIInstance]:
-        """
-        Try instances until one succeeds or all fail.
-        
-        Args:
-            endpoint: The API endpoint
-            deployment: The deployment name
-            payload: The request payload
-            required_tokens: Estimated tokens required for the request
-            method: HTTP method
-            provider_type: Optional provider type to filter instances (e.g., "azure" or "generic")
-            
-        Returns:
-            Tuple of (response, instance used)
-            
-        Raises:
-            HTTPException: If all instances fail
-        """
-        return await self.forwarder.try_instances(
-            self.instances,
-            endpoint,
-            payload,
-            required_tokens,
-            self.router,
-            method,
-            provider_type
-        )
-    
-    def get_instance_stats(self, instance_name: Optional[str] = None) -> Union[List[Dict[str, Any]], Dict[str, Any], None, Dict[str, Any]]:
-        """
-        Get statistics for all instances or a specific instance.
-        
-        Note: This is an enhanced version that supports both getting stats for all instances
-        and for a single instance by name.
-        
-        Args:
-            instance_name: Optional name of a specific instance. If provided, returns stats
-                           for only that instance. If None, returns stats for all instances.
-        
-        Returns:
-            If instance_name is None: List of instance statistics dictionaries
-            If instance_name is provided: Dictionary with statistics for the specified instance,
-                                         or None if the instance doesn't exist
-            If error occurs: Dictionary with error status and message
-        """
-        try:
-            if instance_name is None:
-                # Return stats for all instances
-                stats = self.monitor.get_instance_stats(self.instances)
-                return {
-                    "status": "success",
-                    "instances": stats,
-                    "count": len(stats) if stats else 0
+        return {
+            "current_tpm": state.current_tpm,
+            "current_rpm": state.current_rpm,
+            "total_tokens_served": state.total_tokens_served,
+            "error_rates": {
+                "instance": {
+                    "total": state.current_error_rate,
+                    "500": state.current_500_rate,
+                    "503": state.current_503_rate
+                },
+                "client": {
+                    "total": state.current_client_error_rate,
+                    "500": state.current_client_500_rate,
+                    "503": state.current_client_503_rate
+                },
+                "upstream": {
+                    "total": state.current_upstream_error_rate,
+                    "429": state.current_upstream_429_rate,
+                    "400": state.current_upstream_400_rate
                 }
-            
-            # Get stats for a specific instance
-            if instance_name not in self.instances:
-                return {
-                    "status": "error",
-                    "message": f"Instance '{instance_name}' not found"
+            },
+            "error_counts": {
+                "instance": {
+                    "500": state.total_errors_500,
+                    "503": state.total_errors_503,
+                    "other": state.total_other_errors
+                },
+                "client": {
+                    "500": state.total_client_errors_500,
+                    "503": state.total_client_errors_503,
+                    "other": state.total_client_errors_other
+                },
+                "upstream": {
+                    "429": state.total_upstream_429_errors,
+                    "400": state.total_upstream_400_errors,
+                    "500": state.total_upstream_500_errors,
+                    "other": state.total_upstream_other_errors
                 }
-                
-            # Create a dictionary with just this instance
-            single_instance = {instance_name: self.instances[instance_name]}
-            
-            # Get stats for this instance
-            all_stats = self.monitor.get_instance_stats(single_instance)
-            
-            # Return the first (and only) item in the list, or None if empty
-            if all_stats:
-                return {
-                    "status": "success",
-                    "instance": all_stats[0],
-                    "name": instance_name
-                }
-            return {
-                "status": "error",
-                "message": f"No stats available for instance '{instance_name}'"
             }
-        except Exception as e:
-            error_msg = f"Error getting instance stats: {str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            return {"status": "error", "message": error_msg}
-    
-    def get_health_status(self) -> Dict[str, Any]:
-        """
-        Get health status summary for all instances.
-        
-        Returns:
-            Dictionary with status and health information or error message
-        """
-        try:
-            health_status = self.monitor.get_health_status(self.instances)
-            return {
-                "status": "success",
-                "health_status": health_status
-            }
-        except Exception as e:
-            error_msg = f"Error getting health status: {str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            return {"status": "error", "message": error_msg}
-    
-    def get_service_metrics(self, window_minutes: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Get overall service performance metrics for a specific time window.
-        
-        Args:
-            window_minutes: Time window in minutes for calculations, default uses the average 
-                           of all instances' rpm_window_minutes
-            
-        Returns:
-            Dictionary with status and service metrics or error message
-        """
-        try:
-            metrics = self.monitor.get_service_metrics(self.instances, window_minutes)
-            return {
-                "status": "success",
-                "metrics": metrics
-            }
-        except Exception as e:
-            error_msg = f"Error getting service metrics: {str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            return {"status": "error", "message": error_msg}
-    
-    def get_metrics_for_multiple_windows(self, windows: List[int] = None) -> Dict[str, Any]:
-        """
-        Get service metrics for multiple time windows.
-        
-        Args:
-            windows: List of time windows in minutes to calculate metrics for
-            
-        Returns:
-            Dictionary with status and metrics for each window or error message
-        """
-        try:
-            # Use windows from config hierarchy if not provided
-            if windows is None:
-                config = config_hierarchy.get_configuration()
-                stats_window = config.get('monitoring', {}).get('stats_window_minutes', 5)
-                additional_windows = config.get('monitoring', {}).get('additional_windows', [15, 60])
-                windows = [stats_window] + additional_windows
-            
-            metrics = self.monitor.get_multiple_window_metrics(self.instances, windows)
-            return {
-                "status": "success",
-                "windows": metrics
-            }
-        except Exception as e:
-            error_msg = f"Error getting metrics for multiple windows: {str(e)}"
-            logger.error(f"{error_msg}\n{traceback.format_exc()}")
-            return {"status": "error", "message": error_msg}
-    
-    def set_rpm_window_for_all(self, minutes: int) -> None:
-        """
-        Set the RPM calculation window for all instances.
-        
-        Args:
-            minutes: The number of minutes to use for the RPM calculation window
-        """
-        if minutes <= 0:
-            raise ValueError("RPM window must be positive")
-            
-        for instance in self.instances.values():
-            instance.set_rpm_window(minutes)
-            
-        logger.info(f"Set RPM window for all instances to {minutes} minutes")
-
-
-# Create a singleton instance with the default routing strategy from config
-instance_manager = InstanceManager() 
+        } 

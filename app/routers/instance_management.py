@@ -6,14 +6,12 @@ import time
 from datetime import datetime
 
 from app.config import InstanceConfig
-from app.config import config_loader
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
 from app.services.instance_verification_service import instance_verification_service
 from app.services.instance_helper import filter_instances, sort_instances, paginate_instances, format_instance_list
 from app.errors.handlers import handle_errors
 from app.errors.utils import check_instance_exists, handle_router_errors
-from app.errors.exceptions import InstanceNotFoundError
 
 logger = logging.getLogger(__name__)
 

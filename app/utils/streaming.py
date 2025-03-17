@@ -1,18 +1,14 @@
 """Utility functions for handling streaming requests to OpenAI-compatible services."""
 import json
 import logging
-import asyncio
-import re
-import time
 import httpx
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, status, Response
 from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse
 
-from app.instance.instance_context import instance_manager, instance_router
-from app.instance.api_instance import InstanceStatus
-from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
+from app.instance.instance_context import instance_manager
+from app.utils.token_estimator import estimate_chat_tokens
 from app.utils.url_builder import build_instance_url
 from app.services.azure_openai import azure_openai_service
 

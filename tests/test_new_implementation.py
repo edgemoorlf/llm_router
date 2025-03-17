@@ -14,60 +14,45 @@ import requests
 import threading
 import concurrent.futures
 from typing import Dict, List, Any
+import pytest
 
 # Add parent directory to path so we can import the app
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.models.instance import InstanceConfig, InstanceState
 from app.storage.config_store import ConfigStore
-from app.storage.state_store import StateStore
-from app.instance.new_manager import NewInstanceManager
+from app.storage.redis_state_store import RedisStateStore
+from app.instance.manager import InstanceManager
 
 # Configuration
 API_BASE_URL = "http://localhost:3010"
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "youradminapikey")
 TEST_INSTANCE_NAME = "test-instance"
-CONFIG_FILE = "test_instance_configs.json"
-STATE_FILE = "test_instance_states.json"
+CONFIG_FILE = "test_config.json"
+STATE_FILE = "test_states.json"
+REDIS_URL = "redis://localhost:6379/1"  # Use a different Redis DB for testing
 
-def setup():
-    """Set up test environment."""
+@pytest.fixture
+def manager():
+    """Create a test instance manager."""
     # Clean up any existing test files
-    for file in [CONFIG_FILE, STATE_FILE]:
-        if os.path.exists(file):
-            os.remove(file)
+    if os.path.exists(CONFIG_FILE):
+        os.remove(CONFIG_FILE)
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+        
+    # Create a new manager with test configuration
+    manager = InstanceManager(config_file=CONFIG_FILE, redis_url=REDIS_URL)
     
-    # Create test instance manager with empty configs
-    manager = NewInstanceManager(config_file=CONFIG_FILE, state_file=STATE_FILE)
+    yield manager
     
-    # Add a test instance
-    config = InstanceConfig(
-        name=TEST_INSTANCE_NAME,
-        provider_type="azure",
-        api_key="test-api-key",
-        api_base="https://test.openai.azure.com",
-        api_version="2024-05-01",
-        priority=100,
-        weight=100,
-        max_tpm=10000,
-        max_input_tokens=4000,
-        supported_models=["gpt-4o-mini"],
-        model_deployments={"gpt-4o-mini": "gpt-4o-mini"}
-    )
-    manager.add_instance(config)
-    
-    return manager
+    # Clean up after tests
+    if os.path.exists(CONFIG_FILE):
+        os.remove(CONFIG_FILE)
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
 
-def teardown(manager: NewInstanceManager):
-    """Clean up test environment."""
-    manager.delete_instance(TEST_INSTANCE_NAME)
-    
-    # Clean up test files
-    for file in [CONFIG_FILE, STATE_FILE]:
-        if os.path.exists(file):
-            os.remove(file)
-
-def test_config_state_separation(manager: NewInstanceManager) -> bool:
+def test_config_state_separation(manager: InstanceManager) -> bool:
     """Test that configuration and state are properly separated."""
     print("Testing configuration and state separation...")
     
@@ -196,7 +181,7 @@ def test_api_endpoints() -> bool:
     print("✅ All API endpoint tests passed")
     return True
 
-def test_concurrent_updates(manager: NewInstanceManager) -> bool:
+def test_concurrent_updates(manager: InstanceManager) -> bool:
     """Test concurrent updates to configuration and state."""
     print("Testing concurrent updates...")
     

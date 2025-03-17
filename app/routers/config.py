@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 import time
 
 from app.config import config_loader

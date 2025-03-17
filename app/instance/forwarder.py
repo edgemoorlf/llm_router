@@ -5,7 +5,7 @@ from typing import Dict, Any, Tuple, Optional
 import httpx
 from fastapi import HTTPException, status
 
-from .api_instance import APIInstance
+from app.models.instance import InstanceConfig, InstanceState
 from .service_stats import service_stats
 
 # Import instance manager from context
@@ -18,7 +18,7 @@ class RequestForwarder:
 
     @staticmethod
     async def forward_request(
-            instance: APIInstance, 
+            instance: Tuple[InstanceConfig, InstanceState], 
             endpoint: str, 
             payload: Dict[str, Any],
             method: str = "POST") -> Dict[str, Any]:
@@ -26,7 +26,7 @@ class RequestForwarder:
         Forward a request to an API instance.
         
         Args:
-            instance: The instance to use
+            instance: The instance to use as (config, state) tuple
             endpoint: The API endpoint
             payload: The request payload
             method: HTTP method
@@ -37,32 +37,34 @@ class RequestForwarder:
         Raises:
             HTTPException: If the request fails
         """
+        config, state = instance
+        
         # Extract model from payload
         model_name = payload.get("model", "").lower() if payload and "model" in payload else ""
         
         # Determine deployment name based on the model
         deployment = ""
-        if model_name and instance.provider_type == "azure" and instance.model_deployments:
+        if model_name and config.provider_type == "azure" and config.model_deployments:
             # Look up the deployment name for this model in this specific instance
-            deployment = instance.model_deployments.get(model_name, "")
+            deployment = config.model_deployments.get(model_name, "")
             if deployment:
-                logger.debug(f"Resolved deployment '{deployment}' for model '{model_name}' in instance '{instance.name}'")
+                logger.debug(f"Resolved deployment '{deployment}' for model '{model_name}' in instance '{config.name}'")
             else:
-                logger.warning(f"No deployment mapping found for model '{model_name}' in instance '{instance.name}'")
+                logger.warning(f"No deployment mapping found for model '{model_name}' in instance '{config.name}'")
         
-        url = instance.build_url(endpoint, deployment)
-        instance.last_used = time.time()
+        url = config.build_url(endpoint, deployment)
+        state.last_used = time.time()
         current_time = int(time.time())
         
         # Update request per minute counter for instance
-        instance.update_rpm_usage()
+        state.update_rpm_usage()
         
         # Record request in global service stats
         service_stats.record_request(current_time)
         
         # Log request details at debug level
         request_id = f"req-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
-        logger.debug(f"[{request_id}] Forwarding request to instance {instance.name} ({instance.provider_type}): {url}")
+        logger.debug(f"[{request_id}] Forwarding request to instance {config.name} ({config.provider_type}): {url}")
         
         # Log payload at trace level (if needed for debugging)
         if logger.isEnabledFor(logging.DEBUG):
@@ -76,9 +78,9 @@ class RequestForwarder:
         start_time = time.time()
         try:
             if method.upper() == "POST":
-                response = await instance.client.post(url, json=payload)
+                response = await config.client.post(url, json=payload)
             elif method.upper() == "GET":
-                response = await instance.client.get(url, params=payload)
+                response = await config.client.get(url, params=payload)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -125,23 +127,23 @@ class RequestForwarder:
             status_code = e.response.status_code
             
             # Record upstream error from the endpoint in instance
-            instance.record_upstream_error(status_code)
+            state.record_upstream_error(status_code)
             
             # Record upstream error in global service stats
             service_stats.record_upstream_error(current_time)
             
-            logger.error(f"[{request_id}] Instance {instance.name}[{instance.api_base}] API error: {status_code} - {error_detail} (time={elapsed_ms}ms)")
+            logger.error(f"[{request_id}] Instance {config.name}[{config.api_base}] API error: {status_code} - {error_detail} (time={elapsed_ms}ms)")
             
             # Pass along retry-after header for rate limiting
             if status_code == 429 and "retry-after" in e.response.headers:
                 retry_after = e.response.headers["retry-after"]
                 headers["retry-after"] = retry_after
-                logger.warning(f"[{request_id}] Rate limit exceeded for instance {instance.name}, retry-after: {retry_after}")
+                logger.warning(f"[{request_id}] Rate limit exceeded for instance {config.name}, retry-after: {retry_after}")
             
             # Map Azure errors to appropriate status codes
             raise HTTPException(
                 status_code=status_code,
-                detail=f"API error from instance {instance.name}: {error_detail}",
+                detail=f"API error from instance {config.name}: {error_detail}",
                 headers=headers,
             )
         
@@ -151,12 +153,12 @@ class RequestForwarder:
             error_type = type(e).__name__
             
             # Record as a downstream error (typically results in a 503 response to client)
-            instance.record_error(503)
+            state.record_error(503)
             
-            logger.warning(f"[{request_id}] Connection error to instance {instance.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
+            logger.warning(f"[{request_id}] Connection error to instance {config.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Connection error to API instance {instance.name}: {str(e)}",
+                detail=f"Connection error to API instance {config.name}: {str(e)}",
             )
         except Exception as e:
             # Handle unexpected errors
@@ -164,30 +166,30 @@ class RequestForwarder:
             error_type = type(e).__name__
             
             # Record as downnstream 500 error
-            instance.record_upstream_error(500)
+            state.record_upstream_error(500)
             
             # Record upstream error in global service stats
             service_stats.record_upstream_error(current_time)
             
-            logger.error(f"[{request_id}] Unexpected error with instance {instance.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
+            logger.error(f"[{request_id}] Unexpected error with instance {config.name}: {error_type}: {str(e)} (time={elapsed_ms}ms)")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Unexpected error with API instance {instance.name}: {str(e)}",
+                detail=f"Unexpected error with API instance {config.name}: {str(e)}",
             )
 
     async def try_instances(self,
-                          instances: Dict[str, APIInstance],
+                          instances: Dict[str, Tuple[InstanceConfig, InstanceState]],
                           endpoint: str, 
                           payload: Dict[str, Any], 
                           required_tokens: int,
                           instance_router,
                           method: str = "POST",
-                          provider_type: Optional[str] = None) -> Tuple[Dict[str, Any], APIInstance]:
+                          provider_type: Optional[str] = None) -> Tuple[Dict[str, Any], Tuple[InstanceConfig, InstanceState]]:
         """
         Try instances until one succeeds or all fail.
         
         Args:
-            instances: Dictionary of available API instances
+            instances: Dictionary of available API instances as (config, state) tuples
             endpoint: The API endpoint
             payload: The request payload
             required_tokens: Estimated tokens required for the request
@@ -196,7 +198,7 @@ class RequestForwarder:
             provider_type: Optional provider type to filter instances (e.g., "azure" or "generic")
             
         Returns:
-            Tuple of (response, instance used)
+            Tuple of (response, instance tuple used)
             
         Raises:
             HTTPException: If all instances fail
@@ -212,13 +214,14 @@ class RequestForwarder:
         # Try strategy-based instance first, prioritizing instances that support this model
         primary_instance = instance_router.select_instance(instances, required_tokens, model_name)
         if primary_instance:
-            logger.debug(f"Selected primary instance: {primary_instance.name} for model: {model_name} with max input tokens: {primary_instance.max_input_tokens} vs required tokens: {required_tokens}")
+            config, state = primary_instance
+            logger.debug(f"Selected primary instance: {config.name} for model: {model_name} with max input tokens: {config.max_input_tokens} vs required tokens: {required_tokens}")
             try:
                 response = await self.forward_request(primary_instance, endpoint, payload, method)
                 # Mark instance as healthy and update TPM
-                primary_instance.mark_healthy()
+                state.mark_healthy()
                 if "usage" in response and "total_tokens" in response["usage"]:
-                    primary_instance.update_tpm_usage(response["usage"]["total_tokens"])
+                    state.update_tpm_usage(response["usage"]["total_tokens"])
                 return response, primary_instance
             except HTTPException as e:
                 status_code = e.status_code
@@ -234,92 +237,27 @@ class RequestForwarder:
                         except (ValueError, TypeError):
                             pass
                     
-                    primary_instance.mark_rate_limited(retry_after)
-                    logger.warning(f"Instance {primary_instance.name} rate limited: {detail}")
+                    state.mark_rate_limited(retry_after)
+                    logger.warning(f"Instance {config.name} rate limited: {detail}")
                 else:
-                    primary_instance.mark_error(str(e))
-                    logger.warning(f"Error from instance {primary_instance.name}: {detail}")
+                    state.mark_error(str(e))
+                    logger.warning(f"Error from instance {config.name}: {detail}")
                 
                 # Fall through to try other instances
             except Exception as e:
                 # Instance errors already recorded in forward_request
-                primary_instance.mark_error(str(e))
-                logger.warning(f"Unexpected error from instance {primary_instance.name}: {str(e)}")
+                state.mark_error(str(e))
+                logger.warning(f"Unexpected error from instance {config.name}: {str(e)}")
                 # Fall through to try other instances
         else: 
             error_message = "No instance found"
+            if model_name:
+                error_message += f" supporting model {model_name}"
             logger.error(error_message)
-            
-            # 全局记录客户端错误，不再依赖单个实例
-            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-            service_stats.record_client_error(status_code, current_time)
-                
             raise HTTPException(
-                status_code=status_code,
-                detail=error_message,
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=error_message
             )
-
-        # If primary instance failed, try all other instances that support this model
-        available_instances = instance_router.get_available_instances_for_model(instances, model_name, provider_type)
-        
-        # Remove the primary instance from the list if we already tried it
-        if primary_instance:
-            available_instances = [i for i in available_instances if i.name != primary_instance.name]
-        
-        errors = []
-        
-        for instance in available_instances:
-            # Skip instances that are rate limited
-            if instance.is_rate_limited():
-                logger.debug(f"Skipping rate-limited instance {instance.name}")
-                continue
-                
-            try:
-                response = await self.forward_request(instance, endpoint, payload, method)
-                # Mark instance as healthy and update TPM
-                instance.mark_healthy()
-                if "usage" in response and "total_tokens" in response["usage"]:
-                    instance.update_tpm_usage(response["usage"]["total_tokens"])
-                return response, instance
-            except HTTPException as e:
-                status_code = e.status_code
-                detail = e.detail
-                
-                # Handle rate limiting specifically
-                if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-                    retry_after = None
-                    if hasattr(e, 'headers') and e.headers and 'retry-after' in e.headers:
-                        try:
-                            retry_after = int(e.headers['retry-after'])
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    instance.mark_rate_limited(retry_after)
-                    logger.warning(f"Instance {instance.name} rate limited: {detail}")
-                else:
-                    instance.mark_error(str(e))
-                    logger.warning(f"Error from instance {instance.name}: {detail}")
-                
-                errors.append(f"{instance.name}: {detail}")
-            except Exception as e:
-                # Instance errors already recorded in forward_request
-                instance.mark_error(str(e))
-                logger.error(f"Unexpected error from instance {instance.name}: {str(e)}")
-                errors.append(f"{instance.name}: {str(e)}")
-        
-        # 所有实例都失败了 - 这是将发送给客户端的错误
-        error_message = f"All API instances failed: {'; '.join(errors)}"
-        logger.error(error_message)
-        
-        # 全局记录客户端错误，不再依赖单个实例
-        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        service_stats.record_client_error(status_code, current_time)
-        
-        # No instance available, return 503 Service Unavailable
-        raise HTTPException(
-            status_code=status_code,
-            detail=error_message,
-        )
 
     async def try_specific_instance(
         self, 

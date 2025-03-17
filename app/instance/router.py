@@ -1,140 +1,168 @@
-import logging
-import time
-from typing import Dict, List, Optional
+"""
+Instance router implementation.
 
-from .api_instance import APIInstance
-from .routing_strategy import RoutingStrategy, RoutingStrategyFactory
+This module provides the InstanceRouter class for selecting appropriate instances
+to handle API requests based on various routing strategies.
+"""
+
+import logging
+import random
+from typing import Dict, List, Optional, Any, Tuple
+from app.models.instance import InstanceConfig, InstanceState, create_instance_state
 
 logger = logging.getLogger(__name__)
 
 class InstanceRouter:
-    """Selects API instances based on different routing strategies."""
+    """
+    Routes requests to appropriate instances based on various strategies.
     
-    def __init__(self, routing_strategy: RoutingStrategy = RoutingStrategy.FAILOVER):
+    This class implements different routing strategies for selecting instances
+    to handle API requests, taking into account instance configuration, current
+    state, and request requirements.
+    """
+    
+    def __init__(self, instance_manager):
         """
         Initialize the instance router.
         
         Args:
-            routing_strategy: Strategy for selecting instances
+            instance_manager: The instance manager to use for routing
         """
-        self.routing_strategy_type = routing_strategy
-        self.strategy = RoutingStrategyFactory.create_strategy(routing_strategy)
-    
-    def select_instance(self, 
-                       instances: Dict[str, APIInstance], 
-                       required_tokens: int, 
-                       model_name: Optional[str] = None) -> Optional[APIInstance]:
+        self.instance_manager = instance_manager
+        
+    def select_instance(self, required_tokens: Optional[int] = None,
+                       model_name: Optional[str] = None,
+                       strategy: str = "random") -> Optional[str]:
         """
-        Select an API instance based on the configured routing strategy and model support.
+        Select an instance to handle a request.
         
         Args:
-            instances: Dictionary of available API instances
-            required_tokens: Estimated number of tokens required for the request
-            model_name: The model name requested (optional)
+            required_tokens: Number of tokens required for the request
+            model_name: Model name required for the request
+            strategy: Routing strategy to use (random, least_busy, round_robin)
             
         Returns:
-            Selected instance or None if no suitable instance is available
+            Name of the selected instance or None if no suitable instance found
         """
-        # Filter healthy instances with enough capacity
-        available_instances = [
-            instance for instance in instances.values()
-            if (instance.status == "healthy" or 
-                (instance.status == "rate_limited" and time.time() >= (instance.rate_limited_until or 0)))
-            and (instance.instance_stats.current_tpm + required_tokens) <= instance.max_tpm
-            and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
-        ]
+        # Get all configs and states
+        configs = self.instance_manager.get_all_configs()
+        states = self.instance_manager.get_all_states()
         
-        # If a model name is provided, filter instances that support this model
-        if model_name:
-            # Use exact model name matching only
-            exact_model_name = model_name.lower()
+        candidates = []
+        for name, config in configs.items():
+            # Skip if instance is disabled
+            if not config.enabled:
+                continue
+                
+            # Get state if available, otherwise create a default state
+            state = states.get(name)
+            if not state:
+                state = create_instance_state(name)
+                
+            # Skip if instance is unhealthy
+            if not state.is_healthy:
+                continue
+                
+            # Skip if model is specified and not supported
+            if model_name and model_name not in config.supported_models:
+                continue
+                
+            # Skip if required tokens exceed capacity
+            if required_tokens and required_tokens > config.max_tpm:
+                continue
+                
+            # This instance is a candidate
+            candidates.append((name, config, state))
             
-            # Filter instances that explicitly support this model
-            model_instances = [
-                instance for instance in available_instances
-                if (
-                    # Instance has this model in its supported_models list
-                    exact_model_name in [m.lower() for m in instance.supported_models] or
-                    # Instance has a deployment mapping for this model
-                    exact_model_name in instance.model_deployments or
-                    # Instance has no model restrictions (empty supported_models means it supports all models)
-                    not instance.supported_models
-                )
-            ]
+        if not candidates:
+            logger.warning(f"No suitable instances found for request (model={model_name}, tokens={required_tokens})")
+            return None
             
-            # If we found instances that support this model, use them
-            if model_instances:
-                available_instances = model_instances
-                logger.debug(f"Found {len(model_instances)} instances supporting model '{model_name}'")
-            else:
-                logger.warning(f"No instances explicitly support model '{model_name}', falling back to all available instances")
-        
-        if not available_instances:
-            logger.warning(f"No healthy instances available with enough TPM capacity for {required_tokens} tokens")
-            # Try to find any instance that's not in error state but still respects token limits
-            available_instances = [
-                instance for instance in instances.values()
-                if instance.status != "error"
-                and (instance.instance_stats.current_tpm + required_tokens) <= instance.max_tpm
-                and (instance.max_input_tokens == 0 or required_tokens <= instance.max_input_tokens)
-            ]
+        # Apply routing strategy
+        if strategy == "random":
+            selected = random.choice(candidates)
+            return selected[0]
+        elif strategy == "least_busy":
+            # Sort by number of active requests
+            candidates.sort(key=lambda x: x[2].current_tpm)
+            return candidates[0][0]
+        elif strategy == "round_robin":
+            # Just take the first one for now (we'll implement proper round robin later)
+            return candidates[0][0]
+        else:
+            logger.warning(f"Unknown routing strategy: {strategy}, using random")
+            selected = random.choice(candidates)
+            return selected[0]
             
-            if not available_instances:
-                logger.error("No available instances found")
-                return None
-        
-        # If we only have one instance, return it
-        if len(available_instances) == 1:
-            return available_instances[0]
-        
-        # Apply routing strategy to select an instance
-        logger.debug(f"Selecting instance using {self.routing_strategy_type} strategy from {len(available_instances)} available instances")
-        
-        # Delegate selection to the appropriate strategy implementation
-        return self.strategy.select_instance(available_instances, required_tokens, model_name)
-    
-    def get_available_instances_for_model(self,
-                                         instances: Dict[str, APIInstance],
-                                         model_name: str,
-                                         provider_type: Optional[str] = None) -> List[APIInstance]:
+    def get_instance_for_model(self, model_name: str) -> Optional[str]:
         """
-        Get all available instances that support a specific model and provider type.
+        Find an instance that supports the specified model.
         
         Args:
-            instances: Dictionary of available API instances
-            model_name: The model name to check for
-            provider_type: Optional provider type to filter instances
+            model_name: Name of the model
             
         Returns:
-            List of instances supporting the model
+            Name of a suitable instance or None if not found
         """
-        # Filter out instances in error state and by provider type if specified
-        available_instances = [
-            instance for instance in instances.values() 
-            if instance.status != "error" and
-               (provider_type is None or instance.provider_type == provider_type)
-        ]
+        return self.select_instance(model_name=model_name)
         
-        if not model_name:
-            return available_instances
+    def get_instance_capacity(self, name: str) -> Tuple[bool, Optional[int]]:
+        """
+        Check if an instance has capacity for more requests.
+        
+        Args:
+            name: Name of the instance
             
-        # Use exact model name matching only
-        exact_model_name = model_name.lower()
+        Returns:
+            Tuple of (has_capacity, available_slots)
+            If instance doesn't exist, returns (False, None)
+        """
+        config = self.instance_manager.get_instance_config(name)
+        state = self.instance_manager.get_instance_state(name)
         
-        # Filter instances that support this model
-        model_instances = [
-            instance for instance in available_instances
-            if (
-                # Instance has this model in its supported_models list
-                exact_model_name in [m.lower() for m in instance.supported_models] or
-                # Instance has a deployment mapping for this model
-                exact_model_name in instance.model_deployments or
-                # Instance has no model restrictions (empty supported_models means it supports all models)
-                not instance.supported_models
-            )
-        ]
+        if not config or not state:
+            return (False, None)
+            
+        # Check if instance is enabled and healthy
+        if not config.enabled or not state.is_healthy:
+            return (False, 0)
+            
+        # Calculate available capacity
+        max_concurrent = config.max_parallel_requests
+        current = state.active_requests
         
-        # Sort by priority (lower is higher priority)
-        model_instances.sort(key=lambda x: x.priority)
+        available = max(0, max_concurrent - current)
+        has_capacity = available > 0
         
-        return model_instances
+        return (has_capacity, available)
+        
+    def get_supported_models(self) -> Dict[str, List[str]]:
+        """
+        Get a mapping of models to instances that support them.
+        
+        Returns:
+            Dictionary mapping model names to lists of instance names
+        """
+        configs = self.instance_manager.get_all_configs()
+        states = self.instance_manager.get_all_states()
+        
+        model_map = {}
+        
+        for name, config in configs.items():
+            # Skip if instance doesn't exist in states
+            if name not in states:
+                continue
+                
+            state = states[name]
+            
+            # Skip if instance is disabled or unhealthy
+            if not config.enabled or not state.is_healthy:
+                continue
+                
+            # Add instance to each supported model
+            for model in config.supported_models:
+                if model not in model_map:
+                    model_map[model] = []
+                model_map[model].append(name)
+                
+        return model_map 

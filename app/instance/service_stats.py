@@ -1,7 +1,6 @@
 import time
 import logging
-from typing import Dict, List, Any, Optional, Set
-from collections import defaultdict
+from typing import Dict, List, Any, Optional
 import traceback
 
 logger = logging.getLogger(__name__)

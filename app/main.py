@@ -9,21 +9,20 @@ from fastapi import FastAPI, Depends, Request
 from dotenv import load_dotenv
 import uvicorn
 import argparse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from starlette.status import HTTP_307_TEMPORARY_REDIRECT
+
 
 # Load environment variables
 load_dotenv()
 
 # Import configuration system
 from app.config import config_loader
-from app.config.config_hierarchy import config_hierarchy
+from app.instance.manager import InstanceManager
 
 # Load configuration
 config = config_loader.load_config()
-# Get hierarchical configuration
-hierarchy_config = config_hierarchy.get_configuration()
+
+# Initialize the instance manager
+instance_manager = InstanceManager()
 
 # Configure logging
 log_level = getattr(logging, config.logging.level)

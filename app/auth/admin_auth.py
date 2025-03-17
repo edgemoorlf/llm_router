@@ -1,7 +1,7 @@
 """Authentication for administrative API endpoints."""
 import os
 import logging
-from fastapi import Depends, HTTPException, status, Header
+from fastapi import Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 
 logger = logging.getLogger(__name__)

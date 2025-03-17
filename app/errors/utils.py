@@ -18,20 +18,19 @@ from app.errors.exceptions import (
     ValidationError,
     ProxyError
 )
-
-from app.instance.api_instance import APIInstance
+from app.models.instance import InstanceConfig
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
 
-def check_instance_exists(instance: Optional[APIInstance], instance_name: str) -> APIInstance:
+def check_instance_exists(instance: Optional[InstanceConfig], instance_name: str) -> InstanceConfig:
     """
     Check if an instance exists and raise an appropriate error if not.
     
     Args:
-        instance: The instance object to check
+        instance: The instance configuration to check
         instance_name: Name of the instance
         
     Returns:
@@ -47,12 +46,12 @@ def check_instance_exists(instance: Optional[APIInstance], instance_name: str) -
     return instance
 
 
-def check_model_supported(instance: APIInstance, model_name: str) -> bool:
+def check_model_supported(instance: InstanceConfig, model_name: str) -> bool:
     """
     Check if a model is supported by an instance and raise an error if not.
     
     Args:
-        instance: The instance to check
+        instance: The instance configuration to check
         model_name: Name of the model
         
     Returns:

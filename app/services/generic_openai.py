@@ -98,7 +98,7 @@ class GenericOpenAIService:
         if not generic_payload.get("stream", False) and required_tokens > 0:
             # Only apply global rate limiting if the per-instance rate limiting is not sufficient
             # This gives us a fallback mechanism while still preferring per-instance limits
-            allowed, retry_after = rate_limiter.check_and_update(required_tokens)
+            allowed, retry_after = rate_limiter.check_and_update(required_tokens, instance_id=None)
             if not allowed:
                 logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
                 raise HTTPException(

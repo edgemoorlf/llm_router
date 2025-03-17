@@ -200,24 +200,24 @@ class FileStateManager(StateManager):
             logger.error(f"Error checking for updates: {str(e)}")
             return False, current_time
 
-from .sqlite_state_manager import SQLiteStateManager
-
-def create_state_manager(manager_type: str = "sqlite", **kwargs) -> StateManager:
+def create_state_manager(manager_type: str = "file", **kwargs) -> StateManager:
     """
     Create a state manager instance.
     
     Args:
         manager_type: Type of state manager to create:
-            - "file": File-based state manager
-            - "sqlite": SQLite-based state manager
+            - "file": File-based state manager (legacy)
         **kwargs: Additional arguments to pass to the state manager constructor
 
     Returns:
         StateManager instance
+        
+    Note:
+        The file-based state manager is maintained for legacy support.
+        New implementations should use the Redis-based state management
+        from the new_manager module.
     """
-    if manager_type == "sqlite":
-        return SQLiteStateManager(**kwargs)
-    elif manager_type == "file":
+    if manager_type == "file":
         return FileStateManager(**kwargs)
     else:
-        raise ValueError(f"Unknown state manager type: {manager_type}. Supported types: file, sqlite") 
+        raise ValueError(f"Unknown state manager type: {manager_type}. Only 'file' type is supported for legacy compatibility.") 

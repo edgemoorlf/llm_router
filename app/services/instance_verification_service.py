@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Dict, Any, Optional
 
-from app.instance.manager import instance_manager
+from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
 from app.errors.exceptions import InstanceNotFoundError, ProxyError
 from app.errors.utils import check_instance_exists

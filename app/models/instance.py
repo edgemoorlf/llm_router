@@ -1,14 +1,22 @@
 """
-Models for instance configuration and state separation.
+Models for instance configuration and state.
 
-This module defines the clear separation between:
-- Configuration: Settings defined by operators (static)
-- State: Runtime metrics and status information (dynamic)
+This module defines the core data models for API instances:
+- InstanceConfig: Static configuration defined by operators
+- InstanceState: Dynamic runtime state and metrics
+- InstanceStatus: Enum for instance status values
 """
 
+from enum import Enum
 from typing import List, Dict, Optional, Any
 from pydantic import BaseModel, Field
 import time
+
+class InstanceStatus(str, Enum):
+    """Status of an API instance."""
+    HEALTHY = "healthy"
+    RATE_LIMITED = "rate_limited" 
+    ERROR = "error"
 
 class InstanceConfig(BaseModel):
     """
@@ -51,7 +59,6 @@ class InstanceConfig(BaseModel):
             }
         }
 
-
 class InstanceState(BaseModel):
     """
     Dynamic state for an OpenAI-compatible service instance.
@@ -62,9 +69,51 @@ class InstanceState(BaseModel):
     name: str = Field(..., description="Instance identifier (links to config)")
     
     # Status information
-    status: str = Field(default="healthy", description="Current instance status (healthy, error, rate_limited)")
+    status: InstanceStatus = Field(default=InstanceStatus.HEALTHY, description="Current instance status")
+    health_status: str = Field(default="unknown", description="Health status (healthy, error, rate_limited, unknown)")
+    connection_status: str = Field(default="unknown", description="Connection status (connected, disconnected, unknown)")
+    
+    # Error tracking
     error_count: int = Field(default=0, description="Count of consecutive errors")
     last_error: Optional[str] = Field(default=None, description="Last error message")
+    last_error_time: Optional[float] = Field(default=None, description="When the last error occurred")
+    
+    # Instance-level error statistics
+    total_errors_500: int = Field(default=0, description="Total number of 500 errors encountered")
+    total_errors_503: int = Field(default=0, description="Total number of 503 errors encountered")
+    total_other_errors: int = Field(default=0, description="Total number of other errors encountered")
+    error_500_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of 500 errors")
+    error_503_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of 503 errors")
+    error_other_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of other errors")
+    current_error_rate: float = Field(default=0.0, description="Current error rate (errors/requests)")
+    current_500_rate: float = Field(default=0.0, description="Current 500 error rate")
+    current_503_rate: float = Field(default=0.0, description="Current 503 error rate")
+    
+    # Client-level error statistics
+    total_client_errors_500: int = Field(default=0, description="Total number of 500 errors returned to clients")
+    total_client_errors_503: int = Field(default=0, description="Total number of 503 errors returned to clients")
+    total_client_errors_other: int = Field(default=0, description="Total number of other errors returned to clients")
+    client_error_500_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of client 500 errors")
+    client_error_503_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of client 503 errors")
+    client_error_other_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of client other errors")
+    current_client_error_rate: float = Field(default=0.0, description="Current client error rate")
+    current_client_500_rate: float = Field(default=0.0, description="Current client 500 error rate")
+    current_client_503_rate: float = Field(default=0.0, description="Current client 503 error rate")
+    
+    # Upstream error statistics
+    total_upstream_429_errors: int = Field(default=0, description="Total 429 rate limit errors from upstream APIs")
+    total_upstream_400_errors: int = Field(default=0, description="Total 400 bad request errors from upstream APIs")
+    total_upstream_500_errors: int = Field(default=0, description="Total 500 internal errors from upstream APIs")
+    total_upstream_other_errors: int = Field(default=0, description="Total other errors from upstream APIs")
+    upstream_429_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of 429 errors")
+    upstream_400_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of 400 errors")
+    upstream_500_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of 500 errors")
+    upstream_other_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of other errors")
+    current_upstream_error_rate: float = Field(default=0.0, description="Current upstream error rate")
+    current_upstream_429_rate: float = Field(default=0.0, description="Current upstream 429 error rate")
+    current_upstream_400_rate: float = Field(default=0.0, description="Current upstream 400 error rate")
+    
+    # Rate limiting
     rate_limited_until: Optional[float] = Field(default=None, description="Timestamp when rate limit expires")
     
     # Usage metrics
@@ -72,21 +121,23 @@ class InstanceState(BaseModel):
     current_rpm: int = Field(default=0, description="Current requests per minute")
     total_requests: int = Field(default=0, description="Total number of requests processed")
     successful_requests: int = Field(default=0, description="Number of successful requests")
+    total_tokens_served: int = Field(default=0, description="Total tokens served by this instance")
     
-    # Timestamps
-    last_used: float = Field(default=0.0, description="Timestamp when this instance was last used")
-    last_error_time: Optional[float] = Field(default=None, description="When the last error occurred")
+    # Usage windows
+    usage_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of token usage")
+    request_window: Dict[int, int] = Field(default_factory=dict, description="Sliding window of request counts")
     
     # Performance metrics
     avg_latency_ms: Optional[float] = Field(default=None, description="Average request latency in milliseconds")
     utilization_percentage: float = Field(default=0.0, description="Current utilization as percentage of max_tpm")
-    connection_status: str = Field(default="unknown", description="Connection status (connected, disconnected, unknown)")
-    health_status: str = Field(default="unknown", description="Health status (healthy, error, rate_limited, unknown)")
+    
+    # Timestamps
+    last_used: float = Field(default=0.0, description="Timestamp when this instance was last used")
 
     @property
     def is_healthy(self) -> bool:
         """Check if the instance is healthy based on its status."""
-        return self.status == "healthy"
+        return self.status == InstanceStatus.HEALTHY
 
     class Config:
         schema_extra = {
@@ -101,7 +152,6 @@ class InstanceState(BaseModel):
             }
         }
 
-
 def create_instance_state(name: str) -> InstanceState:
     """
     Create a new instance state with default values.
@@ -114,7 +164,7 @@ def create_instance_state(name: str) -> InstanceState:
     """
     return InstanceState(
         name=name,
-        status="healthy",
+        status=InstanceStatus.HEALTHY,
         health_status="unknown",
         last_used=time.time()
     ) 
