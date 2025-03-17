@@ -10,10 +10,11 @@ from fastapi import HTTPException, status, Response
 from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse
 
-from app.instance.instance_context import instance_manager
+from app.instance.instance_context import instance_manager, instance_router
 from app.instance.api_instance import InstanceStatus
 from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
 from app.utils.url_builder import build_instance_url
+from app.services.azure_openai import azure_openai_service
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +64,32 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                     detail=f"Input tokens ({token_count}) exceed maximum allowed ({max_input_tokens})"
                 )
 
-    # Filter out instances in error state
-    available_instances = [instance for instance in instance_manager.get_all_instances().values() 
-                         if instance.get("status", "") != "error"]
+    # Use appropriate instance selection based on provider type
+    available_instances = []
+    
+    if provider_type == "azure":
+        # Use the shared instance selection method from azure_openai_service
+        available_instances = azure_openai_service.select_instances_for_model(model_name, token_count)
+        
+        if not available_instances:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"No Azure instances available that support model '{model_name}' for streaming request",
+            )
+    else:
+        # For non-Azure providers, use the original logic
+        available_instances = [instance for instance in instance_manager.get_all_instances().values() 
+                             if instance.get("status", "") != "error" and
+                               instance.get("provider_type", "") != "azure"]
+        
+        # Sort instances by priority
+        available_instances.sort(key=lambda x: x.get("priority", 100))
     
     if not available_instances:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No available API instances for streaming request",
+            detail=f"No available API instances for streaming request with model '{model_name}'",
         )
-
-    # Sort instances by priority
-    available_instances.sort(key=lambda x: x.get("priority", 100))
     
     # Try each instance until one succeeds
     last_error = None

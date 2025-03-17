@@ -137,26 +137,17 @@ class AzureOpenAIService:
         """Forward request to Azure instances with failover handling."""
         required_tokens = payload.pop("required_tokens", 1000)
         
-        # Get Azure instances that support this model
-        azure_instances = self._get_azure_instances_for_model(original_model)
+        # Use the shared instance selection method
+        available_instances = self.select_instances_for_model(original_model, required_tokens)
         
-        if not azure_instances:
+        if not available_instances:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
                 detail=f"No Azure instances available that support model '{original_model}'"
             )
             
-        # Select the best instance based on capacity and health
-        primary_instance = self._select_primary_instance(azure_instances, required_tokens, original_model)
-        
-        # If no instance is found that can handle this request with its token limits, return 503
-        if not primary_instance:
-            error_detail = f"No instances available that can handle {required_tokens} tokens for model '{original_model}'"
-            logger.error(error_detail)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=error_detail
-            )
+        # The first instance is the primary instance based on our selection logic
+        primary_instance = available_instances[0]
             
         return await self._execute_request(endpoint, original_model, payload, required_tokens, method, primary_instance)
 
@@ -549,6 +540,57 @@ class AzureOpenAIService:
             stats for stats in all_stats
             if stats.get("provider_type", "") == "azure"
         ]
+
+    def select_instances_for_model(self, model_name: str, required_tokens: int = 0, exclude_instance_name: str = None) -> list:
+        """
+        Select Azure instances suitable for a specific model, ordered by suitability.
+        This method can be shared with other services like streaming to ensure consistent selection logic.
+        
+        Args:
+            model_name: The model name to use
+            required_tokens: Required tokens for the request (for capacity checking)
+            exclude_instance_name: Optional instance name to exclude (e.g., after a failure)
+            
+        Returns:
+            List of instances ordered by suitability (primary instance first, then fallbacks)
+        """
+        # Get Azure instances that support this model
+        azure_instances = self._get_azure_instances_for_model(model_name)
+        
+        if not azure_instances:
+            return []
+            
+        # Select the best instance based on capacity and health
+        primary_instance = self._select_primary_instance(azure_instances, required_tokens, model_name)
+        
+        available_instances = []
+        if primary_instance:
+            # Don't include if it matches the exclude name
+            if not exclude_instance_name or primary_instance.get("name") != exclude_instance_name:
+                available_instances = [primary_instance]  # Start with the best instance
+            
+            # Add other eligible instances as fallbacks
+            for instance in azure_instances:
+                instance_name = instance.get("name", "")
+                # Skip if it's the primary instance or excluded instance
+                if instance_name == primary_instance.get("name") or instance_name == exclude_instance_name:
+                    continue
+                
+                # Only include healthy instances
+                if instance.get("status") == "healthy":
+                    available_instances.append(instance)
+        else:
+            # If no primary instance was found, use all healthy instances that support the model
+            available_instances = [
+                instance for instance in azure_instances 
+                if instance.get("status") == "healthy" and 
+                   (not exclude_instance_name or instance.get("name") != exclude_instance_name)
+            ]
+            
+        # Sort by priority (lowest number = highest priority)
+        available_instances.sort(key=lambda x: x.get("priority", 100))
+        
+        return available_instances
 
 # Create a singleton instance
 azure_openai_service = AzureOpenAIService()

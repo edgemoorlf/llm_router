@@ -28,7 +28,7 @@ Example configuration:
 ```yaml
 # Base configuration (/config/base.yaml)
 name: "Azure OpenAI Proxy"
-version: "1.3.0"
+version: "1.3.2"
 port: 3010
 
 routing:
