@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Any, Union
 
-from app.models.instance import InstanceConfig, InstanceState
+from app.models.instance import InstanceConfig, InstanceState, create_instance_state
 from app.storage.config_store import ConfigStore
 from app.storage.redis_state_store import RedisStateStore
 from app.storage.legacy import LegacyInstanceAccessor
@@ -37,24 +37,42 @@ class NewInstanceManager:
             config_file: Path to the configuration file
             redis_url: Redis connection URL for state storage
         """
+        # Initialize stores
         self.config_store = ConfigStore(config_file)
         self.state_store = RedisStateStore(redis_url=redis_url)
+        
+        # Initialize states for all configs
+        self._initialize_states()
+        
+        # Set up legacy accessor
         self.legacy = LegacyInstanceAccessor(self.config_store, self.state_store)
         self.router = None  # Will be initialized later
         
         # Reset transient states on startup
         self.state_store.reset_states_on_startup()
         
+    def _initialize_states(self):
+        """Initialize states for all configured instances."""
+        configs = self.config_store.get_all_configs()
+        if configs:
+            logger.info(f"Initializing states for {len(configs)} instances")
+            for name in configs:
+                if not self.state_store.get_state(name):
+                    state = create_instance_state(name)
+                    self.state_store.update_state(name, **state.dict())
+        
     def reload_config(self):
-        """Reload configurations from storage."""
-        # Reinitialize the config store to reload from disk
+        """Reload configurations from storage and YAML."""
+        # First try to reload from JSON storage
         self.config_store = ConfigStore(self.config_store.config_file)
         
+        # If no configs loaded, try YAML
+        if not self.config_store.get_all_configs():
+            self.config_store._load_from_yaml()
+        
         # Make sure all configured instances have a state
-        for name in self.config_store.get_all_configs():
-            if not self.state_store.get_state(name):
-                self.state_store.update_state(name, **create_instance_state(name).dict())
-                
+        self._initialize_states()
+        
     def get_instance(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Get an instance by name.

@@ -33,8 +33,12 @@ class ConfigStore:
         self.configs: Dict[str, InstanceConfig] = {}
         self.file_lock = threading.RLock()  # Lock for thread-safe access
         
-        # Load existing configurations
+        # Try to load from JSON file first
         self._load_configs()
+        
+        # If no configs loaded, try to load from YAML
+        if not self.configs:
+            self._load_from_yaml()
     
     def reload(self):
         """
@@ -142,4 +146,27 @@ class ConfigStore:
                 except Exception as e:
                     logger.error(f"Error deleting configuration for {name}: {e}")
                     return False
-            return False 
+            return False
+    
+    def _load_from_yaml(self):
+        """Load initial configurations from YAML if JSON file is empty or missing."""
+        try:
+            from app.config.config_hierarchy import config_hierarchy
+            yaml_config = config_hierarchy.get_configuration()
+            
+            if yaml_config and 'instances' in yaml_config:
+                for name, instance_data in yaml_config['instances'].items():
+                    try:
+                        # Ensure name is in the data
+                        instance_data['name'] = name
+                        config = InstanceConfig(**instance_data)
+                        self.configs[name] = config
+                    except Exception as e:
+                        logger.error(f"Error loading instance {name} from YAML: {e}")
+                
+                # If we loaded configs from YAML, save them to JSON for persistence
+                if self.configs:
+                    self._save_configs()
+                    logger.info(f"Initialized {len(self.configs)} instances from YAML configuration")
+        except Exception as e:
+            logger.error(f"Error loading configurations from YAML: {e}") 
