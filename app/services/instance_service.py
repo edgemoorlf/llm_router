@@ -149,7 +149,17 @@ class InstanceService:
         
         try:
             # Add the instance to the manager
-            self.instance_manager.add_instance(instance_config)
+            result = self.instance_manager.add_instance(instance_config)
+            
+            if not result:
+                logger.error(f"Failed to add instance {instance_config.name} to instance manager")
+                return {
+                    "status": "error",
+                    "message": f"Failed to add instance {instance_config.name} to storage",
+                    "reason": "storage_error"
+                }
+                
+            logger.info(f"Successfully added instance {instance_config.name} to storage")
             
             # Set initial RPM window
             config = config_loader.get_config()
@@ -444,7 +454,7 @@ class InstanceService:
     
     async def remove_instance(self, instance_name: str) -> Dict[str, Any]:
         """
-        Remove an instance from the proxy service at runtime.
+        Remove an instance at runtime.
         
         Args:
             instance_name: The name of the instance to remove
@@ -453,14 +463,14 @@ class InstanceService:
             Status information about the removal
         """
         # Check if instance exists
-        instance = self.instance_manager.get_instance(instance_name)
-        if not instance:
+        if not self.instance_manager.has_instance(instance_name):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Instance '{instance_name}' not found"
             )
         
-        config, _ = instance
+        # Get config before removal
+        config = self.instance_manager.get_instance_config(instance_name)
         
         # Store instance details for the response before removal
         instance_details = {

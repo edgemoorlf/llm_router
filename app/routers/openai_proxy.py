@@ -20,10 +20,10 @@ router = APIRouter(prefix="/v1", tags=["openai"])
 
 def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     """
-    Determine which service to use based on the model name.
+    Determine which service to use based on the requested model name.
     
     Args:
-        model_name: Name of the model
+        model_name: The name of the model requested
         
     Returns:
         A tuple of (service, provider_type)
@@ -40,42 +40,39 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     
     # Debug the instance structure
     logger.debug(f"Instance structure: {str(type(all_instances))}")
-    if all_instances and len(all_instances) > 0:
-        first_key = list(all_instances.keys())[0]
-        first_value = all_instances[first_key]
-        logger.debug(f"First instance: {first_key} has type {type(first_value)}")
-        logger.debug(f"Provider type exists: {'provider_type' in first_value}")
     
     # Filter instances by provider type and model support
     azure_instances = []
     generic_instances = []
     
-    for instance_info in all_instances.values():
-        provider_type = instance_info.get("provider_type", "")
-        supported_models = instance_info.get("supported_models", [])
+    for config, state in all_instances:
+        provider_type = config.provider_type
+        supported_models = config.supported_models
         
         # Convert all model names to lowercase for comparison
         supported_models_lower = [m.lower() for m in supported_models]
         
         # Check if this instance supports the model
-        model_supported = model_name in supported_models_lower or not supported_models
-        
-        if provider_type == "azure" and model_supported:
-            azure_instances.append(instance_info)
-        elif provider_type == "generic" and model_supported:
-            generic_instances.append(instance_info)
+        if model_name in supported_models_lower:
+            if provider_type == "azure":
+                azure_instances.append(config)
+            else:
+                generic_instances.append(config)
     
-    # Select service based on available instances
+    # If we have Azure instances that support this model, use Azure
     if azure_instances:
-        logger.debug(f"Found {len(azure_instances)} Azure instances for model {model_name}")
+        logger.debug(f"Using Azure OpenAI service for model {model_name}")
         return azure_openai_service, "azure"
-    elif generic_instances:
-        logger.debug(f"Found {len(generic_instances)} generic instances for model {model_name}")
-        return generic_openai_service, "generic"
-    else:
-        # Default to Azure service, which will handle the error if needed
-        logger.warning(f"No instances found for model {model_name}, defaulting to Azure service")
-        return azure_openai_service, "azure"
+    
+    # If we have generic instances that support this model, use Generic
+    if generic_instances:
+        logger.debug(f"Using Generic OpenAI service for model {model_name}")
+        return generic_openai_service, "openai"
+    
+    # If no instances support the model, use Azure (assume it's a newer model)
+    # This is a fallback case - Azure handles error reporting
+    logger.debug(f"No instances support model {model_name}, defaulting to Azure OpenAI")
+    return azure_openai_service, "azure"
 
 @router.post("/v1/chat/completions")
 @handle_router_errors("processing chat completions request")
@@ -124,7 +121,7 @@ async def chat_completion(
         # For regular requests, we can forward and return directly
         response = await service.forward_request(
             "/v1/chat/completions",
-            transformed["payload"],
+            transformed.get("payload"),
             transformed.get("original_model")
         )
         

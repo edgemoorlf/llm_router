@@ -8,11 +8,8 @@ from fastapi.responses import JSONResponse
 
 from app.instance.service_stats import service_stats
 from app.instance.instance_context import instance_manager
-from app.services.azure_openai import azure_openai_service
-from app.services.generic_openai import generic_openai_service
-from app.instance.monitor import InstanceMonitor
 from app.services.instance_service import instance_service
-from app.config import config_loader
+from app.models.instance import InstanceStatus
 from app.errors.utils import handle_router_errors
 
 logger = logging.getLogger(__name__)
@@ -113,30 +110,17 @@ async def get_instance_stats(
                 "timestamp": int(time.time())
             }
             
-        # Print the actual content if it's not a dict or it's a string
-        if not isinstance(instances, dict):
-            if isinstance(instances, str):
-                logger.error(f"instances is a string: '{instances}'")
-            else:
-                logger.error(f"instances is not a dict: {instances}")
-            
-            return {
-                "status": "error",
-                "message": f"Failed to process instances: expected dict, got {type(instances).__name__}",
-                "timestamp": int(time.time())
-            }
-        
-        # Check dict contents without any dict comprehension
+        # Create a dictionary from the list of tuples for easy lookup
         instance_configs = {}
-        for key, value in instances.items():
+        for config, state in instances:
             try:
-                logger.debug(f"Processing instance key: {key}, value type: {type(value)}")
-                instance_configs[key] = value
+                logger.debug(f"Processing instance: {config.name}, type: {type(config)}")
+                instance_configs[config.name] = config
             except Exception as e:
-                logger.exception(f"Error processing instance {key}: {e}")
+                logger.exception(f"Error processing instance {config.name}: {e}")
                 return {
                     "status": "error",
-                    "message": f"Error processing instance {key}: {str(e)}",
+                    "message": f"Error processing instance {config.name}: {str(e)}",
                     "timestamp": int(time.time())
                 }
     except Exception as e:
@@ -162,11 +146,11 @@ async def get_instance_stats(
             # Add basic health status
             health_status = "unknown"
             if stats.get("error_count", 0) > 0:
-                health_status = "error"
-            elif stats.get("rate_limited_count", 0) > 0:
-                health_status = "rate_limited"
+                health_status = InstanceStatus.ERROR.value
+            elif stats.get("rate_limited_count", 0) > 0 or stats.get("rate_limited_until") is not None:
+                health_status = InstanceStatus.RATE_LIMITED.value
             else:
-                health_status = "healthy"
+                health_status = InstanceStatus.HEALTHY.value
             
             # Add health status to stats
             stats["health_status"] = health_status
@@ -175,8 +159,9 @@ async def get_instance_stats(
             stats["provider_type"] = instance_config.provider_type
             
             # Calculate utilization percentage
-            if instance_config.max_tpm > 0 and "current_tpm" in stats:
-                stats["utilization_percentage"] = round((stats["current_tpm"] / instance_config.max_tpm) * 100, 1)
+            max_tpm = instance_config.max_tpm
+            if max_tpm > 0 and "current_tpm" in stats:
+                stats["utilization_percentage"] = round((stats["current_tpm"] / max_tpm) * 100, 1)
             else:
                 stats["utilization_percentage"] = 0
             
@@ -220,8 +205,16 @@ async def get_instance_stats(
     try:
         filtered_stats = instance_stats
         
-        # Filter by status
+        # Filter by status - convert string status to enum value if needed
         if status_filter:
+            # Map status filter to enum value if it's a string like "healthy"
+            if status_filter == "healthy":
+                status_filter = InstanceStatus.HEALTHY.value
+            elif status_filter == "error":
+                status_filter = InstanceStatus.ERROR.value
+            elif status_filter == "rate_limited":
+                status_filter = InstanceStatus.RATE_LIMITED.value
+                
             filtered_stats = [
                 s for s in filtered_stats 
                 if s.get("health_status") == status_filter
@@ -245,8 +238,8 @@ async def get_instance_stats(
         if max_tpm is not None:
             filtered_stats = [
                 s for s in filtered_stats 
-                if instance_configs.get(s.get("name")).max_tpm <= max_tpm
-                if s.get("name") in instance_configs
+                if s.get("name") in instance_configs and 
+                instance_configs[s.get("name")].max_tpm <= max_tpm
             ]
         
         # Filter by model support
@@ -271,19 +264,19 @@ async def get_instance_stats(
                 # Sort by priority from instance config
                 filtered_stats = sorted(
                     filtered_stats, 
-                    key=lambda s: instance_configs.get(s.get("name")).priority if s.get("name") in instance_configs else 999,
+                    key=lambda s: instance_configs[s.get("name")].priority if s.get("name") in instance_configs else 999,
                     reverse=reverse
                 )
         
         # Calculate summary statistics
         total_instances = len(filtered_stats)
-        healthy_instances = len([s for s in filtered_stats if s.get("health_status") == "healthy"])
-        error_instances = len([s for s in filtered_stats if s.get("health_status") == "error"])
-        rate_limited_instances = len([s for s in filtered_stats if s.get("health_status") == "rate_limited"])
+        healthy_instances = len([s for s in filtered_stats if s.get("health_status") == InstanceStatus.HEALTHY.value])
+        error_instances = len([s for s in filtered_stats if s.get("health_status") == InstanceStatus.ERROR.value])
+        rate_limited_instances = len([s for s in filtered_stats if s.get("health_status") == InstanceStatus.RATE_LIMITED.value])
         
         # Calculate total TPM across all instances
         total_current_tpm = sum(s.get("current_tpm", 0) for s in filtered_stats)
-        total_max_tpm = sum(instance_configs.get(s.get("name")).max_tpm 
+        total_max_tpm = sum(instance_configs[s.get("name")].max_tpm 
                           for s in filtered_stats 
                           if s.get("name") in instance_configs)
         
@@ -376,9 +369,23 @@ async def get_overall_health():
                     unknown_instances += 1
                     continue
                     
+                # Check for status directly if available
+                if "status" in stats:
+                    status = stats.get("status")
+                    if status == InstanceStatus.HEALTHY.value:
+                        healthy_instances += 1
+                    elif status == InstanceStatus.ERROR.value:
+                        error_instances += 1
+                    elif status == InstanceStatus.RATE_LIMITED.value:
+                        rate_limited_instances += 1
+                    else:
+                        unknown_instances += 1
+                    continue
+                
+                # Fallback to status inference from error counts
                 if stats.get("error_count", 0) > 0:
                     error_instances += 1
-                elif stats.get("rate_limited_count", 0) > 0:
+                elif stats.get("rate_limited_count", 0) > 0 or stats.get("rate_limited_until") is not None:
                     rate_limited_instances += 1
                 elif "last_used" in stats or "current_tpm" in stats:
                     healthy_instances += 1

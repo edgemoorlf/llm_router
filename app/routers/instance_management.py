@@ -1,11 +1,12 @@
-"""Instance management API router."""
-import logging
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, status, Query, Body, BackgroundTasks
-import time
+"""API for instance management (adding, removal, health)"""
 from datetime import datetime
+import logging
+import time
+from typing import Dict, Any, List, Optional
+from fastapi import APIRouter, Query, Body, HTTPException, BackgroundTasks, Request, Depends, status
+from fastapi.responses import JSONResponse
 
-from app.config import InstanceConfig
+from app.models.instance import InstanceConfig, InstanceStatus
 from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
 from app.services.instance_verification_service import instance_verification_service
@@ -56,8 +57,8 @@ async def get_instances_config(
     @handle_errors
     async def _get_instances_config() -> Dict[str, Any]:
 
-        # Get all instances as a list
-        all_instances = list(instance_manager.get_all_instances().values())
+        # Get all instances with both configs and states
+        all_instances = instance_manager.get_all_instances()
         
         # Filter instances
         filtered_instances = filter_instances(
@@ -146,18 +147,18 @@ async def get_instance_details(
         InstanceNotFoundError: If the instance doesn't exist
     """
     # First check if the instance exists
-    instance = instance_manager.get_instance(instance_name)
-    check_instance_exists(instance, instance_name)
+    if not instance_manager.has_instance(instance_name):
+        check_instance_exists(None, instance_name)  # This will raise an error
+        
+    # Get instance configuration and state
+    config = instance_manager.get_instance_config(instance_name)
+    state = instance_manager.get_instance_state(instance_name)
     
-    # Get instance stats
-    instance_stats_response = instance_manager.get_instance_stats(instance_name)
-    if instance_stats_response.get("status") == "success":
-        instance_stats = instance_stats_response.get("instance", {})
-    else:
-        instance_stats = {}
+    # Get stats from the metrics function
+    instance_stats = instance_manager.get_metrics(instance_name) or {}
     
     # Get instance config as dict
-    instance_config = instance.model_dump()
+    instance_config = config.dict() if config else {}
     
     # Remove sensitive information
     if "api_key" in instance_config:
@@ -167,17 +168,18 @@ async def get_instance_details(
     health_status = "unknown"
     health_details = {}
     
-    # Generate basic health status from stats
-    if instance_stats:
-        if instance_stats.get("error_count", 0) > 0:
-            health_status = "error"
-            health_details["error_count"] = instance_stats.get("error_count", 0)
-            health_details["recent_errors"] = instance_stats.get("recent_errors", [])
-        elif instance_stats.get("rate_limited_count", 0) > 0:
-            health_status = "rate_limited"
-            health_details["rate_limited_count"] = instance_stats.get("rate_limited_count", 0)
+    # Generate basic health status from state
+    if state:
+        if state.status == InstanceStatus.ERROR:
+            health_status = InstanceStatus.ERROR.value
+            health_details["error_count"] = state.error_count
+            health_details["last_error"] = state.last_error
+            health_details["last_error_time"] = state.last_error_time
+        elif state.status == InstanceStatus.RATE_LIMITED:
+            health_status = InstanceStatus.RATE_LIMITED.value
+            health_details["rate_limited_until"] = state.rate_limited_until
         else:
-            health_status = "healthy"
+            health_status = InstanceStatus.HEALTHY.value
         
         # Get last used time
         if "last_used" in instance_stats:
@@ -229,9 +231,14 @@ async def get_instance_details(
 @handle_router_errors("adding new instance")
 async def add_instance(instance_config: InstanceConfig) -> Dict[str, Any]:
     """
-    Add a new instance to the proxy service at runtime.
+    Add a new instance to the proxy service.
     
-    Note: This change is not persisted to the configuration file and will be lost on service restart.
+    This operation adds a new instance configuration to the system. The configuration is:
+    1. Saved to the instance_configs.json file
+    2. Persisted in Redis for state information
+    3. Available immediately for routing requests
+    
+    The configuration will persist across service restarts.
     
     Args:
         instance_config: Configuration for the new instance
@@ -251,9 +258,14 @@ async def add_instance(instance_config: InstanceConfig) -> Dict[str, Any]:
 @handle_router_errors("adding multiple instances")
 async def add_many_instances(instances_config: List[InstanceConfig]) -> Dict[str, Any]:
     """
-    Add multiple instances to the proxy service at runtime.
+    Add multiple instances to the proxy service.
     
-    Note: These changes are not persisted to the configuration file and will be lost on service restart.
+    This operation adds multiple instance configurations to the system. Each configuration is:
+    1. Saved to the instance_configs.json file
+    2. Persisted in Redis for state information
+    3. Available immediately for routing requests
+    
+    All configurations will persist across service restarts.
     
     Args:
         instances_config: List of configurations for the new instances
@@ -279,10 +291,14 @@ async def add_many_instances(instances_config: List[InstanceConfig]) -> Dict[str
 @handle_router_errors("removing instance")
 async def remove_instance(instance_name: str) -> Dict[str, Any]:
     """
-    Remove an instance from the proxy service at runtime.
+    Remove an instance from the proxy service.
     
-    Note: This change is not persisted to the configuration file and the instance will be 
-    restored on service restart.
+    This operation removes an instance from the system, which includes:
+    1. Removing the configuration from instance_configs.json file
+    2. Removing all state information from Redis
+    3. Making the instance unavailable for routing requests
+    
+    The removal will persist across service restarts.
     
     Args:
         instance_name: Name of the instance to remove
@@ -307,14 +323,19 @@ async def update_instance(
     """
     Update attributes of an existing instance.
     
-    This endpoint allows updating instance configuration attributes at runtime,
-    such as priority, weight, max_tpm, etc. You can provide only the fields
+    This endpoint allows updating instance configuration attributes, such as 
+    priority, weight, max_tpm, etc. You can provide only the fields
     you want to update.
+    
+    The update process includes:
+    1. Updating the configuration in the instance_configs.json file
+    2. Updating relevant state information in Redis if needed
+    3. Immediately applying changes to the running instance
     
     Sensitive attributes like api_key are only updated if explicitly provided.
     If api_base or provider_type are changed, the instance client will be re-initialized.
     
-    Note: These changes are not persisted to the configuration file and will be lost on service restart.
+    All changes will persist across service restarts.
     
     Args:
         instance_name: Name of the instance to update
@@ -378,3 +399,47 @@ async def verify_instance(
     )
     
     return result 
+
+@router.post("/{instance_name}/reset-health")
+@handle_router_errors("resetting instance health")
+async def reset_instance_health(instance_name: str) -> Dict[str, Any]:
+    """
+    Reset an instance's health status to healthy.
+    
+    This endpoint allows you to manually reset an instance that might have been 
+    wrongfully marked as error or rate-limited. It will:
+    1. Reset the error counter and clear error messages
+    2. Change the status to healthy
+    3. Remove any rate-limiting settings if present
+    
+    This is useful for cases where instances have been automatically marked as
+    unhealthy due to temporary issues or false positives.
+    
+    Args:
+        instance_name: Name of the instance to reset health status
+        
+    Returns:
+        Standardized response with status information
+        
+    Raises:
+        InstanceNotFoundError: If the instance doesn't exist
+    """
+    # Check if the instance exists first
+    check_instance_exists(instance_manager.get_instance_config(instance_name), instance_name)
+    
+    # Reset the instance health
+    instance_manager.mark_healthy(instance_name)
+    
+    # Get the current state to confirm the change
+    state = instance_manager.get_instance_state(instance_name)
+    
+    return {
+        "status": "success",
+        "message": f"Instance '{instance_name}' health status reset to healthy",
+        "timestamp": int(time.time()),
+        "data": {
+            "name": instance_name,
+            "previous_status": "unknown",  # We don't have access to previous status
+            "current_status": state.status.value if state else "unknown"
+        }
+    } 

@@ -8,9 +8,7 @@ from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse
 
 from app.instance.instance_context import instance_manager
-from app.utils.token_estimator import estimate_chat_tokens
 from app.utils.url_builder import build_instance_url
-from app.services.azure_openai import azure_openai_service
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +28,6 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
     """
     # Ensure streaming is enabled
     payload["stream"] = True
-    payload.pop("required_tokens", None)
     
     # Save the original model for adding to response chunks
     model_name = original_model or payload.get("model", "unknown")
@@ -38,116 +35,91 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
     # Ensure model_name is in the payload for Azure deployment mapping
     if "model" not in payload and model_name:
         payload["model"] = model_name
-    
-    # Get max input tokens from instances
-    max_input_tokens = next((inst.get("max_input_tokens", 0) for inst in instance_manager.get_all_instances().values()
-                           if inst.get("max_input_tokens", 0) > 0), None)
 
-    if max_input_tokens:
-        # Estimate tokens in the request
-        if endpoint == "/v1/chat/completions":
-            token_count = estimate_chat_tokens(
-                payload.get("messages", []),
-                payload.get("functions", None),
-                original_model or payload.get("model", ""),
-                provider=provider_type
-            )
-            logger.debug(f"token count: {token_count}")
-            
-            if token_count > max_input_tokens:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Input tokens ({token_count}) exceed maximum allowed ({max_input_tokens})"
-                )
+    # Estimate tokens in the request if it's a chat completion
+    required_tokens = payload.pop("required_tokens", 64)
 
-    # Use appropriate instance selection based on provider type
-    available_instances = []
+    # Select the best instance for this request
+    instance_name = instance_manager.select_instance_for_request(
+        model=model_name,
+        tokens=required_tokens,
+        provider_type=provider_type
+    )
     
-    if provider_type == "azure":
-        # Use the shared instance selection method from azure_openai_service
-        available_instances = azure_openai_service.select_instances_for_model(model_name, token_count)
-        
-        if not available_instances:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"No Azure instances available that support model '{model_name}' for streaming request",
-            )
-    else:
-        # For non-Azure providers, use the original logic
-        available_instances = [instance for instance in instance_manager.get_all_instances().values() 
-                             if instance.get("status", "") != "error" and
-                               instance.get("provider_type", "") != "azure"]
-        
-        # Sort instances by priority
-        available_instances.sort(key=lambda x: x.get("priority", 100))
-    
-    if not available_instances:
+    if not instance_name:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"No available API instances for streaming request with model '{model_name}'",
+            detail=f"No instances available that support model '{model_name}' for streaming request",
         )
+        
+    # Get instance config and state
+    config = instance_manager.get_instance_config(instance_name)
+    state = instance_manager.get_instance_state(instance_name)
     
-    # Try each instance until one succeeds
+    if not config or not state:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to get configuration or state for instance '{instance_name}'",
+        )
+        
+    # Check max input tokens
+    max_input_tokens = config.max_input_tokens
+    if required_tokens > max_input_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input tokens ({required_tokens}) exceed maximum allowed ({max_input_tokens}) for instance '{instance_name}'"
+        )
+        
+    # Check rate limit
+    allowed, retry_after = instance_manager.check_rate_limit(instance_name, required_tokens)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for instance '{instance_name}'. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    # Try each instance until one succeeds, starting with the selected instance
     last_error = None
-    for instance in available_instances:
-        try:
-            # Initialize the instance if needed
-            instance_name = instance.get("name", "")
-            logger.debug(f"Trying to stream using instance: {instance_name}")
-            
-            # For each instance, make sure the model name is in the payload for deployment mapping
-            instance_payload = payload.copy()
-            
-            # Determine deployment name based on the model (for Azure instances)
-            deployment = ""
-            curr_model_name = instance_payload.get("model", "").lower()
-            if curr_model_name and instance.get("provider_type", "") == "azure" and instance.get("model_deployments", {}):
-                # Look up the deployment name for this model in this specific instance
-                model_deployments = instance.get("model_deployments", {})
-                deployment = model_deployments.get(curr_model_name, "")
-                if deployment:
-                    logger.debug(f"Resolved deployment '{deployment}' for model '{curr_model_name}' in instance '{instance_name}'")
-                else:
-                    logger.warning(f"No deployment mapping found for model '{curr_model_name}' in instance '{instance_name}'")
-                    
-                    # Skip this instance if it doesn't have a deployment mapping for this model
-                    if instance.get("provider_type", "") == "azure":
-                        logger.warning(f"Skipping Azure instance {instance_name} that lacks deployment mapping for model {curr_model_name}")
-                        continue
-            
-            # Add current model to instance for URL building
-            instance = instance.copy()  # Make a copy to avoid modifying the original
-            instance["_current_model"] = curr_model_name
-            
-            # Build the URL using shared logic
-            url = build_instance_url(instance, endpoint)
-            if not url:
-                continue  # Skip this instance if URL building failed
-            
-            logger.debug(f"Streaming request via instance {instance_name} to {url}")
-            
-            # Create a new client for streaming (we can't reuse the existing client)
-            client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
-            
-            # Set appropriate headers based on provider type
-            api_key = instance.get("api_key", "")
-            if instance.get("provider_type", "") == "azure":
-                client.headers.update({"api-key": api_key})
-            else:
-                client.headers.update({"Authorization": f"Bearer {api_key}"})
-            
-            # Make the request to the API
-            response = await client.post(url, json=instance_payload, headers={"Accept": "application/json"})
-            
-            # Check for HTTP errors
-            response.raise_for_status()
     
-            # Mark the instance as healthy
-            instance_manager.update_instance_state(instance_name, status="healthy")
-            
-            if endpoint == "/v1/chat/completions":
-                # For chat completions, we need to process each chunk to ensure it matches OpenAI format
-                async def process_stream():
+    try:
+        # Combine config and state for URL building
+        instance = config.dict()
+        instance.update(state.dict())
+        instance["_current_model"] = model_name
+        
+        # Build the URL using shared logic
+        url = build_instance_url(instance, endpoint)
+        if not url:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to build URL for instance '{instance_name}'"
+            )
+        
+        logger.debug(f"Streaming request via instance {instance_name} to {url}")
+        
+        # Create a new client for streaming
+        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+        
+        # Set appropriate headers based on provider type
+        if config.provider_type == "azure":
+            client.headers.update({"api-key": config.api_key})
+        else:
+            client.headers.update({"Authorization": f"Bearer {config.api_key}"})
+        
+        # Make the request to the API
+        response = await client.post(url, json=payload, headers={"Accept": "application/json"})
+        
+        # Check for HTTP errors
+        response.raise_for_status()
+
+        # Mark the instance as healthy
+        instance_manager.mark_healthy(instance_name)
+        
+        if endpoint == "/v1/chat/completions":
+            # Process chat completions stream
+            async def process_stream():
+                try:
                     async for line in response.aiter_lines():
                         if not line or line.strip() == "":
                             continue
@@ -155,7 +127,6 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                         if line.startswith("data:"):
                             line = line[5:].strip()
                             
-                        # Handle the "[DONE]" message that indicates the end of the stream
                         if line == "[DONE]":
                             yield f"data: [DONE]\n\n"
                             continue
@@ -163,21 +134,19 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                         try:
                             chunk = json.loads(line)
                             
-                            # Ensure all required fields exist in the chunk
+                            # Ensure all required fields exist
                             if "choices" not in chunk:
                                 chunk["choices"] = []
                                 
-                            # If we have choices, make sure they have the right format
+                            # Format choices correctly
                             for choice in chunk["choices"]:
                                 if "delta" not in choice and "text" in choice:
-                                    # Convert from completions format to chat format if needed
                                     choice["delta"] = {"content": choice["text"]}
                                     choice.pop("text", None)
                                 elif "delta" in choice and isinstance(choice["delta"], str):
-                                    # Handle the case where delta might be a string
                                     choice["delta"] = {"content": choice["delta"]}
                                     
-                            # Add model if it's missing
+                            # Add model if missing
                             if "model" not in chunk:
                                 chunk["model"] = model_name
                                 
@@ -185,110 +154,144 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                             if "object" not in chunk:
                                 chunk["object"] = "chat.completion.chunk"
                                 
-                            # Format the chunk as a server-sent event
                             yield f"data: {json.dumps(chunk)}\n\n"
                         except json.JSONDecodeError as e:
                             logger.error(f"Error decoding streaming response JSON: {str(e)} - Line: {line}")
-                            # Pass through the line as-is
                             yield f"data: {line}\n\n"
                         except Exception as e:
                             logger.error(f"Error processing streaming chunk: {str(e)}")
-                            
-                return StreamingResponse(
-                    process_stream(),
-                    media_type="text/event-stream",
-                    background=BackgroundTask(client.aclose),
-                )
-            else:
-                # For other endpoints like completions, we still need to ensure SSE format
-                async def process_stream():
+                finally:
+                    # Update instance metrics after streaming completes
+                    instance_manager.record_request(
+                        name=instance_name,
+                        success=True,
+                        tokens=required_tokens
+                    )
+                    
+            return StreamingResponse(
+                process_stream(),
+                media_type="text/event-stream",
+                background=BackgroundTask(client.aclose),
+            )
+        else:
+            # Process other endpoints stream
+            async def process_stream():
+                try:
                     async for line in response.aiter_lines():
                         if not line or line.strip() == "":
                             continue
                             
-                        # If the line already starts with data:, just yield it
                         if line.startswith("data:"):
                             yield f"{line}\n\n"
                             continue
                             
-                        # Handle the "[DONE]" message
                         if line == "[DONE]":
                             yield f"data: [DONE]\n\n"
                             continue
                             
                         try:
-                            # Try to parse as JSON
                             chunk = json.loads(line)
                             
-                            # Ensure all required fields exist
                             if "choices" not in chunk:
                                 chunk["choices"] = []
                                 
-                            # Add model if it's missing
                             if "model" not in chunk:
                                 chunk["model"] = model_name
                                 
-                            # Ensure correct object type for completions
                             if "object" not in chunk:
                                 chunk["object"] = "text_completion.chunk"
                                 
-                            # Format as SSE
                             yield f"data: {json.dumps(chunk)}\n\n"
                         except json.JSONDecodeError as e:
                             logger.error(f"Error decoding streaming response JSON: {str(e)} - Line: {line}")
-                            # Pass through as SSE anyway
                             yield f"data: {line}\n\n"
                         except Exception as e:
                             logger.error(f"Error processing streaming chunk: {str(e)}")
-                
-                return StreamingResponse(
-                    process_stream(),
-                    media_type="text/event-stream",
-                    background=BackgroundTask(client.aclose),
-                )
-                
-        except httpx.HTTPStatusError as e:
-            # Handle API errors
-            error_detail = "Unknown error"
+                finally:
+                    # Update instance metrics after streaming completes
+                    instance_manager.record_request(
+                        name=instance_name,
+                        success=True,
+                        tokens=required_tokens
+                    )
             
-            try:
-                error_response = e.response.json()
-                error_detail = error_response.get("error", {}).get("message", str(e))
-            except Exception:
-                error_detail = e.response.text or str(e)
+            return StreamingResponse(
+                process_stream(),
+                media_type="text/event-stream",
+                background=BackgroundTask(client.aclose),
+            )
             
-            status_code = e.response.status_code
+    except httpx.HTTPStatusError as e:
+        # Handle API errors
+        error_detail = "Unknown error"
+        
+        try:
+            error_response = e.response.json()
+            error_detail = error_response.get("error", {}).get("message", str(e))
+        except Exception:
+            error_detail = e.response.text or str(e)
+        
+        status_code = e.response.status_code
+        
+        # Record the error and update instance state
+        instance_manager.record_request(
+            name=instance_name,
+            success=False,
+            error=error_detail,
+            status_code=status_code
+        )
+        
+        # Handle rate limiting
+        if status_code == 429:
+            retry_after = int(e.response.headers.get("retry-after", "60"))
+            instance_manager.mark_rate_limited(instance_name, retry_after)
+        else:
+            instance_manager.update_instance_state(
+                instance_name,
+                status="error",
+                last_error=error_detail
+            )
             
-            # Handle rate limiting
-            if status_code == 429:
-                retry_after = int(e.response.headers.get("retry-after", "60"))
-                instance_manager.update_instance_state(instance_name, status="rate_limited", retry_after=retry_after)
-                logger.warning(f"Instance {instance_name} rate limited, retrying with next instance")
-                last_error = f"Rate limit exceeded: {error_detail}"
-                continue
-            
-            # Handle other errors
-            instance_manager.update_instance_state(instance_name, status="error", error_detail=error_detail)
-            logger.error(f"Instance {instance_name} returned error {status_code}: {error_detail}")
-            last_error = f"API error: {error_detail}"
-            continue
-            
-        except (httpx.RequestError, httpx.TimeoutException) as e:
-            # Handle connection errors
-            instance_manager.update_instance_state(instance_name, status="error", error_detail=str(e))
-            logger.error(f"Connection error to instance {instance_name}: {str(e)}")
-            last_error = f"Connection error: {str(e)}"
-            continue
-            
-        except Exception as e:
-            # Handle unexpected errors
-            instance_manager.update_instance_state(instance_name, status="error", error_detail=str(e))
-            logger.exception(f"Unexpected error with instance {instance_name}")
-            last_error = f"Unexpected error: {str(e)}"
-            continue
-    
-    # If we get here, all instances failed
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail=f"All API instances failed for streaming request. Last error: {last_error}",
-    )
+        raise HTTPException(
+            status_code=status_code,
+            detail=error_detail,
+            headers=e.response.headers
+        )
+        
+    except (httpx.RequestError, httpx.TimeoutException) as e:
+        # Handle connection errors
+        error_detail = f"Connection error: {str(e)}"
+        instance_manager.record_request(
+            name=instance_name,
+            success=False,
+            error=error_detail,
+            status_code=503
+        )
+        instance_manager.update_instance_state(
+            instance_name,
+            status="error",
+            last_error=error_detail
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_detail
+        )
+        
+    except Exception as e:
+        # Handle unexpected errors
+        error_detail = f"Unexpected error: {str(e)}"
+        instance_manager.record_request(
+            name=instance_name,
+            success=False,
+            error=error_detail,
+            status_code=500
+        )
+        instance_manager.update_instance_state(
+            instance_name,
+            status="error",
+            last_error=error_detail
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_detail
+        )

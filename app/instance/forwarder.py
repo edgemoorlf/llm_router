@@ -8,9 +8,6 @@ from fastapi import HTTPException, status
 from app.models.instance import InstanceConfig, InstanceState
 from .service_stats import service_stats
 
-# Import instance manager from context
-from app.instance.instance_context import instance_manager
-
 logger = logging.getLogger(__name__)
 
 class RequestForwarder:
@@ -240,13 +237,13 @@ class RequestForwarder:
                     state.mark_rate_limited(retry_after)
                     logger.warning(f"Instance {config.name} rate limited: {detail}")
                 else:
-                    state.mark_error(str(e))
+                    state.mark_error(f"instance: {config.name} status_code: {status_code} - {str(e)}")
                     logger.warning(f"Error from instance {config.name}: {detail}")
                 
                 # Fall through to try other instances
             except Exception as e:
                 # Instance errors already recorded in forward_request
-                state.mark_error(str(e))
+                state.mark_error(f"instance: {config.name} status_code: 500 - {str(e)}")
                 logger.warning(f"Unexpected error from instance {config.name}: {str(e)}")
                 # Fall through to try other instances
         else: 
@@ -319,13 +316,13 @@ class RequestForwarder:
                 instance.mark_rate_limited(retry_after)
                 logger.warning(f"Instance {instance.name} rate limited: {detail}")
             else:
-                instance.mark_error(str(e))
+                instance.mark_error(f"instance: {instance.name} status_code: {status_code} - {str(e)}")
                 logger.warning(f"Error from instance {instance.name}: {detail}")
             
             raise
         except Exception as e:
             # If there's an unexpected error, mark the instance as having an error
-            instance.mark_error(str(e))
+            instance.mark_error(f"instance: {instance.name} status_code: 500 - {str(e)}")
             logger.error(f"Unexpected error from instance {instance.name}: {str(e)}")
             
             # Re-raise the exception with a more informative message

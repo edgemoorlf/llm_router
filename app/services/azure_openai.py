@@ -9,16 +9,14 @@ import asyncio
 import os
 
 # Import from instance context
-from app.instance.instance_context import instance_manager, instance_router
-from app.utils.rate_limiter import rate_limiter
-from app.utils.token_estimator import estimate_chat_tokens, estimate_completion_tokens
+from app.instance.instance_context import instance_manager
 from app.utils.url_builder import build_instance_url
+from app.services.instance_selector import instance_selector
+from app.services.error_handler import error_handler
+from app.services.request_transformer import request_transformer
+from app.services.response_cleaner import response_cleaner
 
 logger = logging.getLogger(__name__)
-
-# Default token rate limit (tokens per minute)
-DEFAULT_TOKEN_RATE_LIMIT = 30000
-DEFAULT_MAX_INPUT_TOKENS_LIMIT = 16384
 
 class AzureOpenAIService:
     """Service for Azure OpenAI requests with streamlined endpoint methods."""
@@ -38,342 +36,135 @@ class AzureOpenAIService:
         Returns:
             Transformed payload for Azure OpenAI
         """
-        # Get the model name from the payload
-        model_name = payload.get("model")
-        if not model_name:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Model name is required",
-            )
-            
-        # Use exact model name matching only
-        exact_model_name = model_name.lower()
+        # Delegate to the request transformer service
+        transformed = request_transformer.transform_openai_to_azure(endpoint, payload)
         
         # Verify there are Azure instances that support this model
-        azure_instances = self._get_azure_instances_for_model(exact_model_name)
+        azure_instances = instance_selector.get_instances_for_model(
+            transformed["original_model"], 
+            provider_type="azure"
+        )
         
         if not azure_instances:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"No Azure instances found that support model '{model_name}'",
+                detail=f"No instances found that support model '{payload.get('model')}'",
             )
-        
-        # Clone the payload and remove the model field since Azure uses deployment names
-        azure_payload = payload.copy()
-        azure_payload.pop("model", None)
-        
-        # Estimate tokens for rate limiting and instance selection
-        required_tokens = self._estimate_tokens(endpoint, azure_payload, model_name)
-        
-        # Check against global rate limiter (if enabled)
-        if not azure_payload.get("stream", False) and required_tokens > 0:
-            # Only apply global rate limiting if the per-instance rate limiting is not sufficient
-            # This gives us a fallback mechanism while still preferring per-instance limits
-            allowed, retry_after = rate_limiter.check_and_update(required_tokens, instance_id=None)
-            if not allowed:
-                logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Global rate limit exceeded. Try again in {retry_after} seconds.",
-                    headers={"Retry-After": str(retry_after)},
-                )
-        
-        # Add tokens to payload for later use
-        azure_payload["required_tokens"] = required_tokens
-        logger.debug(f"Transformed request for model '{model_name}' (est. {required_tokens} tokens)")
-        
-        return {
-            "original_model": exact_model_name,  # Preserve the original model name for instance selection
-            "payload": azure_payload
-        }
-    
-    def _estimate_tokens(self, endpoint: str, payload: Dict[str, Any], model_name: str) -> int:
-        """Estimate tokens for the payload based on endpoint type."""
-        # For handling specific endpoints
-        if endpoint == "/v1/chat/completions":
-            # Estimate tokens for chat completions
-            return estimate_chat_tokens(
-                payload.get("messages", []),
-                payload.get("functions", None),
-                model_name,
-                "azure"
-            )
-
-        # For completions endpoint
-        elif endpoint == "/v1/completions":
-            # Estimate tokens for standard completions
-            return estimate_completion_tokens(payload)
-        
-        # For embeddings endpoint (rough estimate)
-        elif endpoint == "/v1/embeddings":
-            # Estimate tokens for embeddings
-            input_text = payload.get("input", "")
-            if isinstance(input_text, str):
-                return len(input_text.split()) * 2  # Rough approximation
-            elif isinstance(input_text, list):
-                return sum(len(text.split()) * 2 for text in input_text if isinstance(text, str))
-        
-        # For other endpoints, use a minimum token count for rate limiting
-        else:
-            return 100  # Minimum token count for unknown endpoints
-        
-    def _clean_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove Azure-specific fields from the response to match OpenAI format."""
-        # Remove top-level Azure-specific fields
-        response.pop("prompt_filter_results", None)
-        response.pop("content_filter_results", None)
-        
-        if "choices" in response:
-            for choice in response["choices"]:
-                # Remove choice-level Azure fields
-                choice.pop("content_filter_results", None)
-                choice.pop("logprobs", None)
-                
-                # Remove refusal field from message
-                if "message" in choice:
-                    choice["message"].pop("refusal", None)
-        
-        return response
+            
+        return transformed
 
     async def forward_request(
         self, endpoint: str, payload: Dict[str, Any], original_model: str, method: str = "POST"
     ) -> Dict[str, Any]:
-        """Forward request to Azure instances with failover handling."""
+        """Forward request to Azure instances with retry and fallback handling."""
         required_tokens = payload.pop("required_tokens", 1000)
+        exclude_instances = set()  # Track excluded instances
+        max_retries = 3
+        retry_count = 0
         
-        # Use the shared instance selection method
-        available_instances = self.select_instances_for_model(original_model, required_tokens)
-        
-        if not available_instances:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                detail=f"No Azure instances available that support model '{original_model}'"
-            )
-            
-        # The first instance is the primary instance based on our selection logic
-        primary_instance = available_instances[0]
-            
-        return await self._execute_request(endpoint, original_model, payload, required_tokens, method, primary_instance)
-
-    def _get_azure_instances(self) -> list:
-        """Get all available Azure instances."""
-        instances = instance_manager.get_all_instances().values()
-        return [i for i in instances if i.get("provider_type", "") == "azure"]
-        
-    def _get_azure_instances_for_model(self, model_name: str) -> list:
-        """Get Azure instances that support a specific model."""
-        return [
-            instance for instance in self._get_azure_instances()
-            if (
-                # Strict model compatibility check - exact match in supported_models only
-                model_name.lower() in [m.lower() for m in instance.get("supported_models", [])]
-            )
-        ]
-
-    def _select_primary_instance(self, instances: list, tokens: int, model_name: str) -> Optional[object]:
-        """
-        Select primary instance based on routing strategy with strict model compatibility checking.
-        
-        Args:
-            instances: List of available Azure instances that support the model
-            tokens: Required tokens for the request
-            model_name: The model name to use
-        """
-        # Filter instances by token capacity and health
-        eligible_instances = []
-        for instance in instances:
-            # Get instance-specific rate limiter
-            instance_name = instance.get("name", "unknown")
-            
-            # Get current usage from instance state
-            current_usage = instance.get("current_tpm", 0)
-            max_tpm = instance.get("max_tpm", DEFAULT_TOKEN_RATE_LIMIT)
-            
-            if current_usage + tokens <= max_tpm:
-                # Verify instance is healthy (not in error or rate limited state)
-                status = instance.get("status", "")
-                if status == "healthy":
-                    eligible_instances.append(instance)
+        while retry_count < max_retries:
+            try:
+                # Get available instances, excluding previously failed ones
+                available_instances = instance_selector.select_instances_for_model(
+                    original_model, 
+                    required_tokens,
+                    provider_type="azure",
+                    exclude_instance_names=exclude_instances
+                )
                 
-        # If we found eligible instances, select one based on the lowest load
-        if eligible_instances:
-            # Choose the instance with the lowest current usage
-            selected_instance = min(eligible_instances, 
-                                 key=lambda i: i.get("current_tpm", 0))
-            logger.debug(f"Selected instance '{selected_instance.get('name', '')}' for model '{model_name}'")
-            # Store the model used for selection to ensure consistent fallback selection
-            selected_instance["_original_model_for_selection"] = model_name
-            return selected_instance
-            
-        # If no eligible instances found with capacity, try using the instance router's selection
-        instance_name = instance_router.select_instance(required_tokens=tokens, model_name=model_name)
-        if instance_name:
-            instance = instance_manager.get_instance(instance_name)
-            if instance and instance.get("provider_type", "") == "azure" and model_name.lower() in [
-                m.lower() for m in instance.get("supported_models", [])
-            ]:
-                logger.debug(f"Selected instance '{instance.get('name', '')}' via instance router for model '{model_name}'")
-                # Store the model used for selection to ensure consistent fallback selection
-                instance["_original_model_for_selection"] = model_name
-            return instance
-            
-        # If no instances are available that meet our criteria, return None
-        logger.error(f"No instances available with capacity for {tokens} tokens for model '{model_name}'")
-        return None
+                if not available_instances:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+                        detail=f"No instances available that support model '{original_model}'"
+                    )
+                
+                # Execute request with fallback handling
+                result = await self._execute_with_fallbacks(
+                    endpoint=endpoint,
+                    model_name=original_model,
+                    payload=payload,
+                    required_tokens=required_tokens,
+                    method=method,
+                    available_instances=available_instances,
+                    exclude_instances=exclude_instances
+                )
+                
+                # Clean the response using the response cleaner service
+                return response_cleaner.clean_azure_response(result)
+                
+            except HTTPException as e:
+                # Check for special errors that should propagate immediately
+                error_handler.handle_special_error(e, "global")
+                
+                # If this was the last retry, re-raise
+                if retry_count >= max_retries - 1:
+                    logger.error(f"All retries failed for model '{original_model}'. Last error: {str(e)}")
+                    raise
+                
+                # Prepare for next retry
+                retry_count += 1
+                logger.warning(f"All instances failed, retry {retry_count}/{max_retries}")
+                await asyncio.sleep(0.5 * retry_count)  # Increasing backoff
 
-    async def _execute_request(
-        self, endpoint: str, model_name: str, payload: Dict[str, Any], required_tokens: int, method: str, instance: Optional[Dict[str, Any]]
+    async def _execute_with_fallbacks(
+        self, 
+        endpoint: str, 
+        model_name: str, 
+        payload: Dict[str, Any], 
+        required_tokens: int,
+        method: str, 
+        available_instances: List[Dict[str, Any]],
+        exclude_instances: set
     ) -> Dict[str, Any]:
-        """Execute the request with failover handling."""
-        # We already check for None in forward_request, but add an assertion for safety
-        assert instance is not None, "Instance should not be None at this point"
+        """Execute request with a list of available instances, trying fallbacks as needed."""
+        fallback_errors = []
         
-        # Preserve the original model for consistent instance selection in fallbacks
-        original_model = instance.get("_original_model_for_selection", model_name)
-        
-        # Ensure the model name is in the payload for deployment name resolution
-        payload_with_model = payload.copy()
-        payload_with_model["model"] = original_model
-            
-        try:
-            # Use the already selected instance directly
+        # Try each instance in sequence until success or all fail
+        for instance in available_instances:
             instance_name = instance.get("name", "")
-            logger.debug(f"Executing request using Azure instance {instance_name} for model {model_name}")
             
-            # Forward the request directly to the selected instance
-            result = await self._forward_request_to_instance(instance, endpoint, payload_with_model, method)
+            # Skip already excluded instances
+            if instance_name in exclude_instances:
+                continue
+                
+            # Prepare payload with model
+            payload_with_model = payload.copy()
+            payload_with_model["model"] = model_name
             
-            # Mark instance as healthy
-            instance_manager.update_instance_state(instance_name, status="healthy")
-            
-            logger.debug(f"Request completed using Azure instance {instance.get('name', '')} for model {model_name}")
-            return self._clean_response(result)
-        except HTTPException as e:
-            # Check for content management policy errors
-            if "content management policy" in e.detail.lower():
-                logger.warning(f"Content policy violation (HTTP {e.status_code}) - prompt: {payload_with_model.get('messages', '')}")
-                # Ensure we're preserving the original error (which should be 400) for content policy violations
-                raise HTTPException(
-                    status_code=e.status_code,  # Preserve original status code (should be 400)
-                    detail=e.detail,
-                    headers=e.headers
+            try:
+                logger.debug(f"Attempting request with instance {instance_name}")
+                
+                # Forward the request directly to this instance
+                result = await self._forward_request_to_instance(
+                    instance, endpoint, payload_with_model, method
                 )
                 
-            # If there's an error with this instance, then try other instances as fallback
-            logger.warning(f"Primary instance {instance.get('name', '')} failed with error {e.status_code}: {e.detail}, falling back to other instances")
-            
-            # Update instance status based on error
-            instance_name = instance.get("name", "")
-            if e.status_code == 429:
-                retry_after = None
-                if hasattr(e, 'headers') and e.headers and 'retry-after' in e.headers:
-                    try:
-                        retry_after = int(e.headers['retry-after'])
-                    except (ValueError, TypeError):
-                        pass
-                instance_manager.update_instance_state(
-                    instance_name,
-                    status="rate_limited",
-                    rate_limited_until=time.time() + (retry_after or 60)
-                )
-            else:
-                instance_manager.update_instance_state(
-                    instance_name,
-                    status="error",
-                    last_error=str(e),
-                    error_count=instance.get("error_count", 0) + 1
-                )
-            
-            # Get all eligible Azure instances that support this model (excluding the failed one)
-            azure_instances = self._get_azure_instances_for_model(original_model)
-            eligible_instances = []
-            
-            for candidate in azure_instances:
-                # Don't include the failed instance
-                if candidate.get('name', '') == instance.get('name', ''):
-                    continue
+                # Success - mark instance as healthy
+                error_handler.update_instance_status(instance_name, "healthy")
+                logger.debug(f"Request completed using Azure instance {instance_name}")
+                
+                return result
+                
+            except HTTPException as e:
+                # Handle special errors that should propagate immediately
+                error_handler.handle_special_error(e, instance_name)
                     
-                # Verify token capacity
-                current_tpm = candidate.get("instance_stats", {}).get("current_tpm", 0) 
-                max_tpm = candidate.get("max_tpm", 0)
-                token_capacity_sufficient = current_tpm + required_tokens <= max_tpm
+                # Update instance status and track the error
+                error_handler.handle_instance_error(instance, e)
+                exclude_instances.add(instance_name)
+                fallback_errors.append(f"{instance_name}: {str(e)}")
                 
-                # Check instance is healthy (not rate limited or in error state)
-                is_healthy = candidate.get("status", "") == "healthy"
-                
-                if token_capacity_sufficient and is_healthy:
-                    eligible_instances.append(candidate)
-            
-            # Log the number of eligible instances
-            logger.debug(f"Found {len(eligible_instances)} eligible fallback instances for model '{original_model}'")
-            
-            # Try all eligible instances
-            if eligible_instances:
-                fallback_errors = []
-                
-                for fallback_instance in eligible_instances:
-                    try:
-                        # Forward the request to the fallback instance
-                        fallback_name = fallback_instance.get("name", "")
-                        logger.debug(f"Trying fallback instance {fallback_name} for model {original_model}")
-                        
-                        result = await self._forward_request_to_instance(fallback_instance, endpoint, payload_with_model, method)
-                        
-                        # Mark instance as healthy and update TPM
-                        fallback_name = fallback_instance.get("name", "")
-                        instance_manager.update_instance_state(fallback_name, status="healthy")
-                        
-                        if "usage" in result and "total_tokens" in result["usage"]:
-                            # Update TPM directly through the instance manager
-                            current_stats = fallback_instance.get("instance_stats", {})
-                            current_tpm = current_stats.get("current_tpm", 0)
-                            new_tpm = current_tpm + result["usage"]["total_tokens"]
-                            instance_manager.update_instance_state(
-                                fallback_name,
-                                instance_stats={"current_tpm": new_tpm}
-                            )
-                            
-                        logger.debug(f"Request completed using fallback Azure instance {fallback_name}")
-                        return self._clean_response(result)
-                    except Exception as fallback_e:
-                        error_msg = str(fallback_e)
-                        logger.warning(f"Fallback instance {fallback_instance.get('name', '')} failed with error: {error_msg}")
-                        fallback_errors.append(f"{fallback_instance.get('name', '')}: {error_msg}")
-                        
-                        # Update fallback instance status
-                        fallback_name = fallback_instance.get("name", "")
-                        if isinstance(fallback_e, HTTPException) and fallback_e.status_code == 429:
-                            retry_after = None
-                            if hasattr(fallback_e, 'headers') and fallback_e.headers and 'retry-after' in fallback_e.headers:
-                                try:
-                                    retry_after = int(fallback_e.headers['retry-after'])
-                                except (ValueError, TypeError):
-                                    pass
-                            instance_manager.update_instance_state(
-                                fallback_name,
-                                status="rate_limited",
-                                rate_limited_until=time.time() + (retry_after or 60)
-                            )
-                        else:
-                            instance_manager.update_instance_state(
-                                fallback_name,
-                                status="error",
-                                last_error=error_msg,
-                                error_count=fallback_instance.get("error_count", 0) + 1
-                            )
-                
-                # If we get here, all fallbacks failed
-                error_detail = f"All eligible fallback instances failed. Primary error: {e.detail}. Fallback errors: {', '.join(fallback_errors)}"
-                logger.error(error_detail)
-                raise HTTPException(
-                    status_code=e.status_code,
-                    detail=error_detail,
-                    headers=e.headers if hasattr(e, "headers") else {}
-                )
-            else:
-                logger.error(f"No eligible fallback instances found with capacity for {required_tokens} tokens for model '{original_model}'")
-                raise e
-                
+                # Log failure and continue to next instance
+                logger.warning(f"Instance {instance_name} failed with error {str(e)}, trying next instance")
+        
+        # If we get here, all instances failed
+        error_detail = f"All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
+        logger.error(error_detail)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_detail
+        )
+
     async def _forward_request_to_instance(
         self, instance: Dict[str, Any], endpoint: str, payload: Dict[str, Any], method: str = "POST"
     ) -> Dict[str, Any]:
@@ -400,7 +191,7 @@ class AzureOpenAIService:
         api_version = instance.get("api_version", "")
         model_deployments = instance.get("model_deployments", {})
         timeout_seconds = instance.get("timeout_seconds", 60.0)
-        retry_count = instance.get("retry_count", 3)
+        retry_count = instance.get("retry_count", 5)
         
         # Extract model from payload
         model_name = payload.get("model", "").lower() if payload and "model" in payload else ""
@@ -473,7 +264,11 @@ class AzureOpenAIService:
                     last_error = e
                     
                     # Don't retry on certain status codes
-                    if e.response.status_code in [400, 401, 403, 404]:
+                    if e.response.status_code in [400, 401, 403, 404, 429]:
+                        # For 429, we should break to let the higher level fallback logic handle it
+                        # rather than retrying the same rate-limited instance
+                        if e.response.status_code == 429:
+                            logger.warning(f"[{request_id}] Instance {instance_name} is rate limited (HTTP 429). Breaking retry loop to try other instances.")
                         break
                         
                     # For other errors, retry with backoff
@@ -481,7 +276,7 @@ class AzureOpenAIService:
                         backoff_seconds = (2 ** retry) * 0.5  # Exponential backoff
                         logger.warning(f"[{request_id}] Request failed with HTTP {e.response.status_code}, retrying in {backoff_seconds:.2f}s ({retry+1}/{retry_count})")
                         await asyncio.sleep(backoff_seconds)
-                    
+                
                 except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
                     last_error = e
                     
@@ -527,7 +322,7 @@ class AzureOpenAIService:
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"Service unavailable: {str(last_error)}"
                 )
-        
+
     async def get_instances_status(self) -> List[Dict[str, Any]]:
         """Get the status of all Azure instances."""
         all_stats = instance_manager.get_instance_stats()
@@ -537,56 +332,36 @@ class AzureOpenAIService:
             if stats.get("provider_type", "") == "azure"
         ]
 
-    def select_instances_for_model(self, model_name: str, required_tokens: int = 0, exclude_instance_name: str = None) -> list:
+    def select_instances_for_model(self, model_name: str, required_tokens: int = 0, exclude_instance_name: str = None, exclude_instance_names: set = None) -> list:
         """
         Select Azure instances suitable for a specific model, ordered by suitability.
-        This method can be shared with other services like streaming to ensure consistent selection logic.
+        
+        This method is now a wrapper around the dedicated instance_selector service to maintain backward compatibility
+        while reducing code duplication.
         
         Args:
             model_name: The model name to use
             required_tokens: Required tokens for the request (for capacity checking)
-            exclude_instance_name: Optional instance name to exclude (e.g., after a failure)
+            exclude_instance_name: Optional instance name to exclude (e.g., after a failure) - DEPRECATED
+            exclude_instance_names: Optional set of instance names to exclude (e.g., after failures)
             
         Returns:
             List of instances ordered by suitability (primary instance first, then fallbacks)
         """
-        # Get Azure instances that support this model
-        azure_instances = self._get_azure_instances_for_model(model_name)
-        
-        if not azure_instances:
-            return []
+        # For backward compatibility
+        excluded = set()
+        if exclude_instance_names:
+            excluded = exclude_instance_names
+        elif exclude_instance_name:
+            excluded.add(exclude_instance_name)
             
-        # Select the best instance based on capacity and health
-        primary_instance = self._select_primary_instance(azure_instances, required_tokens, model_name)
-        
-        available_instances = []
-        if primary_instance:
-            # Don't include if it matches the exclude name
-            if not exclude_instance_name or primary_instance.get("name") != exclude_instance_name:
-                available_instances = [primary_instance]  # Start with the best instance
-            
-            # Add other eligible instances as fallbacks
-            for instance in azure_instances:
-                instance_name = instance.get("name", "")
-                # Skip if it's the primary instance or excluded instance
-                if instance_name == primary_instance.get("name") or instance_name == exclude_instance_name:
-                    continue
-                
-                # Only include healthy instances
-                if instance.get("status") == "healthy":
-                    available_instances.append(instance)
-        else:
-            # If no primary instance was found, use all healthy instances that support the model
-            available_instances = [
-                instance for instance in azure_instances 
-                if instance.get("status") == "healthy" and 
-                   (not exclude_instance_name or instance.get("name") != exclude_instance_name)
-            ]
-            
-        # Sort by priority (lowest number = highest priority)
-        available_instances.sort(key=lambda x: x.get("priority", 100))
-        
-        return available_instances
+        # Delegate to the instance selector service
+        return instance_selector.select_instances_for_model(
+            model_name,
+            required_tokens,
+            provider_type="azure",
+            exclude_instance_names=excluded
+        )
 
 # Create a singleton instance
 azure_openai_service = AzureOpenAIService()

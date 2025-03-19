@@ -12,7 +12,7 @@ import os
 from typing import Dict, Optional, List, Any
 from redis import Redis
 from urllib.parse import urlparse
-from app.models.instance import InstanceState, create_instance_state
+from app.models.instance import InstanceState, InstanceStatus, create_instance_state
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +26,21 @@ class RedisStateStore:
     - Runtime metrics persist with the server
     """
     
-    def __init__(self, redis_url: str = "redis://localhost:6379/0"):
+    def __init__(self, redis_url: str = "redis://localhost:6379/0", redis_password: Optional[str] = None):
         """
         Initialize the Redis state store.
         
         Args:
             redis_url: Redis connection URL
+            redis_password: Redis password for authentication
         """
         # Parse Redis connection parameters
         parsed = urlparse(redis_url)
         host = parsed.hostname or 'localhost'
         port = parsed.port or 6379
         db = int(parsed.path.lstrip('/') or '0')
-        password = os.environ.get('REDIS_PASSWORD')  # Get password directly from env
+        # Use the provided password or fall back to environment variable
+        password = redis_password or os.environ.get('REDIS_PASSWORD')
 
         # Initialize Redis connection with explicit parameters
         self.redis = Redis(
@@ -56,6 +58,13 @@ class RedisStateStore:
         try:
             self.redis.ping()
             logger.info(f"Successfully connected to Redis at {host}:{port}")
+            
+            # Debug: Check if there are any keys in Redis
+            logger.debug("Checking Redis keys after initialization")
+            all_keys = self.redis.keys("*")
+            logger.debug(f"Total Redis keys found: {len(all_keys)}")
+            if all_keys:
+                logger.debug(f"Sample keys: {all_keys[:5]}")
         except Exception as e:
             logger.error(f"Failed to connect to Redis: {e}")
             raise
@@ -63,21 +72,29 @@ class RedisStateStore:
     def get_state(self, name: str) -> Optional[InstanceState]:
         """Get instance state with rate limit expiration handling."""
         key = f"{self.state_prefix}{name}"
+        # logger.debug(f"Getting state for key: {key}")
         data = self.redis.get(key)
         if not data:
+            logger.debug(f"No state found for {name}, creating fresh state")
             # Create fresh state and store it directly without calling update_state
             state = create_instance_state(name)
-            self.redis.set(key, json.dumps(state.dict()))
+            state_json = json.dumps(state.dict())
+            logger.debug(f"Setting fresh state for {name}: {state_json[:50]}...")
+            result = self.redis.set(key, state_json)
+            logger.debug(f"Redis SET result for fresh state: {result}")
             return state
             
         try:
+            # logger.debug(f"Found state data for {name}: {data[:50]}...")
             state_data = json.loads(data)
             # Check if rate limited and if it should be cleared
-            if state_data.get("status") == "rate_limited":
+            if state_data.get("status") == InstanceStatus.RATE_LIMITED.value:
                 rate_limit_key = f"{self.rate_limit_prefix}{name}"
                 if not self.redis.exists(rate_limit_key):
                     # Rate limit expired, but keep other state information
-                    state_data["status"] = "healthy" if state_data.get("error_count", 0) == 0 else "error"
+                    state_data["status"] = (InstanceStatus.HEALTHY.value 
+                                          if state_data.get("error_count", 0) == 0 
+                                          else InstanceStatus.ERROR.value)
                     state_data["rate_limited_until"] = None
                     # Store updated state directly
                     self.redis.set(key, json.dumps(state_data))
@@ -109,7 +126,7 @@ class RedisStateStore:
                 setattr(current, k, v)
                 
         # Special handling for rate limiting
-        if kwargs.get("status") == "rate_limited":
+        if kwargs.get("status") == InstanceStatus.RATE_LIMITED:
             rate_limit_key = f"{self.rate_limit_prefix}{name}"
             rate_limit_until = kwargs.get("rate_limited_until")
             if rate_limit_until:
@@ -143,8 +160,8 @@ class RedisStateStore:
             
             if success:
                 state.successful_requests += 1
-                if state.status != "rate_limited":  # Don't clear rate limiting
-                    state.status = "healthy"
+                if state.status != InstanceStatus.RATE_LIMITED:  # Don't clear rate limiting
+                    state.status = InstanceStatus.HEALTHY
                 state.error_count = 0
                 state.current_tpm += tokens
             else:
@@ -156,7 +173,7 @@ class RedisStateStore:
                 if status_code:
                     if status_code in [401, 403, 404]:
                         # Permanent errors - mark instance as error
-                        state.status = "error"
+                        state.status = InstanceStatus.ERROR
                         logger.error(f"Instance {name} marked as error due to {status_code}: {error}")
                     elif status_code == 429:
                         # Rate limiting - will be handled by update_state
@@ -164,7 +181,7 @@ class RedisStateStore:
                     elif status_code >= 500:
                         # Server errors - mark as error after multiple failures
                         if state.error_count >= 3:
-                            state.status = "error"
+                            state.status = InstanceStatus.ERROR
                             logger.warning(f"Instance {name} marked as error after {state.error_count} server errors")
                 
             if latency_ms is not None:
@@ -187,11 +204,21 @@ class RedisStateStore:
     def get_all_states(self) -> Dict[str, InstanceState]:
         """Get all current instance states."""
         states = {}
-        for key in self.redis.keys(f"{self.state_prefix}*"):
+        #logger.debug(f"Searching for keys with pattern: {self.state_prefix}*")
+        redis_keys = self.redis.keys(f"{self.state_prefix}*")
+        logger.debug(f"Found {len(redis_keys)} keys in Redis: {redis_keys}")
+        
+        for key in redis_keys:
             name = key.replace(self.state_prefix, "")
+            # logger.debug(f"Getting state for instance: {name}")
             state = self.get_state(name)
             if state:
+                # logger.debug(f"Found state for {name}: {state.status}")
                 states[name] = state
+            else:
+                logger.debug(f"No state found for {name}")
+                
+        # logger.debug(f"Returning {len(states)} states: {list(states.keys())}")
         return states
             
     def clear_error_state(self, name: str) -> bool:
@@ -200,8 +227,8 @@ class RedisStateStore:
         This can be used when an admin wants to re-enable an errored instance.
         """
         state = self.get_state(name)
-        if state and state.status == "error":
-            state.status = "healthy"
+        if state and state.status == InstanceStatus.ERROR:
+            state.status = InstanceStatus.HEALTHY
             state.error_count = 0
             state.last_error = None
             state.last_error_time = None
@@ -220,23 +247,46 @@ class RedisStateStore:
         """
         try:
             # Clear all keys with our prefixes
-            for key in self.redis.keys(f"{self.state_prefix}*"):
+            logger.debug(f"Clearing Redis states with prefix: {self.state_prefix}*")
+            state_keys = self.redis.keys(f"{self.state_prefix}*")
+            logger.debug(f"Found {len(state_keys)} state keys to clear")
+            for key in state_keys:
+                logger.debug(f"Deleting state key: {key}")
                 self.redis.delete(key)
-            for key in self.redis.keys(f"{self.rate_limit_prefix}*"):
+                
+            logger.debug(f"Clearing Redis rate limits with prefix: {self.rate_limit_prefix}*")
+            rate_limit_keys = self.redis.keys(f"{self.rate_limit_prefix}*")
+            logger.debug(f"Found {len(rate_limit_keys)} rate limit keys to clear")
+            for key in rate_limit_keys:
+                logger.debug(f"Deleting rate limit key: {key}")
                 self.redis.delete(key)
             
             logger.info("Cleared all existing states from Redis")
             
             # Initialize fresh states for provided instances
             if instance_names:
+                logger.debug(f"Initializing fresh states for {len(instance_names)} instances: {instance_names}")
                 for name in instance_names:
                     state = create_instance_state(name)
                     key = f"{self.state_prefix}{name}"
-                    self.redis.set(key, json.dumps(state.dict()))
+                    logger.debug(f"Setting state for {name} at key {key}")
+                    result = self.redis.set(key, json.dumps(state.dict()))
+                    logger.debug(f"Redis SET result for {name}: {result}")
                 logger.info(f"Initialized fresh states for {len(instance_names)} instances")
+                
+                # Debug: Verify if states were created
+                logger.debug("Verifying if states were created in Redis")
+                count = 0
+                for name in instance_names:
+                    key = f"{self.state_prefix}{name}"
+                    exists = self.redis.exists(key)
+                    if exists:
+                        count += 1
+                    logger.debug(f"Checking if {key} exists: {exists}")
+                logger.debug(f"Found {count}/{len(instance_names)} states in Redis after initialization")
             
         except Exception as e:
-            logger.error(f"Error resetting states on startup: {e}")
+            logger.error(f"Error resetting states on startup: {e}", exc_info=True)
         
         # Reset usage metrics and clear rate limits for all states
         for key in self.redis.keys(f"{self.state_prefix}*"):
@@ -255,11 +305,32 @@ class RedisStateStore:
                     state_data["current_rpm"] = 0
                     
                     # Only clear rate limited status
-                    if state_data.get("status") == "rate_limited":
-                        state_data["status"] = "healthy" if state_data.get("error_count", 0) == 0 else "error"
+                    if state_data.get("status") == InstanceStatus.RATE_LIMITED.value:
+                        state_data["status"] = (InstanceStatus.HEALTHY.value 
+                                              if state_data.get("error_count", 0) == 0 
+                                              else InstanceStatus.ERROR.value)
                         state_data["rate_limited_until"] = None
                         
                     # Store updated state directly instead of using update_state
                     self.redis.set(key, json.dumps(state_data))
             except Exception as e:
                 logger.error(f"Error resetting state for {key}: {e}") 
+
+    def remove_state(self, name: str) -> bool:
+        """
+        Remove the state data for an instance.
+        
+        Args:
+            name: Name of the instance to remove
+            
+        Returns:
+            True if the state was removed, False otherwise
+        """
+        key = f"{self.state_prefix}{name}"
+        rate_limit_key = f"{self.rate_limit_prefix}{name}"
+        
+        # Remove both the state and any rate limit keys
+        deleted_state = self.redis.delete(key)
+        deleted_rate_limit = self.redis.delete(rate_limit_key)
+        
+        return deleted_state > 0 or deleted_rate_limit > 0 

@@ -54,7 +54,7 @@ async def reload_config() -> Dict[str, Any]:
     instance_manager.reload_config()
     
     # Get the number of instances after reload
-    instance_count = len(instance_manager.get_all_instances())
+    instance_count = len(instance_manager.get_all_configs())
     
     return {
         "status": "success",

@@ -7,11 +7,13 @@ that uses the separated configuration and state architecture.
 
 import logging
 import time
-from typing import Dict, List, Optional, Any, Union
+import os
+from typing import Dict, List, Optional, Any, Union, Tuple
 
-from app.models.instance import InstanceConfig, InstanceState, create_instance_state
+from app.models.instance import InstanceConfig, InstanceState, InstanceStatus, create_instance_state
 from app.storage.config_store import ConfigStore
 from app.storage.redis_state_store import RedisStateStore
+from app.utils.rate_limiter import get_rate_limiter, RateLimiter, DEFAULT_TOKEN_RATE_LIMIT, DEFAULT_MAX_INPUT_TOKENS_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -27,65 +29,130 @@ class InstanceManager:
     
     def __init__(self, 
                 config_file: str = "instance_configs.json",
-                redis_url: str = "redis://localhost:6379/0",
+                redis_url: Optional[str] = None,
+                redis_password: Optional[str] = None,
                 rpm_window_minutes: int = 5):
         """
         Initialize the instance manager.
         
         Args:
             config_file: Path to the configuration file
-            redis_url: Redis connection URL for state storage
+            redis_url: Redis connection URL for state storage (defaults to env var REDIS_URL)
+            redis_password: Redis password for authentication (defaults to env var REDIS_PASSWORD)
             rpm_window_minutes: Time window in minutes for statistics calculation
         """
         # Initialize stores
         self.config_store = ConfigStore(config_file)
-        self.state_store = RedisStateStore(redis_url=redis_url)
+        
+        # Get Redis configuration from environment or parameters
+        self.redis_url = redis_url or os.environ.get("REDIS_URL", "redis://localhost:6379")
+        self.redis_password = redis_password or os.environ.get("REDIS_PASSWORD", "")
+        self.use_redis = os.environ.get("USE_REDIS", "").lower() in ("true", "1", "yes")
+        
+        # Initialize state store with Redis configuration
+        self.state_store = RedisStateStore(redis_url=self.redis_url, redis_password=self.redis_password)
         self.rpm_window_minutes = rpm_window_minutes
         
-        # Initialize states for all configs
+        # Initialize rate limiters dictionary
+        self.rate_limiters: Dict[str, RateLimiter] = {}
+        
+        # Initialize states and rate limiters for all configs
         self._initialize_states()
         
         self.router = None  # Will be initialized later
         
-        # Reset transient states on startup
-        self.state_store.reset_states_on_startup()
-        
     def _initialize_states(self):
-        """Initialize states for all configured instances."""
+        """Initialize states and rate limiters for all configured instances."""
         configs = self.config_store.get_all_configs()
         if configs:
-            logger.info(f"Initializing states for {len(configs)} instances")
+            logger.info(f"Initializing states and rate limiters for {len(configs)} instances")
             # Get list of instance names
             instance_names = list(configs.keys())
             # Reset states and initialize new ones
             self.state_store.reset_states_on_startup(instance_names)
-            # Initialize states for each instance
-            for name in instance_names:
+            
+            # Initialize states and rate limiters for each instance
+            for name, config in configs.items():
+                # Initialize state if not exists
                 if not self.state_store.get_state(name):
                     state = create_instance_state(name)
-                    self.state_store.update_state(name, **state.dict())
+                    state_dict = state.dict()
+                    state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+                    self.state_store.update_state(name, **state_dict)
+                
+                # Only create rate limiter if it doesn't exist
+                if name not in self.rate_limiters:
+                    self.rate_limiters[name] = get_rate_limiter(
+                        instance_id=name,
+                        tokens_per_minute=config.max_tpm,
+                        use_redis=self.use_redis,
+                        redis_url=self.redis_url,
+                        redis_password=self.redis_password,
+                        max_input_tokens=config.max_input_tokens
+                    )
+                else:
+                    # Update existing rate limiter if config changed
+                    existing_limiter = self.rate_limiters[name]
+                    if (existing_limiter.tokens_per_minute != config.max_tpm or 
+                        existing_limiter.max_input_tokens != config.max_input_tokens):
+                        logger.info(f"Updating rate limiter configuration for instance {name}")
+                        self.rate_limiters[name] = get_rate_limiter(
+                            instance_id=name,
+                            tokens_per_minute=config.max_tpm,
+                            use_redis=self.use_redis,
+                            redis_url=self.redis_url,
+                            redis_password=self.redis_password,
+                            max_input_tokens=config.max_input_tokens
+                        )
+
+    def _get_rate_limiter(self, name: str) -> Optional[RateLimiter]:
+        """
+        Get the rate limiter for an instance.
         
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            Rate limiter for the instance or None if not found
+        """
+        rate_limiter = self.rate_limiters.get(name)
+        if not rate_limiter:
+            logger.warning(f"No rate limiter found for instance {name}, this should not happen")
+        return rate_limiter
+
     def reload_config(self):
         """Reload configurations from storage and YAML."""
+        # Store old configs for comparison
+        old_configs = self.config_store.get_all_configs()
+        
         # First try to reload from JSON storage
         self.config_store = ConfigStore(self.config_store.config_file)
         
         # If no configs loaded, try YAML
         if not self.config_store.get_all_configs():
             self.config_store._load_from_yaml()
+            
+        new_configs = self.config_store.get_all_configs()
         
-        # Make sure all configured instances have a state
+        # Remove rate limiters for instances that no longer exist
+        removed_instances = set(old_configs.keys()) - set(new_configs.keys())
+        for name in removed_instances:
+            if name in self.rate_limiters:
+                logger.info(f"Removing rate limiter for deleted instance {name}")
+                del self.rate_limiters[name]
+        
+        # Initialize states and update rate limiters for current configs
         self._initialize_states()
-        
-    def get_instance(self, name: str) -> Optional[Dict[str, Any]]:
+
+    def get_instance(self, name: str) -> Optional[Tuple[InstanceConfig, InstanceState]]:
         """
-        Get an instance by name.
+        Get an instance by name, returning both config and state.
         
         Args:
             name: Name of the instance
             
         Returns:
-            Combined instance data or None if not found
+            Tuple of (config, state) if found, None otherwise
         """
         config = self.config_store.get_config(name)
         if not config:
@@ -93,35 +160,37 @@ class InstanceManager:
             
         state = self.state_store.get_state(name)
         if not state:
-            return config.dict()
+            # If state doesn't exist, create a new one
+            state = create_instance_state(name)
+            state_dict = state.dict()
+            state_dict.pop('name', None)  # Remove name to avoid duplicate
+            self.state_store.update_state(name, **state_dict)
             
-        # Combine config and state, preferring config values
-        result = config.dict()
-        for k, v in state.dict().items():
-            if k != 'name':  # Skip name to avoid duplication
-                result[k] = v
-        return result
+        return (config, state)
         
-    def get_all_instances(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_instances(self) -> List[Tuple[InstanceConfig, InstanceState]]:
         """
-        Get all instances.
+        Get all instances with their configs and states.
         
         Returns:
-            Dictionary of instance name to combined properties
+            List of (config, state) tuples
         """
-        result = {}
+        results = []
         configs = self.config_store.get_all_configs()
         states = self.state_store.get_all_states()
         
         for name, config in configs.items():
-            result[name] = config.dict()
-            if name in states:
-                state = states[name]
-                for k, v in state.dict().items():
-                    if k != 'name':  # Skip name to avoid duplication
-                        result[name][k] = v
-                        
-        return result
+            # Get or create state if needed
+            state = states.get(name)
+            if not state:
+                state = create_instance_state(name)
+                state_dict = state.dict()
+                state_dict.pop('name', None)  # Remove name to avoid duplicate
+                self.state_store.update_state(name, **state_dict)
+                
+            results.append((config, state))
+            
+        return results
         
     def get_instance_stats(self) -> Dict[str, Any]:
         """
@@ -130,14 +199,20 @@ class InstanceManager:
         Returns:
             Dictionary with instance statistics
         """
+        logger.debug("Calling get_instance_stats")
         states = self.state_store.get_all_states()
+        logger.debug(f"Retrieved {len(states)} states: {list(states.keys())}")
         
         # Filter to only include instances that have configuration
         configs = self.config_store.get_all_configs()
+        logger.debug(f"Retrieved {len(configs)} configs: {list(configs.keys())}")
+        
         instance_stats = [
             state.dict() for name, state in states.items()
             if name in configs
         ]
+        
+        logger.debug(f"Filtered to {len(instance_stats)} instances with both state and config")
         
         return {
             "status": "success",
@@ -153,7 +228,7 @@ class InstanceManager:
         Args:
             name: Name of the instance
             **kwargs: State properties to update
-            
+        
         Returns:
             True if successful, False otherwise
         """
@@ -167,8 +242,8 @@ class InstanceManager:
             return True
         except Exception as e:
             logger.error(f"Error updating state for {name}: {e}")
-            return False
-            
+        return False
+
     def clear_instance_error(self, name: str) -> bool:
         """
         Clear error state for an instance.
@@ -180,7 +255,7 @@ class InstanceManager:
             True if successful, False otherwise
         """
         return self.state_store.clear_error_state(name)
-        
+            
     def record_request(self, name: str, success: bool, tokens: int = 0,
                       latency_ms: Optional[float] = None,
                       error: Optional[str] = None,
@@ -212,7 +287,7 @@ class InstanceManager:
         except Exception as e:
             logger.error(f"Error recording request for {name}: {e}")
             return False
-
+    
     def get_all_configs(self) -> Dict[str, InstanceConfig]:
         """
         Get all instance configurations.
@@ -233,7 +308,7 @@ class InstanceManager:
             The instance configuration or None if not found
         """
         return self.config_store.get_config(name)
-
+    
     def get_instance_state(self, name: str) -> Optional[InstanceState]:
         """
         Get current state for a specific instance.
@@ -245,7 +320,7 @@ class InstanceManager:
             The instance state or None if not found
         """
         return self.state_store.get_state(name)
-
+    
     def get_all_states(self) -> Dict[str, InstanceState]:
         """
         Get all instance states.
@@ -268,7 +343,9 @@ class InstanceManager:
         state.current_tpm = sum(state.usage_window.values())
         state.total_tokens_served += tokens
         
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
     
     def update_rpm_usage(self, name: str) -> None:
         """Update the requests per minute counter for an instance."""
@@ -291,7 +368,9 @@ class InstanceManager:
         else:
             state.current_rpm = total_requests_in_window
             
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
         self.update_error_rates(name)
     
     def update_error_rates(self, name: str) -> None:
@@ -328,31 +407,48 @@ class InstanceManager:
             state.current_500_rate = 0.0
             state.current_503_rate = 0.0
             
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
     
-    def record_error(self, name: str, status_code: int) -> None:
-        """Record an instance-level error."""
+    def record_error(self, name: str, error_type: str, error_message: str) -> None:
+        """
+        Record an error for an instance.
+        
+        Args:
+            name: Name of the instance
+            error_type: Type of error (client_error, upstream_error)
+            error_message: Error message
+        """
         state = self.state_store.get_state(name)
         if not state:
             return
             
         current_time = int(time.time())
         
-        if status_code == 500:
-            state.total_errors_500 += 1
-            state.error_500_window[current_time] = state.error_500_window.get(current_time, 0) + 1
-        elif status_code == 503:
-            state.total_errors_503 += 1
-            state.error_503_window[current_time] = state.error_503_window.get(current_time, 0) + 1
-        else:
-            state.total_other_errors += 1
-            state.error_other_window[current_time] = state.error_other_window.get(current_time, 0) + 1
-            
-        self.state_store.update_state(name, **state.dict())
-        self.update_error_rates(name)
+        # Update state with error information
+        state.error_count += 1
+        state.last_error = error_message
+        state.last_error_time = current_time
         
-        logger.debug(f"Recorded instance-level error {status_code} for instance {name}, "
-                    f"current error rate: {state.current_error_rate:.2%}")
+        # Update state based on error type
+        if error_type == "client_error":
+            # Use a generic status code for client errors
+            self.record_client_error(name, 400)
+        elif error_type == "upstream_error":
+            # Use a generic status code for upstream errors
+            self.record_upstream_error(name, 500)
+        
+        # If too many errors, mark instance as unhealthy
+        if state.error_count >= 3:
+            state.status = InstanceStatus.ERROR
+            
+        # Save the updated state
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
+        
+        logger.debug(f"Recorded {error_type} for instance {name}: {error_message}")
     
     def record_client_error(self, name: str, status_code: int, timestamp: Optional[int] = None) -> None:
         """Record a client-level error."""
@@ -373,7 +469,9 @@ class InstanceManager:
             state.total_client_errors_other += 1
             state.client_error_other_window[timestamp] = state.client_error_other_window.get(timestamp, 0) + 1
             
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
         self.update_error_rates(name)
         
         logger.debug(f"Recorded client-level error {status_code} for instance {name}, "
@@ -400,7 +498,9 @@ class InstanceManager:
             state.total_upstream_other_errors += 1
             state.upstream_other_window[current_time] = state.upstream_other_window.get(current_time, 0) + 1
             
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
         self.update_error_rates(name)
         
         logger.debug(f"Recorded upstream error {status_code} for instance {name}, "
@@ -413,13 +513,15 @@ class InstanceManager:
             return True
             
         # Check explicit rate limit status
-        if state.status == "rate_limited":
+        if state.status == InstanceStatus.RATE_LIMITED:
             current_time = time.time()
             if state.rate_limited_until and current_time >= state.rate_limited_until:
                 logger.info(f"Instance {name} rate limit has expired, marking as healthy")
-                state.status = "healthy"
+                state.status = InstanceStatus.HEALTHY
                 state.rate_limited_until = None
-                self.state_store.update_state(name, **state.dict())
+                state_dict = state.dict()
+                state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+                self.state_store.update_state(name, **state_dict)
                 return False
             return True
             
@@ -437,11 +539,13 @@ class InstanceManager:
         if not state:
             return
             
-        state.status = "rate_limited"
+        state.status = InstanceStatus.RATE_LIMITED
         if retry_after is None:
             retry_after = 60
         state.rate_limited_until = time.time() + retry_after
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
         logger.warning(f"Instance {name} marked as rate limited for {retry_after} seconds")
     
     def mark_healthy(self, name: str) -> None:
@@ -450,11 +554,13 @@ class InstanceManager:
         if not state:
             return
             
-        state.status = "healthy"
+        state.status = InstanceStatus.HEALTHY
         state.error_count = 0
         state.last_error = None
         state.rate_limited_until = None
-        self.state_store.update_state(name, **state.dict())
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.state_store.update_state(name, **state_dict)
     
     def get_metrics(self, name: str) -> Optional[Dict[str, Any]]:
         """Get all metrics for an instance."""
@@ -501,4 +607,208 @@ class InstanceManager:
                     "other": state.total_upstream_other_errors
                 }
             }
-        } 
+        }
+
+    def check_rate_limit(self, name: str, tokens: int) -> Tuple[bool, Optional[float]]:
+        """
+        Check if an instance has capacity for the requested tokens.
+        
+        Args:
+            name: Name of the instance
+            tokens: Number of tokens requested
+            
+        Returns:
+            Tuple of (allowed: bool, retry_after: Optional[float])
+        """
+        rate_limiter = self._get_rate_limiter(name)
+        if not rate_limiter:
+            logger.error(f"No rate limiter found for instance {name}")
+            return False, None
+            
+        return rate_limiter.check_and_update(tokens)
+
+    def get_current_usage(self, name: str) -> int:
+        """
+        Get current token usage for an instance.
+        
+        Args:
+            name: Name of the instance
+            
+        Returns:
+            Current token usage in the rate limit window
+        """
+        rate_limiter = self._get_rate_limiter(name)
+        if not rate_limiter:
+            logger.error(f"No rate limiter found for instance {name}")
+            return 0
+            
+        return rate_limiter.get_current_usage()
+
+    def select_instance_for_request(self, model: str, tokens: int, provider_type: str = None) -> Optional[str]:
+        """
+        Select the best instance for a request based on model support, health, and capacity.
+        
+        Args:
+            model: Model name requested
+            tokens: Number of tokens needed
+            provider_type: Optional provider type filter
+            
+        Returns:
+            Name of selected instance or None if no suitable instance found
+        """
+        configs = self.get_all_configs()
+        states = self.get_all_states()
+        
+        eligible_instances = []
+        
+        for name, config in configs.items():
+            # Skip if provider type doesn't match
+            if provider_type and config.provider_type != provider_type:
+                continue
+                
+            # Skip if model not supported
+            if model.lower() not in [m.lower() for m in config.supported_models]:
+                continue
+                
+            # Get current state
+            state = states.get(name)
+            if not state or state.status != InstanceStatus.HEALTHY:
+                continue
+                
+            # Check rate limit
+            allowed, _ = self.check_rate_limit(name, tokens)
+            if not allowed:
+                continue
+                
+            eligible_instances.append((name, config))
+            
+        if not eligible_instances:
+            return None
+            
+        # Sort by priority and current usage
+        eligible_instances.sort(key=lambda x: (
+            x[1].priority,
+            self.get_current_usage(x[0])
+        ))
+        
+        return eligible_instances[0][0]
+
+    def has_instance(self, name: str) -> bool:
+        """
+        Check if an instance with the given name exists.
+        
+        Args:
+            name: Name of the instance to check
+            
+        Returns:
+            True if the instance exists, False otherwise
+        """
+        return name in self.config_store.get_all_configs()
+        
+    def add_instance(self, config: InstanceConfig) -> bool:
+        """
+        Add a new instance configuration and initialize its state.
+        
+        Args:
+            config: The instance configuration to add
+            
+        Returns:
+            True if the instance was added successfully, False otherwise
+        """
+        # Add the configuration
+        added = self.config_store.add_config(config)
+        
+        if added:
+            # Initialize state if doesn't exist
+            if not self.state_store.get_state(config.name):
+                state = create_instance_state(config.name)
+                state_dict = state.dict()
+                state_dict.pop('name', None)  # Remove name to avoid duplicate
+                self.state_store.update_state(config.name, **state_dict)
+            
+            # Initialize rate limiter
+            if config.name not in self.rate_limiters:
+                self.rate_limiters[config.name] = get_rate_limiter(
+                    instance_id=config.name,
+                    tokens_per_minute=config.max_tpm,
+                    use_redis=self.use_redis,
+                    redis_url=self.redis_url,
+                    redis_password=self.redis_password,
+                    max_input_tokens=config.max_input_tokens
+                )
+        
+        return added
+        
+    def set_rpm_window(self, name: str, minutes: int) -> None:
+        """
+        Set the RPM window size for an instance.
+        
+        Args:
+            name: Name of the instance
+            minutes: Window size in minutes
+        """
+        # Update the RPM window size
+        self.rpm_window_minutes = minutes
+        
+        # Create a new window in state if needed
+        state = self.state_store.get_state(name)
+        if state:
+            # No need to update the state here as the RPM window
+            # is managed by the instance manager
+            pass
+    
+    def update_instance(self, name: str, config: InstanceConfig) -> bool:
+        """
+        Update an instance configuration.
+        
+        Args:
+            name: Name of the instance to update
+            config: New configuration for the instance
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        # Get the current config
+        current_config = self.config_store.get_config(name)
+        if not current_config:
+            logger.warning(f"Cannot update non-existent instance: {name}")
+            return False
+            
+        # Update the configuration
+        result = self.config_store.add_config(config)
+        
+        # If tpm or input tokens changed, update the rate limiter
+        if result and (config.max_tpm != current_config.max_tpm or 
+                    config.max_input_tokens != current_config.max_input_tokens):
+            # Update rate limiter if it exists
+            if name in self.rate_limiters:
+                self.rate_limiters[name] = get_rate_limiter(
+                    instance_id=name,
+                    tokens_per_minute=config.max_tpm,
+                    use_redis=self.use_redis,
+                    redis_url=self.redis_url,
+                    redis_password=self.redis_password,
+                    max_input_tokens=config.max_input_tokens
+                )
+                
+        return result
+        
+    def remove_instance(self, name: str) -> bool:
+        """
+        Remove an instance configuration and state.
+        
+        Args:
+            name: Name of the instance to remove
+            
+        Returns:
+            True if the instance was removed, False otherwise
+        """
+        # Remove rate limiter if it exists
+        if name in self.rate_limiters:
+            del self.rate_limiters[name]
+        
+        # Remove from storage
+        config_removed = self.config_store.remove_config(name)
+        state_removed = self.state_store.remove_state(name)
+        
+        return config_removed or state_removed 

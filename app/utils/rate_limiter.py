@@ -306,7 +306,6 @@ def get_rate_limiter(
         Configured rate limiter instance
     """
     if use_redis:
-        logger.info(f"Using Redis rate limiter for instance {instance_id}")
         return RedisRateLimiter(
             instance_id=instance_id,
             tokens_per_minute=tokens_per_minute,

@@ -16,13 +16,12 @@ load_dotenv()
 
 # Import configuration system
 from app.config import config_loader
-from app.instance.manager import InstanceManager
 
 # Load configuration
 config = config_loader.load_config()
 
-# Initialize the instance manager
-instance_manager = InstanceManager()
+# Import instance manager and router from the context module
+from app.instance.instance_context import instance_manager
 
 # Configure logging
 log_level = getattr(logging, config.logging.level)
@@ -105,8 +104,6 @@ if config.logging.feishu_webhook:
     # Also add to file handler for consistency
     logging.getLogger().addHandler(feishu_handler)
 
-# Import instance manager and router from the context module
-from app.instance.instance_context import instance_manager, instance_router, check_for_updates
 
 # Create FastAPI app
 app = FastAPI(
@@ -143,15 +140,6 @@ async def log_requests(request: Request, call_next):
         logger.error(f"Error processing request {request_id}: {str(e)}")
         raise
 
-@app.middleware("http")
-async def check_instance_updates_middleware(request: Request, call_next):
-    """Middleware to check for instance updates before processing each request."""
-    # Check for updates from the shared state file
-    check_for_updates()
-    
-    # Process the request
-    response = await call_next(request)
-    return response
 
 # Import router modules
 from app.routers import openai_proxy

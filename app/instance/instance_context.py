@@ -17,11 +17,13 @@ logger = logging.getLogger(__name__)
 # Get configuration from environment variables
 config_file_path = os.environ.get("INSTANCE_CONFIG_FILE", "instance_configs.json")
 redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+redis_password = os.environ.get("REDIS_PASSWORD", "")
 
 # Initialize the instance manager
 instance_manager = InstanceManager(
     config_file=config_file_path,
-    redis_url=redis_url
+    redis_url=redis_url,
+    redis_password=redis_password
 )
 
 # Initialize the router

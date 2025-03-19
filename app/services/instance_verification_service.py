@@ -5,8 +5,7 @@ from typing import Dict, Any, Optional
 
 from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
-from app.errors.exceptions import InstanceNotFoundError, ProxyError
-from app.errors.utils import check_instance_exists
+from app.errors.exceptions import InstanceNotFoundError
 from app.errors.handlers import handle_errors
 
 logger = logging.getLogger(__name__)
@@ -40,21 +39,24 @@ class InstanceVerificationService:
         Raises:
             InstanceNotFoundError: If the instance doesn't exist
         """
-        # Check if instance exists
-        instance = instance_manager.get_instance(instance_name)
-        check_instance_exists(instance, instance_name)
+        # Get instance config and state
+        config = instance_manager.get_instance_config(instance_name)
+        state = instance_manager.get_instance_state(instance_name)
+        
+        if not config:
+            raise InstanceNotFoundError(instance_name)
         
         start_time = time.time()
         
         # If no model specified, use the first supported model
-        if not model_to_test and instance.supported_models:
-            model_to_test = instance.supported_models[0]
+        if not model_to_test and config.supported_models:
+            model_to_test = config.supported_models[0]
         
         # Initialize test results
         result = {
             "status": "success",
             "instance_name": instance_name,
-            "provider_type": instance.provider_type,
+            "provider_type": config.provider_type,
             "timestamp": int(time.time()),
             "tests": {
                 "configuration": {
@@ -82,21 +84,21 @@ class InstanceVerificationService:
             # Check if configuration is complete
             config_issues = []
             
-            if not instance.api_key:
+            if not config.api_key:
                 config_issues.append("API key is missing")
             
-            if not instance.api_base:
+            if not config.api_base:
                 config_issues.append("API base URL is missing")
             
-            if instance.provider_type == "azure" and not instance.api_version:
+            if config.provider_type == "azure" and not config.api_version:
                 config_issues.append("API version is missing for Azure provider")
                 
             # For Azure provider, check deployment mappings
-            if instance.provider_type == "azure" and not instance.model_deployments:
+            if config.provider_type == "azure" and not config.model_deployments:
                 config_issues.append("No model deployment mappings defined for Azure provider")
             
             # Check if any supported models are defined
-            if not instance.supported_models:
+            if not config.supported_models:
                 config_issues.append("No supported models defined")
             
             if config_issues:
@@ -107,11 +109,11 @@ class InstanceVerificationService:
             else:
                 result["tests"]["configuration"]["status"] = "passed"
                 result["tests"]["configuration"]["details"] = {
-                    "api_base": instance.api_base,
-                    "provider_type": instance.provider_type,
-                    "api_version": instance.api_version if instance.provider_type == "azure" else "N/A",
-                    "supported_models_count": len(instance.supported_models),
-                    "deployment_mappings_count": len(instance.model_deployments) if instance.model_deployments else 0
+                    "api_base": config.api_base,
+                    "provider_type": config.provider_type,
+                    "api_version": config.api_version if config.provider_type == "azure" else "N/A",
+                    "supported_models_count": len(config.supported_models),
+                    "deployment_mappings_count": len(config.model_deployments) if config.model_deployments else 0
                 }
         except Exception as e:
             logger.error(f"Error during configuration check: {str(e)}")
@@ -135,18 +137,18 @@ class InstanceVerificationService:
                 result["tests"]["model_support"]["details"] = {
                     "model": model_to_test,
                     "supported": can_handle,
-                    "all_supported_models": instance.supported_models
+                    "all_supported_models": config.supported_models
                 }
                 
                 # For Azure, include deployment mapping
-                if instance.provider_type == "azure" and can_handle:
+                if config.provider_type == "azure" and can_handle:
                     deployment = self._get_deployment_for_model(instance_name, model_to_test)
                     result["tests"]["model_support"]["details"]["deployment"] = deployment
             else:
                 result["tests"]["model_support"]["status"] = "skipped"
                 result["tests"]["model_support"]["details"] = {
                     "reason": "No model specified for testing",
-                    "all_supported_models": instance.supported_models
+                    "all_supported_models": config.supported_models
                 }
         except Exception as e:
             logger.error(f"Error during model support check: {str(e)}")
@@ -198,34 +200,34 @@ class InstanceVerificationService:
     
     def _can_handle_model(self, instance_name: str, model_name: str) -> bool:
         """Check if an instance can handle a specific model."""
-        instance = instance_manager.get_instance(instance_name)
-        if not instance:
+        config = instance_manager.get_instance_config(instance_name)
+        if not config:
             return False
             
         # If no supported models list, assume it can handle any model
-        if not instance.supported_models:
+        if not config.supported_models:
             return True
             
         # Check for exact match
-        if model_name in instance.supported_models:
+        if model_name in config.supported_models:
             return True
             
         # Check for case-insensitive match
-        return model_name.lower() in [m.lower() for m in instance.supported_models]
+        return model_name.lower() in [m.lower() for m in config.supported_models]
     
     def _get_deployment_for_model(self, instance_name: str, model_name: str) -> Optional[str]:
         """Get the deployment name for a specific model."""
-        instance = instance_manager.get_instance(instance_name)
-        if not instance or not instance.model_deployments:
+        config = instance_manager.get_instance_config(instance_name)
+        if not config or not config.model_deployments:
             return None
             
         # Check for exact match
-        if model_name in instance.model_deployments:
-            return instance.model_deployments[model_name]
+        if model_name in config.model_deployments:
+            return config.model_deployments[model_name]
             
         # Check for case-insensitive match
         model_name_lower = model_name.lower()
-        for k, v in instance.model_deployments.items():
+        for k, v in config.model_deployments.items():
             if k.lower() == model_name_lower:
                 return v
                 
@@ -234,9 +236,10 @@ class InstanceVerificationService:
     @handle_errors
     async def _test_model_call(self, instance_name: str, model_name: str, message: str) -> Dict[str, Any]:
         """Test a model call with a simple message."""
-        # Get the instance
-        instance = instance_manager.get_instance(instance_name)
-        check_instance_exists(instance, instance_name)
+        # Get the instance config
+        config = instance_manager.get_instance_config(instance_name)
+        if not config:
+            raise InstanceNotFoundError(instance_name)
         
         # Build a simple test payload
         payload = {
@@ -248,20 +251,28 @@ class InstanceVerificationService:
         # Start timing
         start_time = time.time()
         
-        # For now, just test connectivity rather than making an actual API call
-        # In the future, we could integrate with the instance forwarder to make a real request
-        
-        # Simulate successful response
-        execution_time = round((time.time() - start_time) * 1000, 2)
-        
-        return {
-            "status": "passed",
-            "details": {
-                "model": model_name,
-                "response": "Simulated successful model call",
-                "execution_time_ms": execution_time
+        try:
+            # Use the instance service to make the test call
+            response = await instance_service.test_model(instance_name, payload)
+            
+            # Calculate latency
+            latency = round((time.time() - start_time) * 1000, 2)  # Convert to ms
+            
+            return {
+                "status": "passed",
+                "details": {
+                    "latency_ms": latency,
+                    "response": response
+                }
             }
-        }
+            
+        except Exception as e:
+            return {
+                "status": "failed",
+                "details": {
+                    "error": str(e)
+                }
+            }
 
 # Create a singleton instance
 instance_verification_service = InstanceVerificationService() 

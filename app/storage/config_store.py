@@ -66,8 +66,18 @@ class ConfigStore:
         """Persist configurations to storage."""
         with self.file_lock:
             try:
+                # Ensure absolute path to file
+                if not os.path.isabs(self.config_file):
+                    self.config_file = os.path.abspath(self.config_file)
+                    
                 # Create directory if it doesn't exist
-                os.makedirs(os.path.dirname(self.config_file) or '.', exist_ok=True)
+                file_dir = os.path.dirname(self.config_file)
+                if file_dir and not os.path.exists(file_dir):
+                    logger.info(f"Creating directory for config file: {file_dir}")
+                    os.makedirs(file_dir, exist_ok=True)
+                
+                # Log the file path
+                logger.debug(f"Saving configurations to file: {self.config_file}")
                 
                 # Convert to dict of dicts for JSON serialization
                 data = {name: config.dict() for name, config in self.configs.items()}
@@ -76,13 +86,23 @@ class ConfigStore:
                 temp_file = f"{self.config_file}.tmp"
                 with open(temp_file, "w") as f:
                     json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())  # Ensure data is written to disk
+                
+                # Verify the temporary file exists and has content
+                if not os.path.exists(temp_file):
+                    logger.error(f"Failed to create temporary file: {temp_file}")
+                    return
+                    
+                temp_file_size = os.path.getsize(temp_file)
+                logger.debug(f"Temporary file created: {temp_file}, size: {temp_file_size} bytes")
                 
                 # Rename to the actual file
                 os.replace(temp_file, self.config_file)
                 
                 logger.info(f"Saved {len(self.configs)} instance configurations to {self.config_file}")
             except Exception as e:
-                logger.error(f"Error saving configurations to {self.config_file}: {e}")
+                logger.error(f"Error saving configurations to {self.config_file}: {e}", exc_info=True)
     
     def get_config(self, name: str) -> Optional[InstanceConfig]:
         """
@@ -105,6 +125,9 @@ class ConfigStore:
             Dictionary of instance name to configuration
         """
         with self.file_lock:
+            # Reload from file to ensure we have the latest configurations
+            self._load_configs()
+            
             # Return a copy to avoid external modifications
             return dict(self.configs)
     
@@ -120,8 +143,27 @@ class ConfigStore:
         """
         with self.file_lock:
             try:
+                # Check if we need to convert a relative path to absolute
+                if not os.path.isabs(self.config_file):
+                    abs_path = os.path.abspath(self.config_file)
+                    logger.debug(f"Converting relative path '{self.config_file}' to absolute: '{abs_path}'")
+                    self.config_file = abs_path
+                
+                logger.debug(f"Adding config for instance '{config.name}' to file: {self.config_file}")
+                
+                # Add to in-memory dictionary
                 self.configs[config.name] = config
+                
+                # Explicitly save to disk
                 self._save_configs()
+                
+                # Verify the file was saved
+                if os.path.exists(self.config_file):
+                    file_size = os.path.getsize(self.config_file)
+                    logger.debug(f"Config file saved successfully. Size: {file_size} bytes")
+                else:
+                    logger.error(f"Failed to save config file. File does not exist: {self.config_file}")
+                    
                 return True
             except Exception as e:
                 logger.error(f"Error adding configuration for {config.name}: {e}")
@@ -147,6 +189,18 @@ class ConfigStore:
                     logger.error(f"Error deleting configuration for {name}: {e}")
                     return False
             return False
+    
+    def remove_config(self, name: str) -> bool:
+        """
+        Remove a configuration. Alias for delete_config.
+        
+        Args:
+            name: Name of the instance to remove
+            
+        Returns:
+            True if the configuration was removed, False otherwise
+        """
+        return self.delete_config(name)
     
     def _load_from_yaml(self):
         """Load initial configurations from YAML if JSON file is empty or missing."""
