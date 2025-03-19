@@ -193,6 +193,19 @@ class InstanceSelector:
             logger.warning(f"Instance {instance_name} has None status, defaulting to healthy")
             instance["status"] = "healthy"
             status = "healthy"
+        
+        # Proactively check if rate limit has expired
+        if status == "rate_limited":
+            rate_limited_until = instance.get("rate_limited_until")
+            if rate_limited_until and time.time() >= rate_limited_until:
+                logger.info(f"Rate limit for instance {instance_name} has expired in selector, marking as healthy")
+                instance["status"] = "healthy"
+                status = "healthy"
+                # Also update in the actual instance manager
+                instance_manager.mark_healthy(instance_name)
+            else:
+                remaining = int(rate_limited_until - time.time()) if rate_limited_until else 0
+                logger.debug(f"Instance {instance_name} still rate limited for {remaining} more seconds")
             
         # Skip if not healthy
         if status != "healthy":

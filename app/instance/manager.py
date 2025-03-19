@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Any, Union, Tuple
 from app.models.instance import InstanceConfig, InstanceState, InstanceStatus, create_instance_state
 from app.storage.config_store import ConfigStore
 from app.storage.redis_state_store import RedisStateStore
-from app.utils.rate_limiter import get_rate_limiter, RateLimiter, DEFAULT_TOKEN_RATE_LIMIT, DEFAULT_MAX_INPUT_TOKENS_LIMIT
+from app.utils.rate_limiter import get_rate_limiter, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -148,16 +148,24 @@ class InstanceManager:
         """
         Get an instance by name, returning both config and state.
         
+        This method always retrieves fresh data from both the config file and Redis,
+        to ensure consistency across multiple worker processes.
+        
         Args:
             name: Name of the instance
             
         Returns:
             Tuple of (config, state) if found, None otherwise
         """
+        # Always reload configs to get fresh data
+        self.config_store.reload()
+        
+        # Get fresh config
         config = self.config_store.get_config(name)
         if not config:
             return None
             
+        # Get fresh state directly from Redis
         state = self.state_store.get_state(name)
         if not state:
             # If state doesn't exist, create a new one
@@ -170,14 +178,26 @@ class InstanceManager:
         
     def get_all_instances(self) -> List[Tuple[InstanceConfig, InstanceState]]:
         """
-        Get all instances with their configs and states.
+        Get all instances with their configs and states directly from storage.
+        
+        This method always gets fresh data from both the config file and Redis,
+        to ensure consistency across multiple worker processes.
         
         Returns:
             List of (config, state) tuples
         """
         results = []
+        
+        # Always reload configs to get fresh data
+        self.config_store.reload()
+        
+        # Get fresh configs
         configs = self.config_store.get_all_configs()
+        
+        # Get fresh states directly from Redis
         states = self.state_store.get_all_states()
+        
+        logger.debug(f"get_all_instances: retrieved {len(configs)} configs and {len(states)} states")
         
         for name, config in configs.items():
             # Get or create state if needed
@@ -311,7 +331,7 @@ class InstanceManager:
     
     def get_instance_state(self, name: str) -> Optional[InstanceState]:
         """
-        Get current state for a specific instance.
+        Get current state for a specific instance directly from Redis.
         
         Args:
             name: Name of the instance
@@ -319,15 +339,19 @@ class InstanceManager:
         Returns:
             The instance state or None if not found
         """
+        # Always get a fresh state from Redis, no caching
+        logger.debug(f"Getting fresh state for instance {name} directly from Redis")
         return self.state_store.get_state(name)
     
     def get_all_states(self) -> Dict[str, InstanceState]:
         """
-        Get all instance states.
+        Get all instance states directly from Redis.
         
         Returns:
             Dictionary of instance name to state
         """
+        # Always get fresh states from Redis, no caching
+        logger.debug("Getting all fresh states directly from Redis")
         return self.state_store.get_all_states()
 
     def update_tpm_usage(self, name: str, tokens: int) -> None:

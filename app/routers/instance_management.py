@@ -204,13 +204,13 @@ async def get_instance_details(
             
             # Update health status based on connection test
             if connection_test["status"] != "passed":
-                health_status = "error"
+                health_status = InstanceStatus.ERROR.value
         except Exception as e:
             health_details["connection_test"] = {
                 "status": "error",
                 "details": {"error": str(e)}
             }
-            health_status = "error"
+            health_status = InstanceStatus.ERROR.value
     
     # Build the response
     result = {
@@ -427,8 +427,18 @@ async def reset_instance_health(instance_name: str) -> Dict[str, Any]:
     # Check if the instance exists first
     check_instance_exists(instance_manager.get_instance_config(instance_name), instance_name)
     
+    # Get the current state to capture previous status
+    previous_state = instance_manager.get_instance_state(instance_name)
+    previous_status = previous_state.status.value if previous_state else "unknown"
+    
     # Reset the instance health
     instance_manager.mark_healthy(instance_name)
+    
+    # Explicitly delete any rate limit keys
+    if hasattr(instance_manager.state_store, "redis"):
+        rate_limit_key = f"{instance_manager.state_store.rate_limit_prefix}{instance_name}"
+        instance_manager.state_store.redis.delete(rate_limit_key)
+        logger.info(f"Explicitly deleted rate limit key for instance {instance_name}")
     
     # Get the current state to confirm the change
     state = instance_manager.get_instance_state(instance_name)
@@ -439,7 +449,117 @@ async def reset_instance_health(instance_name: str) -> Dict[str, Any]:
         "timestamp": int(time.time()),
         "data": {
             "name": instance_name,
-            "previous_status": "unknown",  # We don't have access to previous status
+            "previous_status": previous_status,
             "current_status": state.status.value if state else "unknown"
+        }
+    }
+
+@router.post("/{instance_name}/reset-rate-limit")
+@handle_router_errors("resetting rate limit")
+async def reset_rate_limit(instance_name: str) -> Dict[str, Any]:
+    """
+    Reset an instance's rate limit status.
+    
+    This endpoint specifically targets instances that are in a rate-limited state.
+    It will:
+    1. Remove the rate-limited status
+    2. Clear any rate limit expiration timestamps
+    3. Delete the rate limit tracking keys in Redis
+    
+    This is useful for cases where instances have been automatically rate-limited
+    and you need to force them back to service immediately.
+    
+    Args:
+        instance_name: Name of the instance to reset rate limit
+        
+    Returns:
+        Standardized response with status information
+        
+    Raises:
+        InstanceNotFoundError: If the instance doesn't exist
+    """
+    # Check if the instance exists first
+    check_instance_exists(instance_manager.get_instance_config(instance_name), instance_name)
+    
+    # Get the current state to capture previous status
+    previous_state = instance_manager.get_instance_state(instance_name)
+    previous_status = previous_state.status.value if previous_state else "unknown"
+    
+    # Only perform actions if the instance is actually rate-limited
+    is_rate_limited = (previous_state and previous_state.status == InstanceStatus.RATE_LIMITED)
+    
+    if is_rate_limited:
+        # Clear rate limit and mark healthy
+        instance_manager.mark_healthy(instance_name)
+        
+        # Explicitly delete any rate limit keys
+        if hasattr(instance_manager.state_store, "redis"):
+            rate_limit_key = f"{instance_manager.state_store.rate_limit_prefix}{instance_name}"
+            instance_manager.state_store.redis.delete(rate_limit_key)
+            logger.info(f"Explicitly deleted rate limit key for instance {instance_name}")
+        
+        message = f"Rate limit for instance '{instance_name}' has been cleared"
+    else:
+        message = f"Instance '{instance_name}' was not rate-limited, no action taken"
+    
+    # Get the current state to confirm the change
+    state = instance_manager.get_instance_state(instance_name)
+    
+    return {
+        "status": "success",
+        "message": message,
+        "timestamp": int(time.time()),
+        "data": {
+            "name": instance_name,
+            "previous_status": previous_status,
+            "current_status": state.status.value if state else "unknown",
+            "was_rate_limited": is_rate_limited
+        }
+    }
+
+@router.post("/reset-all-rate-limits")
+@handle_router_errors("resetting all rate limits")
+async def reset_all_rate_limits() -> Dict[str, Any]:
+    """
+    Reset rate limit status for all rate-limited instances.
+    
+    This endpoint will scan all instances and:
+    1. Identify all instances that are currently rate-limited
+    2. Reset their status to healthy
+    3. Delete all associated rate limit keys
+    
+    This is useful for system-wide recovery after a burst of rate limit errors,
+    or when restarting services after a period of inactivity.
+    
+    Returns:
+        Standardized response with stats on how many instances were affected
+    """
+    # Get all instances
+    states = instance_manager.get_all_states()
+    
+    # Track which instances were reset
+    reset_instances = []
+    
+    # Check each instance
+    for name, state in states.items():
+        if state.status == InstanceStatus.RATE_LIMITED:
+            # Reset this instance
+            instance_manager.mark_healthy(name)
+            
+            # Explicitly delete any rate limit keys
+            if hasattr(instance_manager.state_store, "redis"):
+                rate_limit_key = f"{instance_manager.state_store.rate_limit_prefix}{name}"
+                instance_manager.state_store.redis.delete(rate_limit_key)
+                
+            reset_instances.append(name)
+            logger.info(f"Reset rate limit for instance {name}")
+    
+    return {
+        "status": "success",
+        "message": f"Reset rate limits for {len(reset_instances)} instances",
+        "timestamp": int(time.time()),
+        "data": {
+            "affected_instances": reset_instances,
+            "count": len(reset_instances)
         }
     } 

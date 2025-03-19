@@ -72,7 +72,7 @@ class RedisStateStore:
     def get_state(self, name: str) -> Optional[InstanceState]:
         """Get instance state with rate limit expiration handling."""
         key = f"{self.state_prefix}{name}"
-        # logger.debug(f"Getting state for key: {key}")
+        logger.debug(f"Getting state for key: {key}")
         data = self.redis.get(key)
         if not data:
             logger.debug(f"No state found for {name}, creating fresh state")
@@ -85,13 +85,18 @@ class RedisStateStore:
             return state
             
         try:
-            # logger.debug(f"Found state data for {name}: {data[:50]}...")
+            logger.debug(f"Found state data for {name}: {data[:50]}...")
             state_data = json.loads(data)
             # Check if rate limited and if it should be cleared
             if state_data.get("status") == InstanceStatus.RATE_LIMITED.value:
                 rate_limit_key = f"{self.rate_limit_prefix}{name}"
-                if not self.redis.exists(rate_limit_key):
+                rate_limited_until = state_data.get("rate_limited_until")
+                
+                # Check both the explicit key and the timestamp to ensure we clear expired rate limits
+                if (not self.redis.exists(rate_limit_key) or 
+                    (rate_limited_until and time.time() >= rate_limited_until)):
                     # Rate limit expired, but keep other state information
+                    logger.info(f"Rate limit for instance {name} has expired, marking as healthy")
                     state_data["status"] = (InstanceStatus.HEALTHY.value 
                                           if state_data.get("error_count", 0) == 0 
                                           else InstanceStatus.ERROR.value)
@@ -108,7 +113,7 @@ class RedisStateStore:
     def update_state(self, name: str, **kwargs) -> InstanceState:
         """Update instance state with error type awareness."""
         key = f"{self.state_prefix}{name}"
-        
+        logger.debug(f"Updating state for key: {key}")
         # Get current state directly from Redis
         data = self.redis.get(key)
         if data:
@@ -126,7 +131,7 @@ class RedisStateStore:
                 setattr(current, k, v)
                 
         # Special handling for rate limiting
-        if kwargs.get("status") == InstanceStatus.RATE_LIMITED:
+        if kwargs.get("status") == InstanceStatus.RATE_LIMITED.value:
             rate_limit_key = f"{self.rate_limit_prefix}{name}"
             rate_limit_until = kwargs.get("rate_limited_until")
             if rate_limit_until:
@@ -134,7 +139,16 @@ class RedisStateStore:
                 if ttl > 0:
                     # Only the rate limit key expires, not the main state
                     self.redis.setex(rate_limit_key, ttl, "1")
+                    logger.info(f"Set rate limit for instance {name} to expire in {ttl} seconds")
                     
+        # Check if we're clearing a rate limit status
+        elif (kwargs.get("status") == InstanceStatus.HEALTHY.value and
+              current.status == InstanceStatus.RATE_LIMITED):
+            # Clear the rate limit key explicitly
+            rate_limit_key = f"{self.rate_limit_prefix}{name}"
+            self.redis.delete(rate_limit_key)
+            logger.info(f"Explicitly cleared rate limit for instance {name}")
+            
         # Store updated state (without TTL)
         self.redis.set(key, json.dumps(current.dict()))
         return current
@@ -160,7 +174,7 @@ class RedisStateStore:
             
             if success:
                 state.successful_requests += 1
-                if state.status != InstanceStatus.RATE_LIMITED:  # Don't clear rate limiting
+                if state.status != InstanceStatus.RATE_LIMITED:  # This is correct - comparing Enum to Enum
                     state.status = InstanceStatus.HEALTHY
                 state.error_count = 0
                 state.current_tpm += tokens
@@ -183,7 +197,7 @@ class RedisStateStore:
                         if state.error_count >= 3:
                             state.status = InstanceStatus.ERROR
                             logger.warning(f"Instance {name} marked as error after {state.error_count} server errors")
-                
+            
             if latency_ms is not None:
                 if state.avg_latency_ms is None:
                     state.avg_latency_ms = latency_ms
@@ -232,7 +246,9 @@ class RedisStateStore:
             state.error_count = 0
             state.last_error = None
             state.last_error_time = None
-            self.update_state(name, **state.dict())
+            state_dict = state.dict()
+            state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+            self.update_state(name, **state_dict)
             return True
         return False
         

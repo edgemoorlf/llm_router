@@ -51,7 +51,7 @@ class RequestTransformer:
         # in Azure OpenAI, at least for S0 level, max_tokens is counted towards the TPM limit
         # per 0318-maxtoken strategy, we remove max_tokens from the payload
         max_tokens = azure_payload.get("max_tokens", None)
-        if max_tokens and max_tokens > 5000 and max_tokens > required_tokens + 5000:
+        if max_tokens and max_tokens > 5000 and max_tokens > required_tokens + 5000 and '2024-05-13' not in model_name:
             azure_payload["max_tokens"] = required_tokens + 5000
         
         # Check against global rate limiter (if enabled)

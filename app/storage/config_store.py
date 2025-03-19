@@ -45,7 +45,18 @@ class ConfigStore:
         Reload configurations from the file.
         """
         with self.file_lock:
+            logger.info(f"Explicitly reloading configs from file {self.config_file}")
+            # Clear current configs to ensure a fresh load
+            self.configs = {}
+            # Try to load from JSON file first
             self._load_configs()
+            
+            # If no configs loaded, try to load from YAML
+            if not self.configs:
+                logger.info("No configs loaded from JSON, attempting to load from YAML")
+                self._load_from_yaml()
+            
+            logger.info(f"Reload complete. Loaded {len(self.configs)} instance configurations")
     
     def _load_configs(self):
         """Load configurations from storage."""
@@ -124,12 +135,9 @@ class ConfigStore:
         Returns:
             Dictionary of instance name to configuration
         """
-        with self.file_lock:
-            # Reload from file to ensure we have the latest configurations
-            self._load_configs()
-            
-            # Return a copy to avoid external modifications
-            return dict(self.configs)
+        # Always reload configs from file to ensure fresh data across workers
+        self.reload()
+        return self.configs
     
     def add_config(self, config: InstanceConfig) -> bool:
         """
