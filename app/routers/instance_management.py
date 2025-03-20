@@ -10,7 +10,7 @@ from app.models.instance import InstanceConfig, InstanceStatus
 from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
 from app.services.instance_verification_service import instance_verification_service
-from app.services.instance_helper import filter_instances, sort_instances, paginate_instances, format_instance_list
+from app.services.instance_helper import filter_instances, sort_instances, paginate_instances, format_instance_list, filter_instances_optimized, filter_with_states
 from app.errors.handlers import handle_errors
 from app.errors.utils import check_instance_exists, handle_router_errors
 
@@ -23,105 +23,83 @@ router = APIRouter(
 )
 
 @router.get("/")
+@handle_router_errors("getting instances configuration")
 async def get_instances_config(
-    provider_type: Optional[str] = Query(None, description="Filter by provider type (azure, generic)"),
-    status: Optional[str] = Query(None, description="Filter by instance status (healthy, error, rate_limited)"),
-    min_tpm: Optional[int] = Query(None, description="Filter instances with current TPM >= this value"),
-    max_tpm: Optional[int] = Query(None, description="Filter instances with max TPM <= this value"),
-    model_support: Optional[str] = Query(None, description="Filter instances that support this model"),
-    sort_by: Optional[str] = Query(None, description="Field to sort by (name, status, current_tpm, priority)"),
-    sort_dir: Optional[str] = Query("asc", description="Sort direction (asc, desc)"),
-    limit: Optional[int] = Query(None, description="Limit the number of returned instances"),
-    offset: Optional[int] = Query(0, description="Offset for pagination")
+    request: Request,
+    provider_type: Optional[str] = None,
+    status: Optional[str] = None,
+    model_support: Optional[str] = None,
+    sort_dir: str = Query("asc", regex="^(asc|desc)$"),
+    min_tpm: Optional[int] = None,
+    max_tpm: Optional[int] = None,
+    offset: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, ge=1),
+    detailed: bool = Query(False)
 ) -> Dict[str, Any]:
     """
-    Get the current instance configuration with enhanced filtering and sorting.
-    
-    This endpoint returns information about all configured instances with extensive filtering options.
+    Get all instances with optional filtering and sorting.
     
     Args:
         provider_type: Filter by provider type (azure, generic)
         status: Filter by instance status (healthy, error, rate_limited)
+        model_support: Filter instances that support this model
+        sort_dir: Sort direction - asc or desc
         min_tpm: Filter instances with current TPM >= this value
         max_tpm: Filter instances with max TPM <= this value
-        model_support: Filter instances that support this model
-        sort_by: Field to sort by (name, status, current_tpm, priority)
-        sort_dir: Sort direction (asc, desc)
-        limit: Limit the number of returned instances
-        offset: Offset for pagination
-        
+        offset: Start of pagination
+        limit: Maximum instances to return
+        detailed: Return detailed information about instances
+    
     Returns:
-        Standardized response with filtered instance configuration information
+        List of instance configurations that match the filters
     """
-    # Define inner function to apply the decorator
-    @handle_errors
-    async def _get_instances_config() -> Dict[str, Any]:
-
-        # Get all instances with both configs and states
-        all_instances = instance_manager.get_all_instances()
+    # Optimization: First filter by config-only criteria (no Redis calls)
+    all_configs = instance_manager.get_all_instance_configs()
+    logger.debug(f"Initial config count: {len(all_configs)}")
+    
+    # Apply config-only filters
+    filtered_configs = filter_instances_optimized(all_configs, provider_type, model_support)
+    logger.debug(f"After config filtering: {len(filtered_configs)}")
+    
+    # If we need state-based filtering, get states only for the filtered configs
+    if status is not None or min_tpm is not None:
+        # Get the states only for configs that passed initial filtering
+        instances_with_states = instance_manager.get_states_for_configs(filtered_configs)
+        logger.debug(f"Got states for {len(instances_with_states)} instances")
         
-        # Filter instances
-        filtered_instances = filter_instances(
-            all_instances,
-            provider_type=provider_type,
-            status=status,
-            min_tpm=min_tpm,
-            max_tpm=max_tpm,
-            model_support=model_support
-        )
-        
-        # Sort instances
-        filtered_instances = sort_instances(
-            filtered_instances,
-            sort_by=sort_by,
-            sort_dir=sort_dir
-        )
-        
-        # Calculate total before pagination
-        total_filtered = len(filtered_instances)
-        
-        # Apply pagination
-        paginated_instances = paginate_instances(
-            filtered_instances,
-            offset=offset,
-            limit=limit
-        )
-        
-        # Format the instance data
-        instances_list = format_instance_list(paginated_instances, detailed=True)
-        
-        # Create applied_filters object for response metadata
-        applied_filters = {
-            "provider_type": provider_type,
-            "status": status,
-            "min_tpm": min_tpm,
-            "max_tpm": max_tpm,
-            "model_support": model_support,
-            "sort_by": sort_by,
-            "sort_dir": sort_dir
-        }
-        # Remove None values
-        applied_filters = {k: v for k, v in applied_filters.items() if v is not None}
-        
-        return {
-            "status": "success",
-            "message": f"Retrieved {len(instances_list)} instances",
-            "timestamp": int(time.time()),
-            "data": {
-                "instances": instances_list,
-                "total_available": len(all_instances),
-                "total_filtered": total_filtered,
-                "count": len(instances_list),
-                "pagination": {
-                    "offset": offset,
-                    "limit": limit
-                },
-                "filters": applied_filters
+        # Apply state-based filtering
+        filtered = filter_with_states(instances_with_states, status, min_tpm, max_tpm)
+    else:
+        # If we don't need state filtering, get states for all filtered configs
+        filtered = instance_manager.get_states_for_configs(filtered_configs)
+    
+    # Apply sorting
+    sorted_instances = sort_instances(filtered, sort_dir == "desc")
+    
+    # Apply pagination
+    paginated = paginate_instances(sorted_instances, offset, limit)
+    
+    # Format response
+    formatted = format_instance_list(paginated, detailed)
+    
+    return {
+        "status": "success",
+        "message": f"Retrieved {len(filtered)} instances",
+        "timestamp": int(time.time()),
+        "data": {
+            "instances": formatted,
+            "total_available": len(all_configs),
+            "total_filtered": len(filtered),
+            "count": len(paginated),
+            "pagination": {
+                "offset": offset,
+                "limit": limit
+            },
+            "filters": {
+                "sort_dir": sort_dir
             }
         }
-    
-    # Call the inner function to get the result
-    return await _get_instances_config()
+    }
 
 @router.get("/{instance_name}")
 @handle_router_errors("retrieving instance details")

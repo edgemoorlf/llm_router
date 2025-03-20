@@ -25,19 +25,58 @@ class InstanceSelector:
         Returns:
             List of instance configurations combined with their states
         """
-        configs = instance_manager.get_all_configs()
-        states = instance_manager.get_all_states()
+        # Get configs first (no Redis call)
+        configs = instance_manager.get_all_instance_configs()
         
+        # Filter by provider type if needed
+        if provider_type:
+            configs = [config for config in configs if config.provider_type == provider_type]
+        
+        # Convert configs to dictionaries
         instances = []
-        for name, config in configs.items():
-            # Filter by provider type if specified
-            if provider_type and config.provider_type != provider_type:
-                continue
-                
+        for config in configs:
             # Create instance dict from config
             instance = config.dict()
             
-            # Add state information if available
+            # Add a default status to avoid None status issues
+            # We'll load actual states later when needed
+            instance["status"] = "healthy"
+            instances.append(instance)
+        
+        return instances
+
+    def _get_states_for_filtered_instances(self, instances: list) -> list:
+        """
+        Get states only for instances that have passed initial filtering.
+        
+        This optimizes Redis calls by only fetching states for instances
+        that are already known to match basic filtering criteria.
+        
+        Args:
+            instances: List of instance dictionaries (from configs only)
+        
+        Returns:
+            List of instances with state data added
+        """
+        # Get state information for each instance
+        instance_names = [instance["name"] for instance in instances]
+        
+        # Use more efficient batched state retrieval
+        if instance_names:
+            states = {}
+            # Get states in batches
+            for i in range(0, len(instance_names), 20):
+                batch = instance_names[i:i+20]
+                for name in batch:
+                    state = instance_manager.get_instance_state(name)
+                    if state:
+                        states[name] = state
+        else:
+            states = {}
+        
+        # Update instances with state information
+        for instance in instances:
+            name = instance["name"]
             state = states.get(name)
             if state:
                 # Add state fields to instance dict
@@ -48,11 +87,9 @@ class InstanceSelector:
                 logger.warning(f"No state found for instance {name}, state might be None")
                 # Set a default status to avoid None status issues
                 instance["status"] = "healthy"
-                
-            instances.append(instance)
-            
+        
         return instances
-    
+
     def get_instances_for_model(self, model_name: str, provider_type: Optional[str] = None) -> list:
         """
         Get instances that support a specific model, optionally filtered by provider type.
@@ -66,6 +103,7 @@ class InstanceSelector:
         """
         instances = self._get_instances(provider_type)
         
+        # Filter by model support (still using only config data, no Redis)
         return [
             instance for instance in instances
             if not instance.get("supported_models") or  # If no supported_models list, assume all supported
@@ -89,17 +127,16 @@ class InstanceSelector:
             exclude_instance_names: Optional set of instance names to exclude (e.g., after failures)
             
         Returns:
-            List of instances ordered by suitability (primary instance first, then fallbacks)
+            List of all eligible instances ordered by priority (lower priority values first)
+            with random selection among instances of the same priority level.
+            Returns an empty list if no suitable instances are found.
         """
         excluded = set() if exclude_instance_names is None else exclude_instance_names
         logger.debug(f"Selecting instances for model '{model_name}', provider_type={provider_type}, excluded={excluded}")
             
-        # Get instances that support this model
+        # Get instances that support this model (config only - no Redis calls yet)
         instances = self.get_instances_for_model(model_name, provider_type)
         logger.debug(f"Found {len(instances)} instances supporting model '{model_name}'")
-        
-        for idx, instance in enumerate(instances):
-            logger.debug(f"Instance {idx+1}/{len(instances)}: {instance.get('name')} - Status: {instance.get('status')}")
         
         # Filter out excluded instances
         instances = [
@@ -111,15 +148,45 @@ class InstanceSelector:
             logger.debug(f"No instances available for model '{model_name}' after exclusions")
             return []
             
-        # Select the best instance based on capacity and health
-        primary_instance = self._select_primary_instance(instances, required_tokens, model_name)
+        # Now that we have filtered the instances by model and other criteria,
+        # get the states only for these filtered instances
+        instances = self._get_states_for_filtered_instances(instances)
         
-        # If no instance has capacity (including TPM and rate limits), return empty list
-        if not primary_instance:
+        # Find all eligible instances with capacity for the requested tokens
+        eligible_instances = []
+        
+        for instance in instances:
+            # Check if instance has capacity for the requested tokens
+            if self._check_instance_capacity(instance, required_tokens):
+                # Add original model name for consistent instance selection in fallbacks
+                instance["_original_model_for_selection"] = model_name
+                eligible_instances.append(instance)
+        
+        if not eligible_instances:
             logger.debug(f"No instances available with capacity for {required_tokens} tokens for model '{model_name}'")
             return []
-                
-        return [primary_instance]
+        
+        # Group instances by priority (lower is better)
+        priority_groups = {}
+        for instance in eligible_instances:
+            priority = instance.get("priority", 100)
+            if priority not in priority_groups:
+                priority_groups[priority] = []
+            priority_groups[priority].append(instance)
+        
+        # Sort priorities (lowest first)
+        sorted_priorities = sorted(priority_groups.keys())
+        
+        # Build final list of instances ordered by priority
+        ordered_instances = []
+        for priority in sorted_priorities:
+            # Randomly shuffle instances within the same priority group
+            group = priority_groups[priority]
+            random.shuffle(group)
+            ordered_instances.extend(group)
+        
+        logger.debug(f"Returning {len(ordered_instances)} eligible instances for model '{model_name}' in priority order")
+        return ordered_instances
         
     def _select_primary_instance(self, instances: list, tokens: int, model_name: str) -> Optional[Dict[str, Any]]:
         """

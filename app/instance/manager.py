@@ -680,42 +680,53 @@ class InstanceManager:
         Returns:
             Name of selected instance or None if no suitable instance found
         """
-        configs = self.get_all_configs()
-        states = self.get_all_states()
+        # First get all configs (no Redis calls)
+        all_configs = self.get_all_instance_configs()
         
-        eligible_instances = []
-        
-        for name, config in configs.items():
+        # Pre-filter configs by model and provider type (no Redis needed)
+        eligible_configs = []
+        for config in all_configs:
             # Skip if provider type doesn't match
             if provider_type and config.provider_type != provider_type:
                 continue
-                
+            
             # Skip if model not supported
             if model.lower() not in [m.lower() for m in config.supported_models]:
                 continue
-                
-            # Get current state
-            state = states.get(name)
+            
+            eligible_configs.append(config)
+        
+        # If no configs matched, return early
+        if not eligible_configs:
+            return None
+        
+        # Now get states only for eligible configs
+        eligible_instances = []
+        for config in eligible_configs:
+            # Get state for this specific instance
+            state = self.get_instance_state(config.name)
+            
+            # Skip if instance is not healthy
             if not state or state.status != InstanceStatus.HEALTHY:
                 continue
-                
+            
             # Check rate limit
-            allowed, _ = self.check_rate_limit(name, tokens)
+            allowed, _ = self.check_rate_limit(config.name, tokens)
             if not allowed:
                 continue
-                
-            eligible_instances.append((name, config))
             
+            eligible_instances.append((config, self.get_current_usage(config.name)))
+        
         if not eligible_instances:
             return None
-            
+        
         # Sort by priority and current usage
         eligible_instances.sort(key=lambda x: (
-            x[1].priority,
-            self.get_current_usage(x[0])
+            x[0].priority,  # Sort by priority first
+            x[1]           # Then by current usage
         ))
         
-        return eligible_instances[0][0]
+        return eligible_instances[0][0].name
 
     def has_instance(self, name: str) -> bool:
         """
@@ -836,3 +847,52 @@ class InstanceManager:
         state_removed = self.state_store.remove_state(name)
         
         return config_removed or state_removed 
+
+    def get_all_instance_configs(self) -> List[InstanceConfig]:
+        """
+        Get all instance configurations without fetching states from Redis.
+        
+        This is an optimization to avoid Redis calls during initial filtering stages
+        when only configuration data (models, names, etc.) is needed. This method
+        always reloads configs to ensure fresh data.
+        
+        Returns:
+            List of InstanceConfig objects
+        """
+        # Always reload configs to get fresh data
+        self.config_store.reload()
+        
+        # Return all configs as a list
+        logger.debug("get_all_instance_configs: retrieving configs without Redis calls")
+        return list(self.config_store.get_all_configs().values()) 
+
+    def get_states_for_configs(self, configs: List[InstanceConfig]) -> List[Tuple[InstanceConfig, InstanceState]]:
+        """
+        Get states only for the provided list of instance configurations.
+        
+        This is an optimization to avoid fetching all states from Redis when only
+        a subset of instances is needed. This method fetches states only for
+        the configurations provided, limiting Redis calls to only what's necessary.
+        
+        Args:
+            configs: List of instance configurations to get states for
+            
+        Returns:
+            List of (config, state) tuples for the provided configurations
+        """
+        result = []
+        
+        for config in configs:
+            # Get state only for this specific instance
+            state = self.get_instance_state(config.name)
+            if not state:
+                # If state doesn't exist, create a new one
+                state = create_instance_state(config.name)
+                state_dict = state.dict()
+                state_dict.pop('name', None)  # Remove name to avoid duplicate
+                self.state_store.update_state(config.name, **state_dict)
+            
+            result.append((config, state))
+        
+        logger.debug(f"get_states_for_configs: fetched {len(result)} states for specified configs")
+        return result 

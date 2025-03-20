@@ -44,23 +44,14 @@ class InstanceRouter:
         Returns:
             Name of the selected instance or None if no suitable instance found
         """
-        # Get all configs and states
-        configs = self.instance_manager.get_all_configs()
-        states = self.instance_manager.get_all_states()
+        # First get configs only (no Redis calls)
+        configs = self.instance_manager.get_all_instance_configs()
         
-        candidates = []
-        for name, config in configs.items():
+        # Pre-filter by model and enabled status (still no Redis)
+        filtered_configs = []
+        for config in configs:
             # Skip if instance is disabled
             if not config.enabled:
-                continue
-                
-            # Get state if available, otherwise create a default state
-            state = states.get(name)
-            if not state:
-                state = create_instance_state(name)
-                
-            # Skip if instance is unhealthy
-            if not state.is_healthy:
                 continue
                 
             # Skip if model is specified and not supported
@@ -71,28 +62,48 @@ class InstanceRouter:
             if required_tokens and required_tokens > config.max_tpm:
                 continue
                 
+            # This config passes initial filtering
+            filtered_configs.append(config)
+        
+        # If no configs passed initial filtering, return early
+        if not filtered_configs:
+            logger.warning(f"No suitable instances found for request (model={model_name}, tokens={required_tokens})")
+            return None
+            
+        # Only now get states for pre-filtered configs
+        candidates = []
+        for config in filtered_configs:
+            # Get state for this specific instance
+            state = self.instance_manager.get_instance_state(config.name)
+            if not state:
+                state = create_instance_state(config.name)
+                
+            # Skip if instance is unhealthy
+            if not state.is_healthy:
+                continue
+                
             # This instance is a candidate
-            candidates.append((name, config, state))
+            candidates.append((config, state))
             
         if not candidates:
-            logger.warning(f"No suitable instances found for request (model={model_name}, tokens={required_tokens})")
+            logger.warning(f"No healthy instances found for request (model={model_name}, tokens={required_tokens})")
             return None
             
         # Apply routing strategy
         if strategy == "random":
             selected = random.choice(candidates)
-            return selected[0]
+            return selected[0].name
         elif strategy == "least_busy":
             # Sort by number of active requests
-            candidates.sort(key=lambda x: x[2].current_tpm)
-            return candidates[0][0]
+            candidates.sort(key=lambda x: x[1].current_tpm)
+            return candidates[0][0].name
         elif strategy == "round_robin":
             # Just take the first one for now (we'll implement proper round robin later)
-            return candidates[0][0]
+            return candidates[0][0].name
         else:
             logger.warning(f"Unknown routing strategy: {strategy}, using random")
             selected = random.choice(candidates)
-            return selected[0]
+            return selected[0].name
             
     def get_instance_for_model(self, model_name: str) -> Optional[str]:
         """

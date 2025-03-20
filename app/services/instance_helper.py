@@ -136,4 +136,72 @@ def format_instance_list(instances: List[Tuple[InstanceConfig, InstanceState]], 
             for config, state in instances
         ]
     else:
-        return [config.model_dump(exclude={"api_key"}) for config, _ in instances] 
+        return [config.model_dump(exclude={"api_key"}) for config, _ in instances]
+
+def filter_instances_optimized(
+    configs: List[InstanceConfig],
+    provider_type: Optional[str] = None,
+    model_support: Optional[str] = None
+) -> List[InstanceConfig]:
+    """
+    Pre-filter instance configs without needing states (avoids Redis calls).
+    
+    This is an optimization to reduce Redis calls by first filtering instances
+    based only on their configurations (which don't require Redis).
+    
+    Args:
+        configs: List of InstanceConfig objects to filter
+        provider_type: Filter by provider type (azure, generic)
+        model_support: Filter instances that support this model
+        
+    Returns:
+        Filtered list of InstanceConfig objects
+    """
+    filtered = configs
+    
+    # Apply filters if provided
+    if provider_type:
+        filtered = [config for config in filtered if config.provider_type == provider_type]
+        
+    if model_support:
+        filtered = [
+            config for config in filtered if 
+            (not config.supported_models or model_support in config.supported_models)
+        ]
+    
+    return filtered
+
+def filter_with_states(
+    instances: List[Tuple[InstanceConfig, InstanceState]],
+    status: Optional[str] = None,
+    min_tpm: Optional[int] = None,
+    max_tpm: Optional[int] = None
+) -> List[Tuple[InstanceConfig, InstanceState]]:
+    """
+    Filter instances with states based on state-specific criteria.
+    
+    This should be called after filter_instances_optimized to apply
+    state-specific filters.
+    
+    Args:
+        instances: List of (InstanceConfig, InstanceState) tuples to filter
+        status: Filter by instance status (healthy, error, rate_limited)
+        min_tpm: Filter instances with current TPM >= this value
+        max_tpm: Filter instances with max TPM <= this value
+        
+    Returns:
+        Filtered list of (InstanceConfig, InstanceState) tuples
+    """
+    filtered = instances
+    
+    # Apply state filters if provided
+    if status:
+        filtered = [(config, state) for config, state in filtered if state.status == status]
+        
+    if min_tpm is not None:
+        filtered = [(config, state) for config, state in filtered if state.current_tpm >= min_tpm]
+        
+    if max_tpm is not None:
+        filtered = [(config, state) for config, state in filtered if config.max_tpm <= max_tpm]
+    
+    return filtered 
