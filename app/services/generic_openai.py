@@ -177,10 +177,23 @@ class GenericOpenAIService:
             
             # Record the request with token usage
             if "usage" in result and "total_tokens" in result["usage"]:
+                tokens = result["usage"]["total_tokens"]
+                
+                # Record basic stats first
                 instance_manager.record_request(
                     name=instance_name,
                     success=True,
-                    tokens=result["usage"]["total_tokens"]
+                    tokens=0  # Don't count tokens here to avoid double counting
+                )
+                
+                # Update token usage using the rate limiter
+                instance_manager.update_token_usage(instance_name, tokens)
+            else:
+                # If no token usage information is available, just record the request
+                instance_manager.record_request(
+                    name=instance_name,
+                    success=True,
+                    tokens=0
                 )
             
             logger.debug(f"Request completed using generic instance {instance_name}")

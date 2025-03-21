@@ -62,6 +62,8 @@ class AzureOpenAIService:
         max_retries = 3
         retry_count = 0
         
+        logger.debug(f"Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
+        
         while retry_count < max_retries:
             try:
                 # Get available instances, excluding previously failed ones
@@ -71,6 +73,12 @@ class AzureOpenAIService:
                     provider_type="azure",
                     exclude_instance_names=exclude_instances
                 )
+                
+                if available_instances:
+                    instance_names = [inst.get("name", "") for inst in available_instances]
+                    logger.debug(f"Selected {len(available_instances)} instances for request: {', '.join(instance_names)}")
+                else:
+                    logger.warning(f"No instances available for model '{original_model}' with {required_tokens} tokens")
                 
                 if not available_instances:
                     raise HTTPException(
@@ -119,6 +127,9 @@ class AzureOpenAIService:
         """Execute request with a list of available instances, trying fallbacks as needed."""
         fallback_errors = []
         
+        # Shuffle the instances to randomize the order
+        random.shuffle(available_instances)
+
         # Try each instance in sequence until success or all fail
         for instance in available_instances:
             instance_name = instance.get("name", "")
@@ -139,10 +150,31 @@ class AzureOpenAIService:
                     instance, endpoint, payload_with_model, method
                 )
                 
-                # Success - mark instance as healthy
-                error_handler.update_instance_status(instance_name, "healthy")
-                logger.debug(f"Request completed using Azure instance {instance_name}")
+                # Update instance metrics on success
+                instance_manager.mark_healthy(instance_name)
                 
+                # Record the request with token usage
+                if "usage" in result and "total_tokens" in result["usage"]:
+                    tokens = result["usage"]["total_tokens"]
+                    
+                    # Record basic stats first
+                    instance_manager.record_request(
+                        name=instance_name,
+                        success=True,
+                        tokens=0  # Don't count tokens here to avoid double counting
+                    )
+                    
+                    # Update token usage using the rate limiter
+                    instance_manager.update_token_usage(instance_name, tokens)
+                else:
+                    # If no token usage information is available, just record the request
+                    instance_manager.record_request(
+                        name=instance_name,
+                        success=True,
+                        tokens=0
+                    )
+                    
+                logger.debug(f"Request completed using Azure instance {instance_name}")
                 return result
                 
             except HTTPException as e:

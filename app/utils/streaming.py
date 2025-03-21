@@ -165,8 +165,11 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                     instance_manager.record_request(
                         name=instance_name,
                         success=True,
-                        tokens=required_tokens
+                        tokens=0  # Don't count tokens here to avoid double counting
                     )
+                    
+                    # Update token usage separately
+                    instance_manager.update_token_usage(instance_name, required_tokens)
                     
             return StreamingResponse(
                 process_stream(),
@@ -212,8 +215,11 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                     instance_manager.record_request(
                         name=instance_name,
                         success=True,
-                        tokens=required_tokens
+                        tokens=0  # Don't count tokens here to avoid double counting
                     )
+                    
+                    # Update token usage separately
+                    instance_manager.update_token_usage(instance_name, required_tokens)
             
             return StreamingResponse(
                 process_stream(),
@@ -237,8 +243,7 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
         instance_manager.record_request(
             name=instance_name,
             success=False,
-            error=error_detail,
-            status_code=status_code
+            error=error_detail
         )
         
         # Handle rate limiting
@@ -264,8 +269,7 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
         instance_manager.record_request(
             name=instance_name,
             success=False,
-            error=error_detail,
-            status_code=503
+            error=error_detail
         )
         instance_manager.update_instance_state(
             instance_name,
@@ -283,8 +287,7 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
         instance_manager.record_request(
             name=instance_name,
             success=False,
-            error=error_detail,
-            status_code=500
+            error=error_detail
         )
         instance_manager.update_instance_state(
             instance_name,

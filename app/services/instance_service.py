@@ -58,15 +58,78 @@ class InstanceService:
         """
         self.instance_manager.remove_instance(name)
         
-    def update_instance(self, name: str, config: InstanceConfig) -> None:
+    def update_instance_sync(self, name: str, config: InstanceConfig) -> None:
         """
-        Update an instance's configuration.
+        Update an instance's configuration (synchronous version).
         
         Args:
             name: Name of the instance to update
             config: New instance configuration
         """
         self.instance_manager.update_instance(name, config)
+        
+    async def update_instance(self, name: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update an instance's configuration asynchronously.
+        
+        Args:
+            name: Name of the instance to update
+            update_data: Dictionary of attributes to update
+            
+        Returns:
+            Dictionary with status and details about the update
+        """
+        try:
+            # Check if instance exists
+            if not self.instance_manager.has_instance(name):
+                return {
+                    "status": "error",
+                    "message": f"Instance '{name}' not found"
+                }
+                
+            # Get current config
+            current_config = self.instance_manager.get_instance_config(name)
+            
+            # Apply the update using the instance manager
+            result = self.instance_manager.update_instance(name, update_data)
+            
+            if not result:
+                return {
+                    "status": "error",
+                    "message": f"Failed to update instance '{name}'"
+                }
+                
+            # Get the updated config
+            updated_config = self.instance_manager.get_instance_config(name)
+            
+            # Prepare response data
+            updated_fields = {}
+            for key, value in update_data.items():
+                # Only include fields that were actually updated
+                if hasattr(current_config, key):
+                    old_value = getattr(current_config, key)
+                    updated_fields[key] = {
+                        "old": old_value,
+                        "new": value
+                    }
+            
+            # Convert to dict with redacted API key
+            instance_dict = updated_config.dict()
+            if "api_key" in instance_dict:
+                instance_dict["api_key"] = "**REDACTED**"
+                
+            return {
+                "status": "success",
+                "message": f"Instance '{name}' updated successfully",
+                "updated_fields": updated_fields,
+                "instance": instance_dict
+            }
+        except Exception as e:
+            logger.error(f"Error updating instance {name}: {str(e)}\n{traceback.format_exc()}")
+            return {
+                "status": "error",
+                "message": f"Error updating instance: {str(e)}"
+            }
         
     def update_tpm_usage(self, name: str, tokens: int) -> None:
         """

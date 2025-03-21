@@ -13,6 +13,7 @@ from typing import Dict, Optional, List, Any
 from redis import Redis
 from urllib.parse import urlparse
 from app.models.instance import InstanceState, InstanceStatus, create_instance_state
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class RedisStateStore:
         
         self.state_prefix = "instance:state:"
         self.rate_limit_prefix = "instance:rate_limit:"
+        self.window_key_prefix = "instance:rate_limit:window:"
         
         # Test connection
         try:
@@ -78,19 +80,40 @@ class RedisStateStore:
             logger.debug(f"No state found for {name}, creating fresh state")
             # Create fresh state and store it directly without calling update_state
             state = create_instance_state(name)
-            state_json = json.dumps(state.dict())
+            
+            # Ensure essential fields have defaults for consistent debugging
+            state_dict = state.dict()
+            # These fields must be present for proper rate limit and error handling
+            if "error_count" not in state_dict:
+                state_dict["error_count"] = 0
+            if "current_tpm" not in state_dict:
+                state_dict["current_tpm"] = 0
+            
+            state_json = json.dumps(state_dict)
             logger.debug(f"Setting fresh state for {name}: {state_json[:50]}...")
             result = self.redis.set(key, state_json)
             logger.debug(f"Redis SET result for fresh state: {result}")
             return state
             
         try:
-            logger.debug(f"Found state data for {name}: {data[:50]}...")
+            logger.debug(f"Found state data for {name}: {data[:64]}...")
             state_data = json.loads(data)
+            # Log important state details for debugging
+            status = state_data.get("status", "unknown")
+            rate_limited_until = state_data.get("rate_limited_until")
+            current_time = time.time()
+            
             # Check if rate limited and if it should be cleared
             if state_data.get("status") == InstanceStatus.RATE_LIMITED.value:
                 rate_limit_key = f"{self.rate_limit_prefix}{name}"
-                rate_limited_until = state_data.get("rate_limited_until")
+                
+                # Debug output for rate limit expiration
+                if rate_limited_until:
+                    time_remaining = rate_limited_until - current_time
+                    if time_remaining > 0:
+                        logger.debug(f"Instance {name} still rate limited for {int(time_remaining)} more seconds")
+                    else:
+                        logger.debug(f"Rate limit for instance {name} has expired (due {int(time_remaining)} seconds ago)")
                 
                 # Check both the explicit key and the timestamp to ensure we clear expired rate limits
                 if (not self.redis.exists(rate_limit_key) or 
@@ -103,23 +126,52 @@ class RedisStateStore:
                     state_data["rate_limited_until"] = None
                     # Store updated state directly
                     self.redis.set(key, json.dumps(state_data))
+            
+            # Extra debug info
+            error_count = state_data.get("error_count", 0)
+            current_tpm = state_data.get("current_tpm", 0)
+            logger.debug(f"Instance {name} status: {status}, errors: {error_count}, TPM: {current_tpm}")
+            
             return InstanceState(**state_data)
         except Exception as e:
             logger.error(f"Error deserializing state for {name}: {e}")
             state = create_instance_state(name)
-            self.redis.set(key, json.dumps(state.dict()))
+            
+            # Ensure essential fields have defaults for consistent debugging
+            state_dict = state.dict()
+            # These fields must be present for proper rate limit and error handling
+            if "error_count" not in state_dict:
+                state_dict["error_count"] = 0
+            if "current_tpm" not in state_dict:
+                state_dict["current_tpm"] = 0
+                
+            self.redis.set(key, json.dumps(state_dict))
             return state
             
     def update_state(self, name: str, **kwargs) -> InstanceState:
         """Update instance state with error type awareness."""
         key = f"{self.state_prefix}{name}"
         logger.debug(f"Updating state for key: {key}")
+        
+        # Important fields to track in the update
+        important_fields = ["status", "rate_limited_until", "current_tpm", "error_count"]
+        important_updates = {k: v for k, v in kwargs.items() if k in important_fields}
+        if important_updates:
+            logger.debug(f"Important updates for {name}: {important_updates}")
+        
         # Get current state directly from Redis
         data = self.redis.get(key)
         if data:
             try:
                 current_data = json.loads(data)
                 current = InstanceState(**current_data)
+                # Log current status for comparison
+                for field in important_fields:
+                    if field in kwargs and hasattr(current, field):
+                        old_val = getattr(current, field)
+                        new_val = kwargs[field]
+                        if old_val != new_val:
+                            logger.debug(f"Changing {name}.{field}: {old_val} -> {new_val}")
             except Exception:
                 current = create_instance_state(name)
         else:
@@ -153,68 +205,49 @@ class RedisStateStore:
         self.redis.set(key, json.dumps(current.dict()))
         return current
         
-    def record_request(self, name: str, success: bool, tokens: int = 0,
-                      latency_ms: Optional[float] = None,
-                      error: Optional[str] = None,
-                      status_code: Optional[int] = None) -> InstanceState:
-        """Record request metrics with error type awareness."""
-        curr_time = time.time()
+    def record_request(self, name: str, success: bool, tokens: int = 0, error: str = None) -> None:
+        """Record a request and update instance state with request metrics.
         
-        # Update metrics atomically
-        pipe = self.redis.pipeline()
-        key = f"{self.state_prefix}{name}"
+        Args:
+            name: Name of the instance
+            success: Whether the request was successful
+            tokens: Number of tokens used (only for successful requests)
+            error: Error message (only for failed requests)
+        """
+        # Get current state
+        state = self.get_state(name)
+        if not state:
+            logger.warning(f"Cannot record request for non-existent instance: {name}")
+            return
+
+        # Update request stats
+        state.total_requests += 1
         
-        try:
-            state = self.get_state(name)
-            if not state:
-                state = create_instance_state(name)
-                
-            state.last_used = curr_time
-            state.total_requests += 1
+        if success:
+            state.successful_requests += 1
+            # Note: We no longer update current_tpm here as it's handled by the rate limiter
+            # to avoid double counting when check_capacity and update_usage are used separately
             
-            if success:
-                state.successful_requests += 1
-                if state.status != InstanceStatus.RATE_LIMITED:  # This is correct - comparing Enum to Enum
-                    state.status = InstanceStatus.HEALTHY
-                state.error_count = 0
-                state.current_tpm += tokens
-            else:
-                state.error_count += 1
-                state.last_error = error
-                state.last_error_time = curr_time
-                
-                # Handle different types of errors
-                if status_code:
-                    if status_code in [401, 403, 404]:
-                        # Permanent errors - mark instance as error
-                        state.status = InstanceStatus.ERROR
-                        logger.error(f"Instance {name} marked as error due to {status_code}: {error}")
-                    elif status_code == 429:
-                        # Rate limiting - will be handled by update_state
-                        pass
-                    elif status_code >= 500:
-                        # Server errors - mark as error after multiple failures
-                        if state.error_count >= 3:
-                            state.status = InstanceStatus.ERROR
-                            logger.warning(f"Instance {name} marked as error after {state.error_count} server errors")
-            
-            if latency_ms is not None:
-                if state.avg_latency_ms is None:
-                    state.avg_latency_ms = latency_ms
-                else:
-                    state.avg_latency_ms = (state.avg_latency_ms * 0.9) + (latency_ms * 0.1)
-                    
-            # Store updated state (without TTL)
-            pipe.set(key, json.dumps(state.dict()))
-            pipe.execute()
-            
-            return state
-            
-        except Exception as e:
-            logger.error(f"Error recording request for {name}: {e}")
-            pipe.reset()
-            return create_instance_state(name)
-            
+            # Update total tokens for historical tracking only
+            # Note: actual token usage for rate limiting is handled by InstanceManager.update_token_usage
+            state.total_tokens_served += tokens
+        else:
+            state.failed_requests += 1
+            state.error_count += 1
+            state.last_error = error
+            state.last_error_time = datetime.utcnow()
+
+            # Check if instance should be rate limited
+            if self._should_rate_limit(state):
+                logger.warning(f"Instance {name} rate limited due to errors: {state.error_count}, current TPM: {state.current_tpm}")
+                state.status = InstanceStatus.RATE_LIMITED
+                state.rate_limited_until = datetime.utcnow() + timedelta(seconds=self.rate_limit_duration)
+
+        # Update state in Redis
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.update_state(name, **state_dict)
+        
     def get_all_states(self) -> Dict[str, InstanceState]:
         """Get all current instance states."""
         states = {}
@@ -349,4 +382,88 @@ class RedisStateStore:
         deleted_state = self.redis.delete(key)
         deleted_rate_limit = self.redis.delete(rate_limit_key)
         
-        return deleted_state > 0 or deleted_rate_limit > 0 
+        return deleted_state > 0 or deleted_rate_limit > 0
+        
+    def dump_rate_limit_data(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Dump rate limit data for debugging.
+        
+        Args:
+            name: Optional instance name to filter for
+            
+        Returns:
+            Dictionary with rate limit data
+        """
+        # Check for rate limit keys
+        if name:
+            keys = [f"{self.rate_limit_prefix}{name}"]
+            window_keys = [f"{self.window_key_prefix}{name}"]
+        else:
+            keys = self.redis.keys(f"{self.rate_limit_prefix}*")
+            window_keys = self.redis.keys(f"{self.window_key_prefix}*")
+            
+        result = {
+            "rate_limit_keys": {},
+            "window_keys": {}
+        }
+        
+        # Check rate limit keys
+        for key in keys:
+            instance_name = key.replace(self.rate_limit_prefix, "")
+            ttl = self.redis.ttl(key)
+            exists = self.redis.exists(key)
+            result["rate_limit_keys"][instance_name] = {
+                "exists": exists > 0,
+                "ttl": ttl
+            }
+            
+        # Check window keys
+        for key in window_keys:
+            parts = key.split(':')
+            if len(parts) > 3:
+                instance_name = parts[3]  # Extract instance name from key
+                # Get the window data
+                entries = self.redis.zrange(key, 0, -1, withscores=True)
+                window_data = []
+                total_tokens = 0
+                
+                for entry, score in entries:
+                    if isinstance(entry, bytes):
+                        entry = entry.decode('utf-8')
+                    tokens = int(entry.split(':')[0])
+                    timestamp = int(score)
+                    age = int(time.time()) - timestamp
+                    window_data.append({
+                        "tokens": tokens,
+                        "age_seconds": age
+                    })
+                    total_tokens += tokens
+                    
+                result["window_keys"][instance_name] = {
+                    "total_tokens": total_tokens,
+                    "entry_count": len(entries),
+                    "entries": window_data
+                }
+                
+        return result 
+
+    def update_total_tokens(self, name: str, tokens: int) -> None:
+        """Update total tokens served for an instance.
+        
+        This updates only the historical tracking and doesn't affect rate limiting.
+        
+        Args:
+            name: Name of the instance
+            tokens: Number of tokens to add
+        """
+        state = self.get_state(name)
+        if not state:
+            return
+            
+        # Update total tokens served
+        state.total_tokens_served += tokens
+        
+        # Update state in Redis
+        state_dict = state.dict()
+        state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+        self.update_state(name, **state_dict) 

@@ -101,6 +101,109 @@ async def get_instances_config(
         }
     }
 
+@router.get("/debug-rate-limits")
+@handle_router_errors("debugging rate limits")
+async def debug_rate_limits(instance_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Debug rate limit data for instances.
+    
+    This endpoint provides detailed information about rate limiting for debugging purposes,
+    including:
+    1. Active rate limit keys and their TTLs
+    2. Token usage windows with per-entry breakdown
+    3. Total token usage per instance
+    
+    Args:
+        instance_name: Optional name of a specific instance to debug
+        
+    Returns:
+        Detailed rate limit diagnostics
+    """
+    # Check if we have access to the state store
+    if not hasattr(instance_manager, "state_store") or not hasattr(instance_manager.state_store, "dump_rate_limit_data"):
+        return {
+            "status": "error",
+            "message": "Rate limit debugging not supported by the current state store",
+            "timestamp": int(time.time())
+        }
+    
+    # Get the diagnostic data
+    rate_limit_data = instance_manager.state_store.dump_rate_limit_data(instance_name)
+    
+    # Add instance config data if looking at a specific instance
+    if instance_name:
+        config = instance_manager.get_instance_config(instance_name)
+        state = instance_manager.get_instance_state(instance_name)
+        
+        # Add to the result
+        if config:
+            rate_limit_data["instance_config"] = {
+                "name": config.name,
+                "provider_type": config.provider_type,
+                "max_tpm": config.max_tpm
+            }
+        
+        if state:
+            rate_limit_data["instance_state"] = {
+                "status": state.status.value,
+                "current_tpm": state.current_tpm,
+                "rate_limited_until": state.rate_limited_until
+            }
+    
+    return {
+        "status": "success",
+        "message": "Rate limit diagnostic information",
+        "timestamp": int(time.time()),
+        "data": rate_limit_data
+    }
+
+@router.post("/reset-all-rate-limits")
+@handle_router_errors("resetting all rate limits")
+async def reset_all_rate_limits() -> Dict[str, Any]:
+    """
+    Reset rate limit status for all rate-limited instances.
+    
+    This endpoint will scan all instances and:
+    1. Identify all instances that are currently rate-limited
+    2. Reset their status to healthy
+    3. Delete all associated rate limit keys
+    
+    This is useful for system-wide recovery after a burst of rate limit errors,
+    or when restarting services after a period of inactivity.
+    
+    Returns:
+        Standardized response with stats on how many instances were affected
+    """
+    # Get all instances
+    states = instance_manager.get_all_states()
+    
+    # Track which instances were reset
+    reset_instances = []
+    
+    # Check each instance
+    for name, state in states.items():
+        if state.status == InstanceStatus.RATE_LIMITED:
+            # Reset this instance
+            instance_manager.mark_healthy(name)
+            
+            # Explicitly delete any rate limit keys
+            if hasattr(instance_manager.state_store, "redis"):
+                rate_limit_key = f"{instance_manager.state_store.rate_limit_prefix}{name}"
+                instance_manager.state_store.redis.delete(rate_limit_key)
+                
+            reset_instances.append(name)
+            logger.info(f"Reset rate limit for instance {name}")
+    
+    return {
+        "status": "success",
+        "message": f"Reset rate limits for {len(reset_instances)} instances",
+        "timestamp": int(time.time()),
+        "data": {
+            "affected_instances": reset_instances,
+            "count": len(reset_instances)
+        }
+    }
+
 @router.get("/{instance_name}")
 @handle_router_errors("retrieving instance details")
 async def get_instance_details(
@@ -492,52 +595,5 @@ async def reset_rate_limit(instance_name: str) -> Dict[str, Any]:
             "previous_status": previous_status,
             "current_status": state.status.value if state else "unknown",
             "was_rate_limited": is_rate_limited
-        }
-    }
-
-@router.post("/reset-all-rate-limits")
-@handle_router_errors("resetting all rate limits")
-async def reset_all_rate_limits() -> Dict[str, Any]:
-    """
-    Reset rate limit status for all rate-limited instances.
-    
-    This endpoint will scan all instances and:
-    1. Identify all instances that are currently rate-limited
-    2. Reset their status to healthy
-    3. Delete all associated rate limit keys
-    
-    This is useful for system-wide recovery after a burst of rate limit errors,
-    or when restarting services after a period of inactivity.
-    
-    Returns:
-        Standardized response with stats on how many instances were affected
-    """
-    # Get all instances
-    states = instance_manager.get_all_states()
-    
-    # Track which instances were reset
-    reset_instances = []
-    
-    # Check each instance
-    for name, state in states.items():
-        if state.status == InstanceStatus.RATE_LIMITED:
-            # Reset this instance
-            instance_manager.mark_healthy(name)
-            
-            # Explicitly delete any rate limit keys
-            if hasattr(instance_manager.state_store, "redis"):
-                rate_limit_key = f"{instance_manager.state_store.rate_limit_prefix}{name}"
-                instance_manager.state_store.redis.delete(rate_limit_key)
-                
-            reset_instances.append(name)
-            logger.info(f"Reset rate limit for instance {name}")
-    
-    return {
-        "status": "success",
-        "message": f"Reset rate limits for {len(reset_instances)} instances",
-        "timestamp": int(time.time()),
-        "data": {
-            "affected_instances": reset_instances,
-            "count": len(reset_instances)
         }
     } 

@@ -127,9 +127,7 @@ class InstanceSelector:
             exclude_instance_names: Optional set of instance names to exclude (e.g., after failures)
             
         Returns:
-            List of all eligible instances ordered by priority (lower priority values first)
-            with random selection among instances of the same priority level.
-            Returns an empty list if no suitable instances are found.
+            List of instances ordered by suitability (primary instance first, then fallbacks)
         """
         excluded = set() if exclude_instance_names is None else exclude_instance_names
         logger.debug(f"Selecting instances for model '{model_name}', provider_type={provider_type}, excluded={excluded}")
@@ -152,20 +150,47 @@ class InstanceSelector:
         # get the states only for these filtered instances
         instances = self._get_states_for_filtered_instances(instances)
         
-        # Find all eligible instances with capacity for the requested tokens
+        # Get all eligible instances based on capacity and health
+        eligible_instances = self._get_eligible_instances(instances, required_tokens, model_name)
+        
+        # If no instances have capacity (including TPM and rate limits), return empty list
+        if not eligible_instances:
+            logger.debug(f"No instances available with capacity for {required_tokens} tokens for model '{model_name}'")
+            return []
+                
+        return eligible_instances
+        
+    def _get_eligible_instances(self, instances: list, tokens: int, model_name: str) -> List[Dict[str, Any]]:
+        """
+        Get all eligible instances based on capacity and health, ordered by priority.
+        
+        Args:
+            instances: List of available instances that support the model
+            tokens: Required tokens for the request
+            model_name: The model name to use
+            
+        Returns:
+            List of eligible instances ordered by priority and randomized within priority groups
+        """
+        # Ensure we have at least one instance
+        if not instances:
+            logger.debug(f"No instances provided to select from for model '{model_name}'")
+            return []
+            
+        # Find eligible instances from the given list of pre-filtered instances
         eligible_instances = []
         
         for instance in instances:
             # Check if instance has capacity for the requested tokens
-            if self._check_instance_capacity(instance, required_tokens):
+            if self._check_instance_capacity(instance, tokens):
                 # Add original model name for consistent instance selection in fallbacks
                 instance["_original_model_for_selection"] = model_name
                 eligible_instances.append(instance)
-        
+                
         if not eligible_instances:
-            logger.debug(f"No instances available with capacity for {required_tokens} tokens for model '{model_name}'")
+            logger.debug(f"No eligible instances with capacity for {tokens} tokens for model '{model_name}'")
             return []
-        
+            
         # Group instances by priority (lower is better)
         priority_groups = {}
         for instance in eligible_instances:
@@ -173,7 +198,7 @@ class InstanceSelector:
             if priority not in priority_groups:
                 priority_groups[priority] = []
             priority_groups[priority].append(instance)
-        
+            
         # Sort priorities (lowest first)
         sorted_priorities = sorted(priority_groups.keys())
         
@@ -200,46 +225,11 @@ class InstanceSelector:
         Returns:
             Selected instance or None if no suitable instance is found
         """
-        # Ensure we have at least one instance
-        if not instances:
-            logger.debug(f"No instances provided to select from for model '{model_name}'")
-            return None
-            
-        # Find the best instance from the given list of pre-filtered instances
-        # Filter instances with sufficient capacity
-        eligible_instances = []
+        # Get eligible instances ordered by priority and randomized within priority groups
+        ordered_instances = self._get_eligible_instances(instances, tokens, model_name)
         
-        for instance in instances:
-            # Check if instance has capacity for the requested tokens
-            if self._check_instance_capacity(instance, tokens):
-                eligible_instances.append(instance)
-                
-        if not eligible_instances:
-            logger.debug(f"No eligible instances with capacity for {tokens} tokens for model '{model_name}'")
-            return None
-            
-        # Group instances by priority (lower is better)
-        priority_groups = {}
-        for instance in eligible_instances:
-            priority = instance.get("priority", 100)
-            if priority not in priority_groups:
-                priority_groups[priority] = []
-            priority_groups[priority].append(instance)
-            
-        # Sort priorities (lowest first)
-        sorted_priorities = sorted(priority_groups.keys())
-        
-        # Get the highest priority group and randomly select an instance
-        highest_priority_group = priority_groups[sorted_priorities[0]]
-        
-        # Randomly select an instance from the highest priority group
-        selected_instance = random.choice(highest_priority_group)
-        logger.debug(f"Selected instance {selected_instance.get('name')} for model '{model_name}' from {len(highest_priority_group)} eligible instances with priority {sorted_priorities[0]}")
-        
-        # Add original model name for consistent instance selection in fallbacks
-        selected_instance["_original_model_for_selection"] = model_name
-        
-        return selected_instance
+        # Return the first instance (highest priority) or None if no eligible instances
+        return ordered_instances[0] if ordered_instances else None
         
     def _check_instance_capacity(self, instance: Dict[str, Any], required_tokens: int) -> bool:
         """
@@ -253,6 +243,14 @@ class InstanceSelector:
             True if instance has capacity, False otherwise
         """
         instance_name = instance.get("name", "")
+        
+        # Sync rate limiter data to ensure current_tpm is accurate
+        instance_manager.sync_rate_limiter_to_state(instance_name)
+        
+        # Update the instance state in our local dictionary
+        current_state = instance_manager.get_instance_state(instance_name)
+        if current_state:
+            instance["current_tpm"] = current_state.current_tpm
         
         # Get status, defaulting to healthy if missing or None
         status = instance.get("status")
@@ -283,18 +281,24 @@ class InstanceSelector:
         current_tpm = instance.get("current_tpm", 0)
         max_tpm = instance.get("max_tpm", 0)
         if max_tpm > 0 and current_tpm >= max_tpm * 0.95:  # Only check if max_tpm is set
-            logger.debug(f"Instance {instance_name} skipped: approaching TPM limit ({current_tpm}/{max_tpm})")
+            tpm_usage_percent = (current_tpm / max_tpm) * 100
+            logger.debug(f"Instance {instance_name} skipped: approaching TPM limit ({current_tpm}/{max_tpm}, {tpm_usage_percent:.1f}%)")
             return False
             
         # Check rate limit
-        allowed, retry_after = instance_manager.check_rate_limit(instance_name, required_tokens)
+        allowed = instance_manager.check_rate_limit(instance_name, required_tokens)
         if not allowed:
-            logger.debug(f"Instance {instance_name} skipped: rate limited (retry after {retry_after}s)")
+            logger.debug(f"Instance {instance_name} skipped: rate limited")
             # Mark as rate limited if not already
             if status != "rate_limited":
-                instance_manager.mark_rate_limited(instance_name, int(retry_after) if retry_after else None)
+                # Get current token usage for better debugging
+                current_usage = instance_manager.get_current_usage(instance_name)
+                max_usage = instance_manager.get_instance_config(instance_name).max_tpm
+                logger.debug(f"Marking instance {instance_name} as rate limited. Current usage: {current_usage}/{max_usage} tokens")
+                instance_manager.mark_rate_limited(instance_name, None)
             return False
             
+        logger.debug(f"Instance {instance_name} has capacity for {required_tokens} tokens (TPM: {current_tpm}/{max_tpm})")
         return True
 
 # Create a singleton instance

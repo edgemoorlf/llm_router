@@ -44,6 +44,7 @@ class InstanceConfig(BaseModel):
     enabled: bool = Field(default=True, description="Whether this instance is enabled")
     timeout_seconds: float = Field(default=60.0, description="Request timeout in seconds")
     retry_count: int = Field(default=3, description="Number of retries for failed requests")
+    rate_limit_enabled: bool = Field(default=True, description="Whether rate limiting is enabled for this instance")
 
     class Config:
         schema_extra = {

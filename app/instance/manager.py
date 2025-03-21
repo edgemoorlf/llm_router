@@ -8,6 +8,7 @@ that uses the separated configuration and state architecture.
 import logging
 import time
 import os
+import random
 from typing import Dict, List, Optional, Any, Union, Tuple
 
 from app.models.instance import InstanceConfig, InstanceState, InstanceStatus, create_instance_state
@@ -220,13 +221,17 @@ class InstanceManager:
             Dictionary with instance statistics
         """
         logger.debug("Calling get_instance_stats")
+        
+        # First sync all rate limiter data to instance states
+        configs = self.config_store.get_all_configs()
+        for name in configs.keys():
+            self.sync_rate_limiter_to_state(name)
+        
+        # Now get the updated states
         states = self.state_store.get_all_states()
         logger.debug(f"Retrieved {len(states)} states: {list(states.keys())}")
         
         # Filter to only include instances that have configuration
-        configs = self.config_store.get_all_configs()
-        logger.debug(f"Retrieved {len(configs)} configs: {list(configs.keys())}")
-        
         instance_stats = [
             state.dict() for name, state in states.items()
             if name in configs
@@ -287,9 +292,9 @@ class InstanceManager:
             name: Name of the instance
             success: Whether the request was successful
             tokens: Number of tokens processed
-            latency_ms: Request latency in milliseconds
+            latency_ms: Request latency in milliseconds (ignored)
             error: Error message if request failed
-            status_code: HTTP status code if request failed
+            status_code: HTTP status code if request failed (ignored)
             
         Returns:
             True if successful, False otherwise
@@ -299,9 +304,7 @@ class InstanceManager:
                 name=name,
                 success=success,
                 tokens=tokens,
-                latency_ms=latency_ms,
-                error=error,
-                status_code=status_code
+                error=error
             )
             return True
         except Exception as e:
@@ -586,8 +589,56 @@ class InstanceManager:
         state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
         self.state_store.update_state(name, **state_dict)
     
+    def update_token_usage(self, name: str, tokens: int) -> None:
+        """Update token usage for an instance after a successful request.
+        
+        This should be called after a request has been successfully processed
+        to update the token consumption for rate limiting purposes.
+        
+        Args:
+            name: Name of the instance
+            tokens: Number of tokens consumed
+        """
+        if not self.state_store:
+            return
+            
+        # Get instance config to check if rate limiting is enabled
+        instance_data = self.get_instance(name)
+        if not instance_data:
+            return
+            
+        # Extract config from the tuple
+        config, _ = instance_data
+        
+        # Get the current state
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        # If rate limiting is enabled, update the token usage
+        if config.rate_limit_enabled and tokens > 0:
+            rate_limiter = self._get_rate_limiter(name)
+            if rate_limiter:
+                rate_limiter.update_usage(tokens)
+                
+                # Update current_tpm in the instance state to match rate limiter
+                current_usage = rate_limiter.get_current_usage()
+                state.current_tpm = current_usage
+                
+                # Update state in Redis
+                state_dict = state.dict()
+                state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+                self.state_store.update_state(name, **state_dict)
+                
+        # Update historical total_tokens_served regardless of rate limiting
+        self.state_store.update_total_tokens(name, tokens)
+    
     def get_metrics(self, name: str) -> Optional[Dict[str, Any]]:
         """Get all metrics for an instance."""
+        # First sync the rate limiter data to the instance state
+        self.sync_rate_limiter_to_state(name)
+        
+        # Now get the updated state
         state = self.state_store.get_state(name)
         if not state:
             return None
@@ -633,24 +684,35 @@ class InstanceManager:
             }
         }
 
-    def check_rate_limit(self, name: str, tokens: int) -> Tuple[bool, Optional[float]]:
-        """
-        Check if an instance has capacity for the requested tokens.
+    def check_rate_limit(self, name: str, tokens: int) -> bool:
+        """Check if an instance has capacity for tokens under rate limiting.
+        
+        This method ONLY checks capacity and doesn't update any token usage.
+        Token usage should be updated after a successful request using update_token_usage.
         
         Args:
             name: Name of the instance
-            tokens: Number of tokens requested
+            tokens: Number of tokens to check
             
         Returns:
-            Tuple of (allowed: bool, retry_after: Optional[float])
+            True if instance has capacity, False otherwise
         """
+        instance_config = self.get_instance_config(name)
+        if not instance_config:
+            return False
+            
+        # If rate limiting is not enabled, always return True
+        if not instance_config.rate_limit_enabled:
+            return True
+            
+        # Check if instance is rate limited
         rate_limiter = self._get_rate_limiter(name)
         if not rate_limiter:
-            logger.error(f"No rate limiter found for instance {name}")
-            return False, None
+            logger.error(f"Rate limiter not available for {name}")
+            return False
             
-        return rate_limiter.check_and_update(tokens)
-
+        return rate_limiter.check_capacity(tokens)
+        
     def get_current_usage(self, name: str) -> int:
         """
         Get current token usage for an instance.
@@ -670,63 +732,65 @@ class InstanceManager:
 
     def select_instance_for_request(self, model: str, tokens: int, provider_type: str = None) -> Optional[str]:
         """
-        Select the best instance for a request based on model support, health, and capacity.
+        Select the best instance for a request based on model compatibility and capacity.
         
         Args:
-            model: Model name requested
-            tokens: Number of tokens needed
+            model: The model name to use
+            tokens: Required tokens for the request
             provider_type: Optional provider type filter
             
         Returns:
-            Name of selected instance or None if no suitable instance found
+            Name of the selected instance or None if no suitable instance is found
         """
-        # First get all configs (no Redis calls)
-        all_configs = self.get_all_instance_configs()
-        
-        # Pre-filter configs by model and provider type (no Redis needed)
-        eligible_configs = []
-        for config in all_configs:
-            # Skip if provider type doesn't match
+        eligible_instances = []
+        all_instances = []
+        instance_to_use = None
+    
+        # Get all instance configs
+        configs = self.get_all_instance_configs()
+        if not configs:
+            logger.error("No instance configurations found")
+            return None
+            
+        # Filter instances by model and provider_type
+        for config in configs:
+            # Skip wrong provider type
             if provider_type and config.provider_type != provider_type:
                 continue
-            
-            # Skip if model not supported
-            if model.lower() not in [m.lower() for m in config.supported_models]:
-                continue
-            
-            eligible_configs.append(config)
+                
+            # Check model support
+            if self._is_model_compatible(config, model):
+                all_instances.append(config)
+                
+                # Check capacity
+                allowed = self.check_rate_limit(config.name, tokens)
+                if allowed:
+                    eligible_instances.append(config)
         
-        # If no configs matched, return early
-        if not eligible_configs:
+        if not all_instances:
+            logger.warning(f"No instances found that support model '{model}'")
             return None
-        
-        # Now get states only for eligible configs
-        eligible_instances = []
-        for config in eligible_configs:
-            # Get state for this specific instance
-            state = self.get_instance_state(config.name)
             
-            # Skip if instance is not healthy
-            if not state or state.status != InstanceStatus.HEALTHY:
-                continue
-            
-            # Check rate limit
-            allowed, _ = self.check_rate_limit(config.name, tokens)
-            if not allowed:
-                continue
-            
-            eligible_instances.append((config, self.get_current_usage(config.name)))
-        
         if not eligible_instances:
+            logger.warning(f"No instances with capacity found for model '{model}' and {tokens} tokens")
             return None
-        
-        # Sort by priority and current usage
-        eligible_instances.sort(key=lambda x: (
-            x[0].priority,  # Sort by priority first
-            x[1]           # Then by current usage
-        ))
-        
-        return eligible_instances[0][0].name
+            
+        # Group by priority (lower is better)
+        priority_groups = {}
+        for instance in eligible_instances:
+            priority = instance.priority
+            if priority not in priority_groups:
+                priority_groups[priority] = []
+            priority_groups[priority].append(instance)
+            
+        # Get the group with the lowest priority
+        if priority_groups:
+            min_priority = min(priority_groups.keys())
+            candidates = priority_groups[min_priority]
+            # Randomly select an instance from the group
+            instance_to_use = random.choice(candidates)
+            
+        return instance_to_use.name if instance_to_use else None
 
     def has_instance(self, name: str) -> bool:
         """
@@ -792,13 +856,13 @@ class InstanceManager:
             # is managed by the instance manager
             pass
     
-    def update_instance(self, name: str, config: InstanceConfig) -> bool:
+    def update_instance(self, name: str, config_updates: Dict[str, Any]) -> bool:
         """
         Update an instance configuration.
         
         Args:
             name: Name of the instance to update
-            config: New configuration for the instance
+            config_updates: Dictionary with fields to update in the configuration
             
         Returns:
             True if successful, False otherwise
@@ -809,21 +873,33 @@ class InstanceManager:
             logger.warning(f"Cannot update non-existent instance: {name}")
             return False
             
+        # Create a dictionary from the current config
+        updated_config_dict = current_config.dict()
+        
+        # Update with the new values
+        updated_config_dict.update(config_updates)
+        
+        # Ensure name is preserved
+        updated_config_dict["name"] = name
+        
+        # Convert back to InstanceConfig
+        updated_config = InstanceConfig(**updated_config_dict)
+        
         # Update the configuration
-        result = self.config_store.add_config(config)
+        result = self.config_store.add_config(updated_config)
         
         # If tpm or input tokens changed, update the rate limiter
-        if result and (config.max_tpm != current_config.max_tpm or 
-                    config.max_input_tokens != current_config.max_input_tokens):
+        if result and (updated_config.max_tpm != current_config.max_tpm or 
+                    updated_config.max_input_tokens != current_config.max_input_tokens):
             # Update rate limiter if it exists
             if name in self.rate_limiters:
                 self.rate_limiters[name] = get_rate_limiter(
                     instance_id=name,
-                    tokens_per_minute=config.max_tpm,
+                    tokens_per_minute=updated_config.max_tpm,
                     use_redis=self.use_redis,
                     redis_url=self.redis_url,
                     redis_password=self.redis_password,
-                    max_input_tokens=config.max_input_tokens
+                    max_input_tokens=updated_config.max_input_tokens
                 )
                 
         return result
@@ -896,3 +972,61 @@ class InstanceManager:
         
         logger.debug(f"get_states_for_configs: fetched {len(result)} states for specified configs")
         return result 
+
+    def _is_model_compatible(self, config: Any, model: str) -> bool:
+        """
+        Check if an instance supports a given model.
+        
+        Args:
+            config: The instance configuration to check
+            model: The model name to check support for
+            
+        Returns:
+            True if the instance supports the model, False otherwise
+        """
+        # Normalize the model name
+        model_lower = model.lower()
+        
+        # If no supported_models list, assume all models are supported
+        if not config.supported_models:
+            return True
+            
+        # Check if the model is in the supported_models list
+        for supported_model in config.supported_models:
+            if model_lower == supported_model.lower():
+                return True
+                
+        return False 
+
+    def sync_rate_limiter_to_state(self, name: str) -> None:
+        """
+        Sync token usage data from the rate limiter to the instance state.
+        This ensures current_tpm in the instance state matches the rate limiter's data.
+        
+        Args:
+            name: Name of the instance
+        """
+        # Skip if no state store
+        if not self.state_store:
+            return
+            
+        # Get rate limiter
+        rate_limiter = self._get_rate_limiter(name)
+        if not rate_limiter:
+            return
+            
+        # Get current state
+        state = self.state_store.get_state(name)
+        if not state:
+            return
+            
+        # Get current usage from rate limiter
+        current_usage = rate_limiter.get_current_usage()
+        
+        # Update state only if different
+        if state.current_tpm != current_usage:
+            state.current_tpm = current_usage
+            state_dict = state.dict()
+            state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
+            self.state_store.update_state(name, **state_dict)
+            logger.debug(f"Synced current_tpm for instance {name}: {current_usage}") 
