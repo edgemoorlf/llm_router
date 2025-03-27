@@ -220,7 +220,9 @@ class RedisRateLimiter(RateLimiter):
                 except (ValueError, IndexError, AttributeError) as e:
                     logger.error(f"Error parsing token value '{value}': {e}")
             
-            logger.debug(f"Current usage for instance {self.instance_id}: {current_usage}/{self.tokens_per_minute} tokens")
+            if entries:
+                logger.debug(f"Current usage for instance {self.instance_id}: {current_usage}/{self.tokens_per_minute} tokens")
+            
             return current_usage
             
         except redis.RedisError as e:
@@ -246,8 +248,8 @@ class RedisRateLimiter(RateLimiter):
         
         try:
             with self.redis.pipeline() as pipe:
-                # Remove entries older than 1 minute
-                cutoff = current_time - 60
+                # Remove entries older than window period
+                cutoff = current_time - self.window_seconds
                 pipe.zremrangebyscore(self.redis_key, "-inf", cutoff)
                 
                 # Get current usage
@@ -273,6 +275,8 @@ class RedisRateLimiter(RateLimiter):
                                  f"Retry after {retry_after} seconds")
                     return False, max(1, retry_after)
                 
+                if current_usage > 0:
+                    logger.debug(f"Instance {self.instance_id} has capacity: {current_usage}/{self.tokens_per_minute} tokens used")
                 return True, 0
                 
         except redis.RedisError as e:
@@ -293,8 +297,17 @@ class RedisRateLimiter(RateLimiter):
             # Add the new tokens
             unique_token_key = f"{tokens}:{time.time_ns()}"
             self.redis.zadd(self.redis_key, {unique_token_key: current_time})
-            self.redis.expire(self.redis_key, self.window_seconds * 2)
-            logger.debug(f"Updated usage for instance {self.instance_id}: +{tokens} tokens")
+            
+            # Remove explicit TTL - we'll manage expiration through zremrangebyscore
+            # Instead, just clean up old entries beyond our window
+            cutoff = current_time - self.window_seconds
+            self.redis.zremrangebyscore(self.redis_key, "-inf", cutoff)
+            
+            # Check current usage after updating (for debugging)
+            current_usage = self.get_current_usage()
+            
+            logger.debug(f"Updated usage for instance {self.instance_id}: +{tokens} tokens, "
+                        f"current usage: {current_usage}/{self.tokens_per_minute}")
         except redis.RedisError as e:
             logger.error(f"Redis error updating usage for {self.instance_id}: {e}")
 
@@ -316,8 +329,12 @@ class RedisRateLimiter(RateLimiter):
         return allowed, retry_after
     
     def reset(self) -> None:
-        """Reset the rate limiter."""
-        self.redis.delete(self.redis_key)
+        """Reset the rate limiter by clearing all usage data."""
+        try:
+            result = self.redis.delete(self.redis_key)
+            logger.info(f"Explicitly reset rate limiter for instance {self.instance_id} (deleted {result} keys)")
+        except redis.RedisError as e:
+            logger.error(f"Redis error resetting rate limiter for {self.instance_id}: {e}")
 
 
 def get_rate_limiter(

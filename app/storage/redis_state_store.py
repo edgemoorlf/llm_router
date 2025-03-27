@@ -232,7 +232,8 @@ class RedisStateStore:
             # Note: actual token usage for rate limiting is handled by InstanceManager.update_token_usage
             state.total_tokens_served += tokens
         else:
-            state.failed_requests += 1
+            # Just update error count - we don't have a failed_requests counter
+            # Failed requests can be calculated as total_requests - successful_requests
             state.error_count += 1
             state.last_error = error
             state.last_error_time = datetime.utcnow()

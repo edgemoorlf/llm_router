@@ -106,10 +106,35 @@ class InstanceSelector:
         # Filter by model support (still using only config data, no Redis)
         return [
             instance for instance in instances
-            if not instance.get("supported_models") or  # If no supported_models list, assume all supported
-               model_name.lower() in [m.lower() for m in instance.get("supported_models", [])]
+            if self._is_model_compatible(instance, model_name)
         ]
         
+    def _is_model_compatible(self, instance: Dict[str, Any], model: str) -> bool:
+        """
+        Check if an instance supports a given model.
+        
+        Args:
+            instance: The instance configuration to check
+            model: The model name to check support for
+            
+        Returns:
+            True if the instance supports the model, False otherwise
+        """
+        # Normalize the model name
+        model_lower = model.lower()
+        
+        # If no supported_models list, assume all models are supported
+        supported_models = instance.get("supported_models", [])
+        if not supported_models:
+            return True
+            
+        # Check if the model is in the supported_models list
+        for supported_model in supported_models:
+            if model_lower == supported_model.lower():
+                return True
+                
+        return False
+
     def select_instances_for_model(
         self, 
         model_name: str, 
@@ -180,7 +205,53 @@ class InstanceSelector:
         # Find eligible instances from the given list of pre-filtered instances
         eligible_instances = []
         
+        # First filter out instances with non-healthy status
+        # This avoids unnecessary capacity checks for instances we won't use anyway
+        healthy_instances = []
         for instance in instances:
+            status = instance.get("status")
+            instance_name = instance.get("name", "unknown")
+            
+            # Proactively check if rate limit has expired for rate-limited instances
+            if status == "rate_limited":
+                rate_limited_until = instance.get("rate_limited_until")
+                if rate_limited_until and time.time() >= rate_limited_until:
+                    logger.info(f"Rate limit for instance {instance_name} has expired in selector, marking as healthy")
+                    instance["status"] = "healthy"
+                    status = "healthy"
+                    # Also update in the actual instance manager
+                    instance_manager.mark_healthy(instance_name)
+                else:
+                    remaining = int(rate_limited_until - time.time()) if rate_limited_until else 0
+                    logger.debug(f"Instance {instance_name} still rate limited for {remaining} more seconds")
+            
+            if status is None:
+                logger.warning(f"Instance {instance_name} has None status, defaulting to healthy")
+                instance["status"] = "healthy"
+                healthy_instances.append(instance)
+            elif status == "healthy":
+                healthy_instances.append(instance)
+            else:
+                logger.debug(f"Instance {instance_name} skipped: status is {status}")
+                
+        # If no healthy instances, return empty list early
+        if not healthy_instances:
+            logger.debug(f"No healthy instances available for model '{model_name}'")
+            return []
+            
+        # For remaining healthy instances, sync rate limiter data once
+        for instance in healthy_instances:
+            instance_name = instance.get("name", "")
+            # Sync rate limiter data to ensure current_tpm is accurate
+            instance_manager.sync_rate_limiter_to_state(instance_name)
+            
+            # Update the instance state in our local dictionary with the fresh data
+            current_state = instance_manager.get_instance_state(instance_name)
+            if current_state:
+                instance["current_tpm"] = current_state.current_tpm
+        
+        # Now check capacity for the healthy instances
+        for instance in healthy_instances:
             # Check if instance has capacity for the requested tokens
             if self._check_instance_capacity(instance, tokens):
                 # Add original model name for consistent instance selection in fallbacks
@@ -244,39 +315,8 @@ class InstanceSelector:
         """
         instance_name = instance.get("name", "")
         
-        # Sync rate limiter data to ensure current_tpm is accurate
-        instance_manager.sync_rate_limiter_to_state(instance_name)
+        # We no longer need to check status here since we've already filtered by status
         
-        # Update the instance state in our local dictionary
-        current_state = instance_manager.get_instance_state(instance_name)
-        if current_state:
-            instance["current_tpm"] = current_state.current_tpm
-        
-        # Get status, defaulting to healthy if missing or None
-        status = instance.get("status")
-        if status is None:
-            logger.warning(f"Instance {instance_name} has None status, defaulting to healthy")
-            instance["status"] = "healthy"
-            status = "healthy"
-        
-        # Proactively check if rate limit has expired
-        if status == "rate_limited":
-            rate_limited_until = instance.get("rate_limited_until")
-            if rate_limited_until and time.time() >= rate_limited_until:
-                logger.info(f"Rate limit for instance {instance_name} has expired in selector, marking as healthy")
-                instance["status"] = "healthy"
-                status = "healthy"
-                # Also update in the actual instance manager
-                instance_manager.mark_healthy(instance_name)
-            else:
-                remaining = int(rate_limited_until - time.time()) if rate_limited_until else 0
-                logger.debug(f"Instance {instance_name} still rate limited for {remaining} more seconds")
-            
-        # Skip if not healthy
-        if status != "healthy":
-            logger.debug(f"Instance {instance_name} skipped: status is {status}")
-            return False
-            
         # Check TPM limit
         current_tpm = instance.get("current_tpm", 0)
         max_tpm = instance.get("max_tpm", 0)
@@ -289,17 +329,51 @@ class InstanceSelector:
         allowed = instance_manager.check_rate_limit(instance_name, required_tokens)
         if not allowed:
             logger.debug(f"Instance {instance_name} skipped: rate limited")
-            # Mark as rate limited if not already
-            if status != "rate_limited":
-                # Get current token usage for better debugging
-                current_usage = instance_manager.get_current_usage(instance_name)
-                max_usage = instance_manager.get_instance_config(instance_name).max_tpm
-                logger.debug(f"Marking instance {instance_name} as rate limited. Current usage: {current_usage}/{max_usage} tokens")
-                instance_manager.mark_rate_limited(instance_name, None)
+            # Mark as rate limited - just a single call, no redundant state fetching
+            # Get current token usage for better debugging
+            current_usage = instance.get("current_tpm", 0)
+            max_usage = instance.get("max_tpm", 0)
+            logger.debug(f"Marking instance {instance_name} as rate limited. Current usage: {current_usage}/{max_usage} tokens")
+            instance_manager.mark_rate_limited(instance_name, None)
             return False
             
         logger.debug(f"Instance {instance_name} has capacity for {required_tokens} tokens (TPM: {current_tpm}/{max_tpm})")
         return True
+
+    def select_instance_for_request(self, model: str, tokens: int, provider_type: str = None) -> Optional[str]:
+        """
+        Select the best instance for a request based on model compatibility and capacity.
+        
+        Args:
+            model: The model name to use
+            tokens: Required tokens for the request
+            provider_type: Optional provider type filter
+            
+        Returns:
+            Name of the selected instance or None if no suitable instance is found
+        """
+        logger.debug(f"Selecting instance for model {model}, tokens {tokens}, provider_type {provider_type}")
+        
+        # Get instances that support this model (config only - no Redis calls yet)
+        instances = self.get_instances_for_model(model, provider_type)
+        if not instances:
+            logger.warning(f"No instances found that support model '{model}'")
+            return None
+            
+        # Now get state information only for filtered instances
+        instances = self._get_states_for_filtered_instances(instances)
+        
+        # Get eligible instances ordered by priority
+        eligible_instances = self._get_eligible_instances(instances, tokens, model)
+        
+        if not eligible_instances:
+            logger.warning(f"No instances with capacity found for model '{model}' and {tokens} tokens")
+            return None
+        
+        # Return the name of the first instance (highest priority)
+        selected_instance = eligible_instances[0]
+        logger.info(f"Selected instance {selected_instance['name']} for model {model}, tokens {tokens}")
+        return selected_instance['name']
 
 # Create a singleton instance
 instance_selector = InstanceSelector() 

@@ -160,8 +160,10 @@ class GenericOpenAIService:
             )
             
         # Check rate limit
-        allowed, retry_after = instance_manager.check_rate_limit(instance_name, required_tokens)
+        allowed = instance_manager.check_rate_limit(instance_name, required_tokens)
         if not allowed:
+            # Get retry after time from rate limiter directly
+            retry_after = 60  # Default
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded for instance '{instance_name}'. Try again in {retry_after} seconds.",
