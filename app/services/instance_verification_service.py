@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 
 from app.instance.instance_context import instance_manager
 from app.services.instance_service import instance_service
-from app.errors.exceptions import InstanceNotFoundError
+from app.errors.internal_errors import InstanceNotFoundError
 from app.errors.handlers import handle_errors
 
 logger = logging.getLogger(__name__)

@@ -99,10 +99,12 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
                 logger.warning(f"Failed to build URL for instance '{instance_name}', trying next instance")
                 continue
             
-            logger.debug(f"Streaming request via instance {instance_name} to {url}")
+            logger.debug(f"Streaming request via instance {instance_name} to {url} with proxies: {instance.get('proxy_url')}")
             
             # Create a new client for streaming
-            client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+            client = httpx.AsyncClient(timeout=httpx.Timeout(300.0),
+                                       proxies={"http://": instance.get("proxy_url")}  # HTTP proxy only
+                                      )
             
             # Set appropriate headers based on provider type
             if config.provider_type == "azure":

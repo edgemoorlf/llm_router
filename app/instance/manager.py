@@ -49,7 +49,6 @@ class InstanceManager:
         # Get Redis configuration from environment or parameters
         self.redis_url = redis_url or os.environ.get("REDIS_URL", "redis://localhost:6379")
         self.redis_password = redis_password or os.environ.get("REDIS_PASSWORD", "")
-        self.use_redis = os.environ.get("USE_REDIS", "").lower() in ("true", "1", "yes")
         
         # Initialize state store with Redis configuration
         self.state_store = RedisStateStore(redis_url=self.redis_url, redis_password=self.redis_password)
@@ -87,7 +86,6 @@ class InstanceManager:
                     self.rate_limiters[name] = get_rate_limiter(
                         instance_id=name,
                         tokens_per_minute=config.max_tpm,
-                        use_redis=self.use_redis,
                         redis_url=self.redis_url,
                         redis_password=self.redis_password,
                         max_input_tokens=config.max_input_tokens
@@ -101,7 +99,6 @@ class InstanceManager:
                         self.rate_limiters[name] = get_rate_limiter(
                             instance_id=name,
                             tokens_per_minute=config.max_tpm,
-                            use_redis=self.use_redis,
                             redis_url=self.redis_url,
                             redis_password=self.redis_password,
                             max_input_tokens=config.max_input_tokens
@@ -130,7 +127,6 @@ class InstanceManager:
                 self.rate_limiters[name] = get_rate_limiter(
                     instance_id=name,
                     tokens_per_minute=config.max_tpm,
-                    use_redis=self.use_redis,
                     redis_url=self.redis_url,
                     redis_password=self.redis_password,
                     max_input_tokens=config.max_input_tokens
@@ -833,7 +829,6 @@ class InstanceManager:
                 self.rate_limiters[config.name] = get_rate_limiter(
                     instance_id=config.name,
                     tokens_per_minute=config.max_tpm,
-                    use_redis=self.use_redis,
                     redis_url=self.redis_url,
                     redis_password=self.redis_password,
                     max_input_tokens=config.max_input_tokens
@@ -899,7 +894,6 @@ class InstanceManager:
                 self.rate_limiters[name] = get_rate_limiter(
                     instance_id=name,
                     tokens_per_minute=updated_config.max_tpm,
-                    use_redis=self.use_redis,
                     redis_url=self.redis_url,
                     redis_password=self.redis_password,
                     max_input_tokens=updated_config.max_input_tokens

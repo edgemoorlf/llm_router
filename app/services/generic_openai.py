@@ -71,7 +71,7 @@ class GenericOpenAIService:
         if not generic_payload.get("stream", False) and required_tokens > 0:
             # Only apply global rate limiting if the per-instance rate limiting is not sufficient
             # This gives us a fallback mechanism while still preferring per-instance limits
-            allowed, retry_after = rate_limiter.check_and_update(required_tokens, instance_id=None)
+            allowed, retry_after = rate_limiter.check_capacity(required_tokens)
             if not allowed:
                 logger.warning(f"Global rate limit exceeded: required {required_tokens} tokens")
                 raise HTTPException(
@@ -257,7 +257,10 @@ class GenericOpenAIService:
         url = f"{config.api_base.rstrip('/')}{endpoint}"
         
         # Create a new client for this request
-        async with httpx.AsyncClient(timeout=httpx.Timeout(config.timeout_seconds)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout_seconds),
+            proxies={"http://": config.proxy_url}  # HTTP proxy only
+        ) as client:
             # Set up headers
             headers = {
                 "Content-Type": "application/json",

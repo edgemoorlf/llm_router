@@ -13,11 +13,18 @@ from typing import Optional, Dict, Any, TypeVar, List, Callable
 from fastapi import HTTPException, status
 
 from app.errors.exceptions import (
-    InstanceNotFoundError,
-    ModelNotSupportedError,
-    ValidationError,
     ProxyError
 )
+
+from app.errors.internal_errors import (
+    InstanceNotFoundError,
+)
+
+from app.errors.client_errors import (
+    ModelNotSupportedError,
+    ValidationError,
+)
+
 from app.models.instance import InstanceConfig
 
 logger = logging.getLogger(__name__)

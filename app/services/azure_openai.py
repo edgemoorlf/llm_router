@@ -24,6 +24,7 @@ class AzureOpenAIService:
     def __init__(self):
         """Initialize the Azure OpenAI service."""
         logger.info("Initialized Azure OpenAI service for Azure-specific instances")
+        random.seed(42)
     
     async def transform_request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -61,8 +62,8 @@ class AzureOpenAIService:
         exclude_instances = set()  # Track excluded instances
         max_retries = 3
         retry_count = 0
-        
-        logger.debug(f"Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
+        request_id = f"fr1-{time.time()}"
+        logger.info(f"[{request_id}] Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
         
         while retry_count < max_retries:
             try:
@@ -76,14 +77,14 @@ class AzureOpenAIService:
                 
                 if available_instances:
                     instance_names = [inst.get("name", "") for inst in available_instances]
-                    logger.debug(f"Selected {len(available_instances)} instances for request: {', '.join(instance_names)}")
+                    logger.info(f"[{request_id}] Selected {len(available_instances)} instances for request: {', '.join(instance_names)}")
                 else:
-                    logger.warning(f"No instances available for model '{original_model}' with {required_tokens} tokens")
+                    logger.warning(f"[{request_id}] No instances available for model '{original_model}' with {required_tokens} tokens")
                 
                 if not available_instances:
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                        detail=f"No instances available that support model '{original_model}'"
+                        detail=f"[{request_id}] No instances available that support model '{original_model}'"
                     )
                 
                 # Execute request with fallback handling
@@ -106,12 +107,12 @@ class AzureOpenAIService:
                 
                 # If this was the last retry, re-raise
                 if retry_count >= max_retries - 1:
-                    logger.error(f"All retries failed for model '{original_model}'. Last error: {str(e)}")
+                    logger.error(f"[{request_id}] All retries failed for model '{original_model}'. Last error: {str(e)}")
                     raise
                 
                 # Prepare for next retry
                 retry_count += 1
-                logger.warning(f"All instances failed, retry {retry_count}/{max_retries}")
+                logger.warning(f"[{request_id}] All instances failed, retry {retry_count}/{max_retries}")
                 await asyncio.sleep(0.5 * retry_count)  # Increasing backoff
 
     async def _execute_with_fallbacks(
@@ -130,6 +131,8 @@ class AzureOpenAIService:
         # Shuffle the instances to randomize the order
         random.shuffle(available_instances)
 
+        request_id = f"ewf-{time.time()}"
+
         # Try each instance in sequence until success or all fail
         for instance in available_instances:
             instance_name = instance.get("name", "")
@@ -143,7 +146,7 @@ class AzureOpenAIService:
             payload_with_model["model"] = model_name
             
             try:
-                logger.debug(f"Attempting request with instance {instance_name}")
+                logger.debug(f"[{request_id}] Attempting request with instance {instance_name}")
                 
                 # Forward the request directly to this instance
                 result = await self._forward_request_to_instance(
@@ -174,7 +177,7 @@ class AzureOpenAIService:
                         tokens=0
                     )
                     
-                logger.debug(f"Request completed using Azure instance {instance_name}")
+                logger.debug(f"[{request_id}] Request completed using Azure instance {instance_name}")
                 return result
                 
             except HTTPException as e:
@@ -187,10 +190,10 @@ class AzureOpenAIService:
                 fallback_errors.append(f"{instance_name}: {str(e)}")
                 
                 # Log failure and continue to next instance
-                logger.warning(f"Instance {instance_name} failed with error {str(e)}, trying next instance")
+                logger.warning(f"[{request_id}] Instance {instance_name} failed with error {str(e)}, trying next instance")
         
         # If we get here, all instances failed
-        error_detail = f"All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
+        error_detail = f"[{request_id}] All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
         logger.error(error_detail)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -223,7 +226,7 @@ class AzureOpenAIService:
         api_version = instance.get("api_version", "")
         model_deployments = instance.get("model_deployments", {})
         timeout_seconds = instance.get("timeout_seconds", 60.0)
-        retry_count = instance.get("retry_count", 5)
+        retry_count = instance.get("retry_count", 3)
         
         # Extract model from payload
         model_name = payload.get("model", "").lower() if payload and "model" in payload else ""
@@ -243,7 +246,7 @@ class AzureOpenAIService:
                 )
                 
         # Generate a request ID for tracking
-        request_id = f"{instance_name}-{time.time()}"
+        request_id = f"fr2r-{instance_name}-{time.time()}"
         
         # Add current model to instance for URL building
         instance = instance.copy()  # Make a copy to avoid modifying the original
@@ -260,7 +263,10 @@ class AzureOpenAIService:
         logger.debug(f"[{request_id}] Forwarding request to instance {instance_name} ({provider_type}): {url}")
         
         # Set up HTTP client with appropriate timeout
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds),
+            proxies={"http://": instance.get("proxy_url")}  # HTTP proxy only
+        ) as client:
             # Set headers based on provider_type
             headers = {"Content-Type": "application/json"}
             

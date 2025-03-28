@@ -45,7 +45,7 @@ class ConfigStore:
         Reload configurations from the file.
         """
         with self.file_lock:
-            logger.info(f"Explicitly reloading configs from file {self.config_file}")
+            logger.debug(f"Explicitly reloading configs from file {self.config_file}")
             # Clear current configs to ensure a fresh load
             self.configs = {}
             # Try to load from JSON file first
@@ -53,10 +53,10 @@ class ConfigStore:
             
             # If no configs loaded, try to load from YAML
             if not self.configs:
-                logger.info("No configs loaded from JSON, attempting to load from YAML")
+                logger.debug("No configs loaded from JSON, attempting to load from YAML")
                 self._load_from_yaml()
             
-            logger.info(f"Reload complete. Loaded {len(self.configs)} instance configurations")
+            logger.debug(f"Reload complete. Loaded {len(self.configs)} instance configurations")
     
     def _load_configs(self):
         """Load configurations from storage."""
@@ -67,7 +67,7 @@ class ConfigStore:
                         data = json.load(f)
                         for name, config_data in data.items():
                             self.configs[name] = InstanceConfig(**config_data)
-                    logger.info(f"Loaded {len(self.configs)} instance configurations from {self.config_file}")
+                    logger.debug(f"Loaded {len(self.configs)} instance configurations from {self.config_file}")
                 except Exception as e:
                     logger.error(f"Error loading configurations from {self.config_file}: {e}")
             else:
