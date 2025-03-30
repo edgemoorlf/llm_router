@@ -90,11 +90,11 @@ class InstanceVerificationService:
             if not config.api_base:
                 config_issues.append("API base URL is missing")
             
-            if config.provider_type == "azure" and not config.api_version:
+            if config.provider_type == ProviderType.AZURE and not config.api_version:
                 config_issues.append("API version is missing for Azure provider")
                 
             # For Azure provider, check deployment mappings
-            if config.provider_type == "azure" and not config.model_deployments:
+            if config.provider_type == ProviderType.AZURE and not config.model_deployments:
                 config_issues.append("No model deployment mappings defined for Azure provider")
             
             # Check if any supported models are defined
@@ -275,4 +275,4 @@ class InstanceVerificationService:
             }
 
 # Create a singleton instance
-instance_verification_service = InstanceVerificationService() 
+instance_verification_service = InstanceVerificationService()

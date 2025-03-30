@@ -39,12 +39,8 @@ class ErrorHandler:
                         detail=CONTENT_POLICY_VIOLATION_DETAIL,
                         headers=error.headers if hasattr(error, "headers") else {}
                     )
-                
-                raise HTTPException(
-                    status_code=error.status_code,
-                    detail=error.detail,
-                    headers=error.headers if hasattr(error, "headers") else {}
-                )
+
+            # doing nothing otherwise, hand it over the normal error handler
                 
         return False  # Not a special error
     
@@ -72,21 +68,16 @@ class ErrorHandler:
                     status="rate_limited",
                     rate_limited_until=time.time() + (retry_after or 60)
                 )
-            else:
+            elif error.status_code in [401, 404]:
+                # Only under 401,404 we should mark the instance as error
                 instance_manager.update_instance_state(
                     instance_name,
                     status="error",
                     last_error=str(error),
                     error_count=instance.get("error_count", 0) + 1
                 )
-        else:
-            # Handle non-HTTPException errors
-            instance_manager.update_instance_state(
-                instance_name,
-                status="error",
-                last_error=str(error),
-                error_count=instance.get("error_count", 0) + 1
-            )
+                
+        # Otherwise, it's not instance's error, we should not update instance state
     
     def parse_http_error(self, error: Exception) -> Tuple[int, str, Dict[str, str]]:
         """

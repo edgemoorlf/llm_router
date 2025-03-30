@@ -1,8 +1,8 @@
 import requests
 
 # 配置参数
-API_KEY = "2PZVEgzOujTs9aT2lxYfq2yuunnbUmjud0HzPbZAXzNFLWgdf0WHJQQJ99BCACHYHv6XJ3w3AAABACOGiMb8"  # 替换为你的API密钥
-API_BASE = "https://eastus2-0317-27-1-1120.openai.azure.com/"
+API_KEY = "661URv0Y3b8tAQMYlPyEuiAV4QFi805p3etY929VTkPWsKVMGWc8JQQJ99BCAChHRaEXJ3w3AAABACOGir4L"  # 替换为你的API密钥
+API_BASE = "https://norwayeast-55-0324-0806-subscription2.openai.azure.com"
 DEPLOYMENT_NAME = "gpt-4o"
 DEPLOYMENT_ENDPOINT = f"{API_BASE}/openai/deployments/{DEPLOYMENT_NAME}/chat/completions?api-version=2024-08-01-preview"
 PROXY_URL = "http://fd955bb413ae99:a3af88e6@15.204.52.62:5001"
@@ -39,5 +39,6 @@ response = requests.post(
 if response.status_code == 200:
     reply = response.json()['choices'][0]['message']['content']
     print("Assistant:", reply)
+    print(f"response:\n {response.json()}")
 else:
     print(f"Error {response.status_code}: {response.text}")

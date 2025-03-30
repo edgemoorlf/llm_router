@@ -74,7 +74,7 @@ def determine_service_by_model(model_name: str) -> Tuple[Any, str]:
     logger.debug(f"No instances support model {model_name}, defaulting to Azure OpenAI")
     return azure_openai_service, "azure"
 
-@router.post("/v1/chat/completions")
+@router.post("/chat/completions")
 @handle_router_errors("processing chat completions request")
 async def chat_completion(
     request: Request, 
@@ -134,21 +134,23 @@ async def chat_completion(
                 detail="The API response does not contain expected 'choices' field",
             )
             
-        # Ensure each choice has a message with role and content for non-streaming
+        # Preserve all fields while ensuring required structure
         for choice in response["choices"]:
-            if "message" not in choice or "role" not in choice["message"] or "content" not in choice["message"]:
-                # Azure OpenAI might not always include content in case of content filtering
-                if "message" in choice and "role" in choice["message"] and "content" not in choice["message"]:
-                    choice["message"]["content"] = ""
+            # Keep existing logprobs and other fields intact
+            if "message" not in choice:
+                choice["message"] = {"role": "assistant", "content": ""}
+            else:
+                # Only add missing required fields without overwriting
+                choice["message"].setdefault("role", "assistant")
+                choice["message"].setdefault("content", "")
                     
         # Add the model info to the response if not present
         if "model" not in response:
             response["model"] = original_model or "Unknown"
             
-        # Ensure finish_reason is always included
+        # Preserve existing finish_reason and logprobs
         for choice in response["choices"]:
-            if "finish_reason" not in choice:
-                choice["finish_reason"] = "stop"  # Set a default
+            choice.setdefault("finish_reason", "stop")
                 
         # Track request completion
         duration_ms = int((time.time() - request_start_time) * 1000)
@@ -156,7 +158,7 @@ async def chat_completion(
                 
         return response
 
-@router.post("/v1/completions")
+@router.post("/completions")
 @handle_router_errors("processing completions request")
 async def completion(
     request: Request, 
@@ -239,7 +241,7 @@ async def completion(
         
         return response
 
-@router.post("/v1/embeddings")
+@router.post("/embeddings")
 @handle_router_errors("processing embeddings request")
 async def embeddings(request: Request) -> Any:
     """

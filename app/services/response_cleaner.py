@@ -32,7 +32,6 @@ class ResponseCleaner:
             for choice in cleaned["choices"]:
                 # Remove choice-level Azure fields
                 choice.pop("content_filter_results", None)
-                choice.pop("logprobs", None)
                 
                 # Remove refusal field from message
                 if "message" in choice:
@@ -86,4 +85,4 @@ class ResponseCleaner:
         }
 
 # Create a singleton instance
-response_cleaner = ResponseCleaner() 
+response_cleaner = ResponseCleaner()

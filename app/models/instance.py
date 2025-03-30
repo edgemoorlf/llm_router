@@ -10,6 +10,7 @@ This module defines the core data models for API instances:
 from enum import Enum
 from typing import List, Dict, Optional, Any
 from pydantic import BaseModel, Field
+
 import time
 
 class InstanceStatus(str, Enum):
@@ -168,4 +169,4 @@ def create_instance_state(name: str) -> InstanceState:
         status=InstanceStatus.HEALTHY,
         health_status="unknown",
         last_used=time.time()
-    ) 
+    )

@@ -5,6 +5,7 @@ import time
 from typing import Dict, List, Any, Optional, Set
 
 from app.instance.instance_context import instance_manager
+from app.models.instance import InstanceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,10 @@ class InstanceSelector:
             
             # Add a default status to avoid None status issues
             # We'll load actual states later when needed
-            instance["status"] = "healthy"
-            instances.append(instance)
+            instance_state = instance_manager.state_store.get_state(instance["name"])
+            if  instance_state != InstanceStatus.ERROR.value:
+                instance["status"] = instance_state
+                instances.append(instance)
         
         return instances
 

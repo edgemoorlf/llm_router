@@ -251,12 +251,12 @@ async def get_instance_details(
     
     # Generate basic health status from state
     if state:
-        if state.status == InstanceStatus.ERROR:
+        if state.status == InstanceStatus.ERROR.value:
             health_status = InstanceStatus.ERROR.value
             health_details["error_count"] = state.error_count
             health_details["last_error"] = state.last_error
             health_details["last_error_time"] = state.last_error_time
-        elif state.status == InstanceStatus.RATE_LIMITED:
+        elif state.status == InstanceStatus.RATE_LIMITED.value:
             health_status = InstanceStatus.RATE_LIMITED.value
             health_details["rate_limited_until"] = state.rate_limited_until
         else:

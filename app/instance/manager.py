@@ -138,16 +138,9 @@ class InstanceManager:
 
     def reload_config(self):
         """Reload configurations from storage and YAML."""
-        # Store old configs for comparison
-        old_configs = self.config_store.get_all_configs()
+
+        old_configs = self.config_store.configs
         
-        # First try to reload from JSON storage
-        self.config_store = ConfigStore(self.config_store.config_file)
-        
-        # If no configs loaded, try YAML
-        if not self.config_store.get_all_configs():
-            self.config_store._load_from_yaml()
-            
         new_configs = self.config_store.get_all_configs()
         
         # Remove rate limiters for instances that no longer exist
@@ -164,17 +157,12 @@ class InstanceManager:
         """
         Get an instance by name, returning both config and state.
         
-        This method always retrieves fresh data from both the config file and Redis,
-        to ensure consistency across multiple worker processes.
-        
         Args:
             name: Name of the instance
             
         Returns:
             Tuple of (config, state) if found, None otherwise
         """
-        # Always reload configs to get fresh data
-        self.config_store.reload()
         
         # Get fresh config
         config = self.config_store.get_config(name)

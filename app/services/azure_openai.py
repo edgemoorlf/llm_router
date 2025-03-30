@@ -64,16 +64,17 @@ class AzureOpenAIService:
         retry_count = 0
         request_id = f"fr1-{time.time()}"
         logger.info(f"[{request_id}] Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
-        
-        while retry_count < max_retries:
-            try:
-                # Get available instances, excluding previously failed ones
-                available_instances = instance_selector.select_instances_for_model(
+        # Get available instances
+        instance_candidates = instance_selector.select_instances_for_model(
                     original_model, 
                     required_tokens,
-                    provider_type="azure",
-                    exclude_instance_names=exclude_instances
-                )
+                    provider_type="azure"
+        )
+
+        while retry_count < max_retries:
+            try:
+                # excluding previously failed ones
+                available_instances = [instance for instance in instance_candidates if instance['name'] not in exclude_instances]
                 
                 if available_instances:
                     instance_names = [inst.get("name", "") for inst in available_instances]
@@ -112,7 +113,7 @@ class AzureOpenAIService:
                 
                 # Prepare for next retry
                 retry_count += 1
-                logger.warning(f"[{request_id}] All instances failed, retry {retry_count}/{max_retries}")
+                logger.warning(f"[{request_id}] All instances failed, retry {retry_count+1}/{max_retries}")
                 await asyncio.sleep(0.5 * retry_count)  # Increasing backoff
 
     async def _execute_with_fallbacks(
@@ -193,7 +194,7 @@ class AzureOpenAIService:
                 logger.warning(f"[{request_id}] Instance {instance_name} failed with error {str(e)}, trying next instance")
         
         # If we get here, all instances failed
-        error_detail = f"[{request_id}] All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
+        error_detail = f"[{request_id}] All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)[:100]}..."
         logger.error(error_detail)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

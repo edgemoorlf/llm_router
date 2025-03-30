@@ -195,7 +195,7 @@ class RedisStateStore:
                     
         # Check if we're clearing a rate limit status
         elif (kwargs.get("status") == InstanceStatus.HEALTHY.value and
-              current.status == InstanceStatus.RATE_LIMITED):
+              current.status == InstanceStatus.RATE_LIMITED.value):
             # Clear the rate limit key explicitly
             rate_limit_key = f"{self.rate_limit_prefix}{name}"
             self.redis.delete(rate_limit_key)
@@ -238,12 +238,6 @@ class RedisStateStore:
             state.last_error = error
             state.last_error_time = datetime.utcnow()
 
-            # Check if instance should be rate limited
-            if self._should_rate_limit(state):
-                logger.warning(f"Instance {name} rate limited due to errors: {state.error_count}, current TPM: {state.current_tpm}")
-                state.status = InstanceStatus.RATE_LIMITED
-                state.rate_limited_until = datetime.utcnow() + timedelta(seconds=self.rate_limit_duration)
-
         # Update state in Redis
         state_dict = state.dict()
         state_dict.pop('name', None)  # Remove name from dict to avoid duplicate
@@ -275,8 +269,8 @@ class RedisStateStore:
         This can be used when an admin wants to re-enable an errored instance.
         """
         state = self.get_state(name)
-        if state and state.status == InstanceStatus.ERROR:
-            state.status = InstanceStatus.HEALTHY
+        if state and state.status == InstanceStatus.ERROR.value:
+            state.status = InstanceStatus.HEALTHY.value
             state.error_count = 0
             state.last_error = None
             state.last_error_time = None
