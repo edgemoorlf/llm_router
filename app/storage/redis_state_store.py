@@ -9,6 +9,7 @@ import json
 import time
 import logging
 import os
+import traceback
 from typing import Dict, Optional, List, Any
 from redis import Redis
 from urllib.parse import urlparse
@@ -152,6 +153,11 @@ class RedisStateStore:
         """Update instance state with error type awareness."""
         key = f"{self.state_prefix}{name}"
         logger.debug(f"Updating state for key: {key}")
+        
+        # Log stack trace when setting to rate_limited
+        if kwargs.get("status") == InstanceStatus.RATE_LIMITED.value:
+            stack = ''.join(traceback.format_stack())
+            logger.warning(f"Setting instance {name} to RATE_LIMITED. Stack trace:\n{stack}")
         
         # Important fields to track in the update
         important_fields = ["status", "rate_limited_until", "current_tpm", "error_count"]

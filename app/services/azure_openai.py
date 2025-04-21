@@ -260,7 +260,7 @@ class AzureOpenAIService:
         logger.debug(f"[{request_id}] Forwarding request to instance {instance_name} ({provider_type}): {url}")
         
         # Set up HTTP client with appropriate timeout
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds), proxies={"http://": instance.get("proxy_url")}) as client:
             # Set headers based on provider_type
             headers = {"Content-Type": "application/json"}
             

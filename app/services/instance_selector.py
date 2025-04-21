@@ -5,6 +5,7 @@ import time
 from typing import Dict, List, Any, Optional, Set
 
 from app.instance.instance_context import instance_manager
+from app.utils.rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,28 @@ class InstanceSelector:
         """
         instance_name = instance.get("name", "")
         
+        # First check if rate limiter exists to avoid marking instances as rate limited
+        # when they don't have a rate limiter yet
+        if instance_name not in instance_manager.rate_limiters:
+            logger.warning(f"No rate limiter found for instance {instance_name}, attempting to initialize it")
+            # Try to initialize the rate limiter
+            config = instance_manager.get_instance_config(instance_name)
+            if config:
+                logger.info(f"Creating missing rate limiter for instance {instance_name}")
+                instance_manager.rate_limiters[instance_name] = get_rate_limiter(
+                    instance_id=instance_name,
+                    tokens_per_minute=config.max_tpm,
+                    use_redis=instance_manager.use_redis,
+                    redis_url=instance_manager.redis_url,
+                    redis_password=instance_manager.redis_password,
+                    max_input_tokens=config.max_input_tokens
+                )
+                logger.info(f"Successfully created rate limiter for instance {instance_name}")
+            else:
+                logger.error(f"Could not find config for instance {instance_name}, cannot create rate limiter")
+                # Do not mark as rate limited, just treat as no capacity
+                return False
+
         # Sync rate limiter data to ensure current_tpm is accurate
         instance_manager.sync_rate_limiter_to_state(instance_name)
         
@@ -289,8 +312,8 @@ class InstanceSelector:
         allowed = instance_manager.check_rate_limit(instance_name, required_tokens)
         if not allowed:
             logger.debug(f"Instance {instance_name} skipped: rate limited")
-            # Mark as rate limited if not already
-            if status != "rate_limited":
+            # Mark as rate limited only if rate limiter exists and we actually checked capacity
+            if status != "rate_limited" and instance_name in instance_manager.rate_limiters:
                 # Get current token usage for better debugging
                 current_usage = instance_manager.get_current_usage(instance_name)
                 max_usage = instance_manager.get_instance_config(instance_name).max_tpm

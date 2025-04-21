@@ -99,7 +99,7 @@ async def handle_streaming_request(endpoint: str, payload: Dict[str, Any], provi
         logger.debug(f"Streaming request via instance {instance_name} to {url}")
         
         # Create a new client for streaming
-        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0), proxies={"http://": instance.get("proxy_url")})
         
         # Set appropriate headers based on provider type
         if config.provider_type == "azure":

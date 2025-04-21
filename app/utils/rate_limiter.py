@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # Default token rate limit (tokens per minute)
-DEFAULT_TOKEN_RATE_LIMIT = 1000000
+DEFAULT_TOKEN_RATE_LIMIT = 9999999
 DEFAULT_MAX_INPUT_TOKENS_LIMIT = 16384
 
 class TokenUsage(BaseModel):

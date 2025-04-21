@@ -119,6 +119,19 @@ class InstanceManager:
         rate_limiter = self.rate_limiters.get(name)
         if not rate_limiter:
             logger.warning(f"No rate limiter found for instance {name}, this should not happen")
+            # Try to reinitialize the rate limiter if the config exists
+            config = self.config_store.get_config(name)
+            if config:
+                logger.info(f"Reinitializing missing rate limiter for instance {name}")
+                self.rate_limiters[name] = get_rate_limiter(
+                    instance_id=name,
+                    tokens_per_minute=config.max_tpm,
+                    use_redis=self.use_redis,
+                    redis_url=self.redis_url,
+                    redis_password=self.redis_password,
+                    max_input_tokens=config.max_input_tokens
+                )
+                return self.rate_limiters[name]
         return rate_limiter
 
     def reload_config(self):
