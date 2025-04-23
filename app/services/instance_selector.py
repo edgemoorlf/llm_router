@@ -281,7 +281,13 @@ class InstanceSelector:
             logger.warning(f"Instance {instance_name} has None status, defaulting to healthy")
             instance["status"] = "healthy"
             status = "healthy"
-        
+
+        # Skip if dead (401 or 404)
+        if status == "dead":
+            logger.debug(f"Instance {instance_name} skipped: status is {status}")
+            return False
+            
+
         # Proactively check if rate limit has expired
         if status == "rate_limited":
             rate_limited_until = instance.get("rate_limited_until")
@@ -294,11 +300,6 @@ class InstanceSelector:
             else:
                 remaining = int(rate_limited_until - time.time()) if rate_limited_until else 0
                 logger.debug(f"Instance {instance_name} still rate limited for {remaining} more seconds")
-            
-        # Skip if not healthy
-        if status != "healthy":
-            logger.debug(f"Instance {instance_name} skipped: status is {status}")
-            return False
             
         # Check TPM limit
         current_tpm = instance.get("current_tpm", 0)

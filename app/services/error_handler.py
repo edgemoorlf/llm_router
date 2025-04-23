@@ -59,7 +59,14 @@ class ErrorHandler:
         instance_name = instance.get("name", "")
         
         if isinstance(error, HTTPException):
-            if error.status_code == 429:
+            if error.status_code == 401 or error.status_code == 404:
+                instance_manager.update_instance_state(
+                    instance_name,
+                    status="dead",
+                    last_error=str(error),
+                    error_count=instance.get("error_count", 0) + 1
+                )
+            elif error.status_code == 429:
                 retry_after = None
                 if hasattr(error, 'headers') and error.headers and 'retry-after' in error.headers:
                     try:

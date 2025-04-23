@@ -61,8 +61,10 @@ class AzureOpenAIService:
         exclude_instances = set()  # Track excluded instances
         max_retries = 3
         retry_count = 0
+
+        request_id = f"req-{time.time()}"
         
-        logger.debug(f"Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
+        logger.debug(f"[{request_id}] Forwarding request to Azure instances. Model: {original_model}, Tokens: {required_tokens}")
         
         while retry_count < max_retries:
             try:
@@ -76,18 +78,19 @@ class AzureOpenAIService:
                 
                 if available_instances:
                     instance_names = [inst.get("name", "") for inst in available_instances]
-                    logger.debug(f"Selected {len(available_instances)} instances for request: {', '.join(instance_names)}")
+                    logger.debug(f"[{request_id}] Selected {len(available_instances)} instances for request: {', '.join(instance_names)}")
                 else:
-                    logger.warning(f"No instances available for model '{original_model}' with {required_tokens} tokens")
+                    logger.warning(f"[{request_id}] No instances available for model '{original_model}' with {required_tokens} tokens")
                 
                 if not available_instances:
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                        detail=f"No instances available that support model '{original_model}'"
+                        detail=f"[{request_id}] No instances available that support model '{original_model}'"
                     )
                 
                 # Execute request with fallback handling
                 result = await self._execute_with_fallbacks(
+                    request_id=request_id,
                     endpoint=endpoint,
                     model_name=original_model,
                     payload=payload,
@@ -106,16 +109,17 @@ class AzureOpenAIService:
                 
                 # If this was the last retry, re-raise
                 if retry_count >= max_retries - 1:
-                    logger.error(f"All retries failed for model '{original_model}'. Last error: {str(e)}")
+                    logger.error(f"[{request_id}] All retries failed for model '{original_model}'. Last error: {str(e)}")
                     raise
                 
                 # Prepare for next retry
                 retry_count += 1
-                logger.warning(f"All instances failed, retry {retry_count}/{max_retries}")
+                logger.warning(f"[{request_id}] All instances failed, retry {retry_count}/{max_retries}")
                 await asyncio.sleep(0.5 * retry_count)  # Increasing backoff
 
     async def _execute_with_fallbacks(
         self, 
+        request_id: str,
         endpoint: str, 
         model_name: str, 
         payload: Dict[str, Any], 
@@ -143,11 +147,11 @@ class AzureOpenAIService:
             payload_with_model["model"] = model_name
             
             try:
-                logger.debug(f"Attempting request with instance {instance_name}")
+                logger.debug(f"[{request_id}] Attempting request with instance {instance_name}")
                 
                 # Forward the request directly to this instance
                 result = await self._forward_request_to_instance(
-                    instance, endpoint, payload_with_model, method
+                    request_id=request_id, instance, endpoint, payload_with_model, method
                 )
                 
                 # Update instance metrics on success
@@ -174,7 +178,7 @@ class AzureOpenAIService:
                         tokens=0
                     )
                     
-                logger.debug(f"Request completed using Azure instance {instance_name}")
+                logger.debug(f"[{request_id}] Request completed using Azure instance {instance_name}")
                 return result
                 
             except HTTPException as e:
@@ -187,10 +191,10 @@ class AzureOpenAIService:
                 fallback_errors.append(f"{instance_name}: {str(e)}")
                 
                 # Log failure and continue to next instance
-                logger.warning(f"Instance {instance_name} failed with error {str(e)}, trying next instance")
+                logger.warning(f"[{request_id}] Instance {instance_name} failed with error {str(e)}, trying next instance")
         
         # If we get here, all instances failed
-        error_detail = f"All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
+        error_detail = f"[{request_id}] All instances failed for model '{model_name}'. Errors: {', '.join(fallback_errors)}"
         logger.error(error_detail)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -198,7 +202,7 @@ class AzureOpenAIService:
         )
 
     async def _forward_request_to_instance(
-        self, instance: Dict[str, Any], endpoint: str, payload: Dict[str, Any], method: str = "POST"
+        self, request_id: str, instance: Dict[str, Any], endpoint: str, payload: Dict[str, Any], method: str = "POST"
     ) -> Dict[str, Any]:
         """
         Forward a request directly to an instance.
@@ -218,9 +222,7 @@ class AzureOpenAIService:
         # Get instance properties
         instance_name = instance.get("name", "")
         provider_type = instance.get("provider_type", "azure")
-        api_base = instance.get("api_base", "")
         api_key = instance.get("api_key", "")
-        api_version = instance.get("api_version", "")
         model_deployments = instance.get("model_deployments", {})
         timeout_seconds = instance.get("timeout_seconds", 60.0)
         retry_count = instance.get("retry_count", 5)
@@ -234,12 +236,12 @@ class AzureOpenAIService:
             # Look up the deployment name for this model in this specific instance
             deployment = model_deployments.get(model_name, "")
             if deployment:
-                logger.debug(f"Resolved deployment '{deployment}' for model '{model_name}' in instance '{instance_name}'")
+                logger.debug(f"[{request_id}] Resolved deployment '{deployment}' for model '{model_name}' in instance '{instance_name}'")
             else:
-                logger.warning(f"No deployment mapping found for model '{model_name}' in instance '{instance_name}'")
+                logger.warning(f"[{request_id}] No deployment mapping found for model '{model_name}' in instance '{instance_name}'")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"No deployment mapping found for model '{model_name}' in instance '{instance_name}'"
+                    detail=f"[{request_id}] No deployment mapping found for model '{model_name}' in instance '{instance_name}'"
                 )
                 
         # Generate a request ID for tracking
@@ -254,7 +256,7 @@ class AzureOpenAIService:
         if not url:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Could not build URL for instance '{instance.get('name', '')}'"
+                detail=f"[{request_id}] Could not build URL for instance '{instance.get('name', '')}'"
             )
         
         logger.debug(f"[{request_id}] Forwarding request to instance {instance_name} ({provider_type}): {url}")
