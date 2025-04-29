@@ -151,7 +151,7 @@ class AzureOpenAIService:
                 
                 # Forward the request directly to this instance
                 result = await self._forward_request_to_instance(
-                    request_id=request_id, instance, endpoint, payload_with_model, method
+                    request_id, instance, endpoint, payload_with_model, method
                 )
                 
                 # Update instance metrics on success

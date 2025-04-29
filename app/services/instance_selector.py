@@ -267,14 +267,6 @@ class InstanceSelector:
                 # Do not mark as rate limited, just treat as no capacity
                 return False
 
-        # Sync rate limiter data to ensure current_tpm is accurate
-        instance_manager.sync_rate_limiter_to_state(instance_name)
-        
-        # Update the instance state in our local dictionary
-        current_state = instance_manager.get_instance_state(instance_name)
-        if current_state:
-            instance["current_tpm"] = current_state.current_tpm
-        
         # Get status, defaulting to healthy if missing or None
         status = instance.get("status")
         if status is None:
@@ -287,9 +279,16 @@ class InstanceSelector:
             logger.debug(f"Instance {instance_name} skipped: status is {status}")
             return False
             
-
         # Proactively check if rate limit has expired
         if status == "rate_limited":
+            # Sync rate limiter data to ensure current_tpm is accurate
+            instance_manager.sync_rate_limiter_to_state(instance_name)
+            
+            # Update the instance state in our local dictionary
+            current_state = instance_manager.get_instance_state(instance_name)
+            if current_state:
+                instance["current_tpm"] = current_state.current_tpm
+            
             rate_limited_until = instance.get("rate_limited_until")
             if rate_limited_until and time.time() >= rate_limited_until:
                 logger.info(f"Rate limit for instance {instance_name} has expired in selector, marking as healthy")

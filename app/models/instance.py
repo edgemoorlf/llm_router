@@ -17,6 +17,7 @@ class InstanceStatus(str, Enum):
     HEALTHY = "healthy"
     RATE_LIMITED = "rate_limited" 
     ERROR = "error"
+    DEAD = "dead"
 
 class InstanceConfig(BaseModel):
     """
