@@ -67,3 +67,22 @@ production.yaml
 
 # Database
 *.db
+
+  # Secrets and credentials
+  *.key
+  *.pem
+  *.crt
+  *.p12
+  *secret*
+  *credential*
+  *password*
+
+  # Test files with real data
+  tests/test_azoai.py
+  tests/*_real.py
+
+  # Instance configurations with real data
+  instance_configs.json
+  instances.json
+  config/development.yaml
+  config/production.yaml
